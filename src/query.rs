@@ -165,7 +165,8 @@ impl<'s> Snapshot<'s> {
                 if tier >= TIER_EXACT {
                     df_for_idf = df_for_idf.max(rec.df());
                 }
-                let range = rec.postings_off() as usize..(rec.postings_off() + rec.postings_len()) as usize;
+                let range =
+                    rec.postings_off() as usize..(rec.postings_off() + rec.postings_len()) as usize;
                 if let Ok(ids) = base::decode_postings(&self.postings()[range]) {
                     for id in ids {
                         let e = tiers.entry(id).or_insert(0.0);

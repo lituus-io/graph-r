@@ -43,7 +43,6 @@ use std::collections::HashMap;
 
 pub use crate::store::now_ms;
 
-
 /// What an absorb/ingest pass wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BridgeReport {
@@ -119,7 +118,11 @@ pub fn absorb(store: &Store, index: &LinkIndex) -> Result<BridgeReport> {
 /// Fold an [`UpdateReport`]'s per-page outcomes into the graph: added and
 /// updated pages are (re)upserted with segments and edges, unchanged pages
 /// are touched. Compacts afterwards so lookups see the new structure.
-pub fn ingest_update(store: &Store, index: &LinkIndex, report: &UpdateReport) -> Result<BridgeReport> {
+pub fn ingest_update(
+    store: &Store,
+    index: &LinkIndex,
+    report: &UpdateReport,
+) -> Result<BridgeReport> {
     ingest_pages(store, index, &report.pages)
 }
 
@@ -171,7 +174,8 @@ fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Resu
                     etag: m.etag.as_deref(),
                     pinned: m.pinned,
                 })?;
-                let keywords: Vec<&str> = page.keywords.iter().map(compact_str::CompactString::as_str).collect();
+                let keywords: Vec<&str> =
+                    page.keywords.iter().map(compact_str::CompactString::as_str).collect();
                 let segs: Vec<SegmentRecord<'_>> = page
                     .headings
                     .iter()

@@ -207,16 +207,17 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
 
     // Lexicon accumulation: token hash → (label, ascending unique node ids).
     let mut lexicon: BTreeMap<u64, (CompactString, Vec<u32>)> = BTreeMap::new();
-    let push_tokens = |text: &str, id: u32, lexicon: &mut BTreeMap<u64, (CompactString, Vec<u32>)>| {
-        crate::query::for_each_token(text, |tok| {
-            let hash = xxhash_rust::xxh3::xxh3_64(tok.as_bytes());
-            let entry =
-                lexicon.entry(hash).or_insert_with(|| (CompactString::from(tok), Vec::new()));
-            if entry.1.last() != Some(&id) {
-                entry.1.push(id);
-            }
-        });
-    };
+    let push_tokens =
+        |text: &str, id: u32, lexicon: &mut BTreeMap<u64, (CompactString, Vec<u32>)>| {
+            crate::query::for_each_token(text, |tok| {
+                let hash = xxhash_rust::xxh3::xxh3_64(tok.as_bytes());
+                let entry =
+                    lexicon.entry(hash).or_insert_with(|| (CompactString::from(tok), Vec::new()));
+                if entry.1.last() != Some(&id) {
+                    entry.1.push(id);
+                }
+            });
+        };
 
     for (i, (&key, m)) in models.iter().enumerate() {
         let id = i as u32;

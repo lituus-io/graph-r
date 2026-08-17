@@ -35,10 +35,8 @@ pub(crate) fn compute(n: usize, out_edges: &[Vec<EdgeRow>]) -> (Vec<u16>, Vec<u3
 }
 
 fn pagerank(n: usize, out_edges: &[Vec<EdgeRow>]) -> Vec<f64> {
-    let link_out: Vec<usize> = out_edges
-        .iter()
-        .map(|es| es.iter().filter(|(_, t, _, _)| *t == 0).count())
-        .collect();
+    let link_out: Vec<usize> =
+        out_edges.iter().map(|es| es.iter().filter(|(_, t, _, _)| *t == 0).count()).collect();
     let teleport = (1.0 - DAMPING) / n as f64;
     let mut rank = vec![1.0 / n as f64; n];
     let mut next = vec![0.0f64; n];
@@ -127,9 +125,8 @@ fn label_propagation(n: usize, out_edges: &[Vec<EdgeRow>]) -> Vec<u32> {
                 .iter()
                 .map(|(&l, &w)| (l, w))
                 .max_by(|a, b| {
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(b.0.cmp(&a.0)) // smaller label wins ties
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0))
+                    // smaller label wins ties
                 })
                 .map(|(l, _)| l)
             else {

@@ -91,11 +91,10 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .filter(|&e| e <= self.bytes.len())
-            .ok_or_else(|| Error::format(format!("truncated: need {n} bytes at {}", self.pos)))?;
+        let end =
+            self.pos.checked_add(n).filter(|&e| e <= self.bytes.len()).ok_or_else(|| {
+                Error::format(format!("truncated: need {n} bytes at {}", self.pos))
+            })?;
         let out = &self.bytes[self.pos..end];
         self.pos = end;
         Ok(out)

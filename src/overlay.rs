@@ -141,7 +141,16 @@ impl OverlayView {
         for (_, op) in ops {
             let entry = map.entry(op.key().0).or_default();
             match op {
-                Op::UpsertNode { content_hash, fetched_at_ms, flags, url, title, snippet, etag, .. } => {
+                Op::UpsertNode {
+                    content_hash,
+                    fetched_at_ms,
+                    flags,
+                    url,
+                    title,
+                    snippet,
+                    etag,
+                    ..
+                } => {
                     // An upsert resurrects a removed key and supersedes prior
                     // freshness (the fetch that produced it is the new stamp).
                     // Pins are sticky: once any pin state is known within this
@@ -149,8 +158,7 @@ impl OverlayView {
                     // (base-generation stickiness is applied at read time).
                     const PINNED: u16 = crate::format::base::nflags::PINNED;
                     let upsert_pin = *flags & PINNED != 0;
-                    let prior_core_pin =
-                        entry.core.as_ref().is_some_and(|c| c.flags & PINNED != 0);
+                    let prior_core_pin = entry.core.as_ref().is_some_and(|c| c.flags & PINNED != 0);
                     // Explicit pin state ORs with the upsert; otherwise a pin
                     // can only be *proven* here (any pinning upsert), never
                     // disproven — an all-unpinned history stays deferred so
@@ -251,16 +259,19 @@ mod tests {
         let ops = [
             (1, Op::SetPinned { key, pinned: true }),
             (2, Op::Remove { key }),
-            (3, Op::UpsertNode {
-                key,
-                content_hash: 9,
-                fetched_at_ms: 10,
-                flags: 0,
-                url: "https://x.dev/a".into(),
-                title: None,
-                snippet: None,
-                etag: None,
-            }),
+            (
+                3,
+                Op::UpsertNode {
+                    key,
+                    content_hash: 9,
+                    fetched_at_ms: 10,
+                    flags: 0,
+                    url: "https://x.dev/a".into(),
+                    title: None,
+                    snippet: None,
+                    etag: None,
+                },
+            ),
         ];
         let view = OverlayView::build(ops.iter());
         let n = &view.map[&5];

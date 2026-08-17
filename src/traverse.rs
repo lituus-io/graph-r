@@ -60,12 +60,7 @@ pub struct Neighbors<'s> {
 #[derive(Debug)]
 pub(crate) enum NeighborsInner<'s> {
     /// CSR run in the base file.
-    Base {
-        snap: &'s crate::snapshot::Snapshot<'s>,
-        edges: &'s [u8],
-        idx: usize,
-        end: usize,
-    },
+    Base { snap: &'s crate::snapshot::Snapshot<'s>, edges: &'s [u8], idx: usize, end: usize },
     /// Whole-set replacement living in the overlay.
     Overlay {
         snap: &'s crate::snapshot::Snapshot<'s>,

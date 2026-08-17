@@ -299,7 +299,6 @@ impl Store {
         }
         Err(Error::busy("all generation slots pinned by snapshots"))
     }
-
 }
 
 /// Load `graph.base` + replay `graph.wal` for `dir`. Returns the generation,
@@ -341,13 +340,12 @@ fn load_generation(
                 f.set_len(replayed.good_len as u64)?;
                 f.sync_all()?;
             }
-            let next =
-                replayed.ops.last().map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
-            let ops: Vec<(u64, wal::Op)> = replayed
+            let next = replayed
                 .ops
-                .into_iter()
-                .filter(|&(s, _)| s > header.wal_applied_seq)
-                .collect();
+                .last()
+                .map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
+            let ops: Vec<(u64, wal::Op)> =
+                replayed.ops.into_iter().filter(|&(s, _)| s > header.wal_applied_seq).collect();
             (ops, replayed.good_len, next)
         }
     };

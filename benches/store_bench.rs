@@ -52,10 +52,7 @@ fn build_store(dir: &std::path::Path, n: usize) -> Store {
         let e2 = url_of((i * 7 + 3) % n.max(1));
         w.set_edges(
             UrlKey::of(&url),
-            &[
-                (UrlKey::of(&e1), EdgeType::Link, 65_535),
-                (UrlKey::of(&e2), EdgeType::Link, 40_000),
-            ],
+            &[(UrlKey::of(&e1), EdgeType::Link, 65_535), (UrlKey::of(&e2), EdgeType::Link, 40_000)],
         );
         if i % 512 == 511 {
             w.commit().unwrap();
@@ -88,7 +85,9 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
         group.bench_with_input(BenchmarkId::new("query", n), &n, |b, _| {
-            b.iter(|| black_box(snap.query("benchmark configuration details", &QueryOpts::default())));
+            b.iter(|| {
+                black_box(snap.query("benchmark configuration details", &QueryOpts::default()))
+            });
         });
         group.bench_with_input(BenchmarkId::new("due_scan", n), &n, |b, _| {
             b.iter(|| black_box(snap.due(u64::MAX / 2, 64)));

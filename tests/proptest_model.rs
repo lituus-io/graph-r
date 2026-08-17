@@ -24,8 +24,11 @@ fn url_of(n: u8) -> String {
 
 fn op_strategy() -> impl Strategy<Value = MOp> {
     prop_oneof![
-        (0u8..12, any::<u64>(), any::<bool>())
-            .prop_map(|(n, hash, pinned)| MOp::Upsert { n, hash, pinned }),
+        (0u8..12, any::<u64>(), any::<bool>()).prop_map(|(n, hash, pinned)| MOp::Upsert {
+            n,
+            hash,
+            pinned
+        }),
         (0u8..12, any::<bool>()).prop_map(|(n, unchanged)| MOp::Touch { n, unchanged }),
         (0u8..12).prop_map(|n| MOp::Remove { n }),
         (0u8..12, any::<bool>()).prop_map(|(n, on)| MOp::Pin { n, on }),

@@ -63,7 +63,8 @@ impl LockFile {
     /// process holds it. Never blocks.
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        let file =
+            std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
         // SAFETY: plain FFI call on an owned, open fd; no memory is shared.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {

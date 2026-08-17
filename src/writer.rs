@@ -281,19 +281,14 @@ impl<'s> Writer<'s> {
             } else {
                 node.changes
             };
-            let last_change = if t.outcome == Outcome::Changed {
-                t.checked_at_ms
-            } else {
-                node.last_change_ms
-            };
+            let last_change =
+                if t.outcome == Outcome::Changed { t.checked_at_ms } else { node.last_change_ms };
             // The op carries the node's *full* effective state, not a delta:
             // touches fold last-wins in the overlay, so an unchanged check
             // must not erase the hash/etag a prior change observed.
             let hash = t.content_hash.unwrap_or(node.content_hash);
-            let etag: Option<compact_str::CompactString> = t
-                .etag
-                .map(Into::into)
-                .or_else(|| node.etag.map(Into::into));
+            let etag: Option<compact_str::CompactString> =
+                t.etag.map(Into::into).or_else(|| node.etag.map(Into::into));
             (next, checks, changes, last_change, hash, etag)
         };
         self.state.staged.push(Op::Touch {

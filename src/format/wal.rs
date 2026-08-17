@@ -139,7 +139,16 @@ impl Op {
     /// Serialize into `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Self::UpsertNode { key, content_hash, fetched_at_ms, flags, url, title, snippet, etag } => {
+            Self::UpsertNode {
+                key,
+                content_hash,
+                fetched_at_ms,
+                flags,
+                url,
+                title,
+                snippet,
+                etag,
+            } => {
                 out.push(OP_UPSERT);
                 put_u64(out, key.0);
                 put_u64(out, *content_hash);

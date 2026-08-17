@@ -259,7 +259,8 @@ impl<'s> Snapshot<'s> {
                 // an unpinned re-ingest never silently unpins.
                 match p.pinned {
                     Some(pinned) => {
-                        flags = if pinned { flags | nflags::PINNED } else { flags & !nflags::PINNED };
+                        flags =
+                            if pinned { flags | nflags::PINNED } else { flags & !nflags::PINNED };
                     }
                     None => {
                         if let (Some(id), false) = (base_id, p.severed) {
@@ -269,13 +270,8 @@ impl<'s> Snapshot<'s> {
                         }
                     }
                 }
-                let (mut fetched, mut interval, mut checks, mut changes, mut last_change) = (
-                    core.fetched_at_ms,
-                    self.ttl().base_s,
-                    0u16,
-                    0u16,
-                    0u64,
-                );
+                let (mut fetched, mut interval, mut checks, mut changes, mut last_change) =
+                    (core.fetched_at_ms, self.ttl().base_s, 0u16, 0u16, 0u64);
                 let mut content_hash = core.content_hash;
                 let mut etag: Option<&str> = core.etag.as_deref();
                 if let Some(t) = &p.touch {

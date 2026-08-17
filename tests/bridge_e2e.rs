@@ -156,9 +156,8 @@ fn due_list_drives_refresh_and_freshness_feeds_back() {
         evict_unreachable: true,
         concurrency: 2,
     };
-    let refresh = futures::executor::block_on(async {
-        index.refresh_with(&fetcher, opts).await.unwrap()
-    });
+    let refresh =
+        futures::executor::block_on(async { index.refresh_with(&fetcher, opts).await.unwrap() });
     assert_eq!(refresh.refreshed, 1);
     assert_eq!(refresh.unchanged, 1);
 

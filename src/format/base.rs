@@ -13,7 +13,9 @@
 //! new section kinds (unknown kinds are skipped on read) and header flags,
 //! never by reinterpreting existing bytes.
 
-use crate::bytesio::{self, align_up, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, Reader};
+use crate::bytesio::{
+    self, align_up, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, Reader,
+};
 use crate::error::{Error, Result};
 use crate::format::{ALIGN, DIR_ENTRY_LEN, TRAILER_LEN};
 use crate::key::UrlKey;
@@ -260,7 +262,9 @@ impl BaseDir {
         }
         let count = header.section_count as usize;
         let dir_end = HEADER_LEN
-            .checked_add(count.checked_mul(DIR_ENTRY_LEN).ok_or_else(|| Error::format("dir overflow"))?)
+            .checked_add(
+                count.checked_mul(DIR_ENTRY_LEN).ok_or_else(|| Error::format("dir overflow"))?,
+            )
             .ok_or_else(|| Error::format("dir overflow"))?;
         if dir_end > trailer_off {
             return Err(Error::format("directory exceeds file"));
@@ -272,7 +276,8 @@ impl BaseDir {
             let offset = get_u64(bytes, e + 8) as usize;
             let length = get_u64(bytes, e + 16) as usize;
             let sum = get_u64(bytes, e + 24);
-            let end = offset.checked_add(length).ok_or_else(|| Error::format("section overflow"))?;
+            let end =
+                offset.checked_add(length).ok_or_else(|| Error::format("section overflow"))?;
             if offset < dir_end || end > trailer_off {
                 return Err(Error::format("section out of bounds"));
             }
@@ -748,21 +753,7 @@ mod tests {
     fn node_binary_search_finds_all() {
         let mut nodes = Vec::new();
         for k in [3u64, 9, 12, 400, 500] {
-            write_node_rec(
-                &mut nodes,
-                UrlKey(k),
-                0,
-                0,
-                0,
-                [NO_LABEL; 4],
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
+            write_node_rec(&mut nodes, UrlKey(k), 0, 0, 0, [NO_LABEL; 4], 0, 0, 0, 0, 0, 0, 0);
         }
         for k in [3u64, 9, 12, 400, 500] {
             assert!(find_node(&nodes, UrlKey(k)).is_some());

@@ -71,9 +71,9 @@ pub struct TtlConfig {
 impl Default for TtlConfig {
     fn default() -> Self {
         Self {
-            base_s: 21_600,      // 6 h
-            min_s: 900,          // 15 min
-            max_s: 2_592_000,    // 30 d
+            base_s: 21_600,   // 6 h
+            min_s: 900,       // 15 min
+            max_s: 2_592_000, // 30 d
             grow_num: 3,
             grow_den: 2,
             cut_num: 1,
@@ -89,16 +89,15 @@ impl TtlConfig {
     /// leaves the schedule); `Error` schedules a floor-interval retry.
     #[must_use]
     pub fn next_interval(&self, interval_s: u32, outcome: Outcome) -> u32 {
-        let clamp = |v: u64| -> u32 {
-            v.clamp(u64::from(self.min_s), u64::from(self.max_s)) as u32
-        };
+        let clamp =
+            |v: u64| -> u32 { v.clamp(u64::from(self.min_s), u64::from(self.max_s)) as u32 };
         match outcome {
-            Outcome::Unchanged => {
-                clamp(u64::from(interval_s) * u64::from(self.grow_num) / u64::from(self.grow_den.max(1)))
-            }
-            Outcome::Changed => {
-                clamp(u64::from(interval_s) * u64::from(self.cut_num) / u64::from(self.cut_den.max(1)))
-            }
+            Outcome::Unchanged => clamp(
+                u64::from(interval_s) * u64::from(self.grow_num) / u64::from(self.grow_den.max(1)),
+            ),
+            Outcome::Changed => clamp(
+                u64::from(interval_s) * u64::from(self.cut_num) / u64::from(self.cut_den.max(1)),
+            ),
             Outcome::Error => self.min_s,
             Outcome::Gone => interval_s,
         }

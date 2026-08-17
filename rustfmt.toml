@@ -1,0 +1,14 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+#
+# This crate is written in a dense, ~100-column style: single-line `if/else`
+# expressions, unsplit iterator chains, and one-line struct literals. Default
+# rustfmt keeps `max_width = 100` but caps sub-expressions far lower
+# (`fn_call_width = 60`, `chain_width = 60`, `single_line_if_else_max_width = 50`),
+# which would explode those constructs across several lines each and lose the
+# density the code was written for.
+#
+# `use_small_heuristics = "Max"` raises every sub-width to `max_width`, which is
+# the setting that reproduces the existing layout. Without it `cargo fmt` rewrites
+# ~120 sites purely on style.
+use_small_heuristics = "Max"
