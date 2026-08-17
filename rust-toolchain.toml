@@ -1,9 +1,24 @@
 # Copyright: lituus-io, all rights reserved.
 # Author: terekete <spicyzhug@gmail.com>
 #
-# Pinned to the same nightly channel as link-r: the bridge feature compiles
-# link-r, whose GAT+TAIT async traits require `impl_trait_in_assoc_type`.
+# Nightly is required transitively: the `bridge` feature compiles link-r, whose
+# GAT+TAIT async traits need `impl_trait_in_assoc_type`.
+#
+# The channel is pinned to an exact date, not bare "nightly". An undated pin
+# already broke this crate once -- a newer nightly promoted two clippy lints to
+# warn-by-default and the zero-warning invariant failed with no source change.
+# CI runs with `-D warnings`, so unpinned nightly means CI can break overnight
+# on a compiler update rather than on a commit.
+#
+# nightly-2026-06-10 resolves to rustc 1.98.0-nightly (beae78130 2026-06-09).
+# Note the off-by-one: rustup's channel date is the publish date, one day after
+# the commit date in the version string. Verify with:
+#   rustup run nightly-2026-06-10 rustc --version
+#
+# Bumping this pin is a deliberate commit: install the new date, run
+# `cargo fmt --check`, `cargo clippy --all-features --all-targets` and
+# `cargo test --all-features` before changing the line below.
 
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-06-10"
 components = ["rustfmt", "clippy"]
