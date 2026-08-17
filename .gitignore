@@ -1,0 +1,23 @@
+# Build artifacts
+/target
+**/target/
+Cargo.lock.orig
+
+# Fuzzing corpus and crash artifacts (findings are promoted to
+# tests/regression.rs, so the corpus itself is not tracked)
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# Criterion output (baselines under benches/baselines/ ARE tracked)
+/target/criterion/
+
+# Python build/venv
+*.so
+dist/
+__pycache__/
+.pytest_cache/
+.venv/
+
+# OS / editor
+.DS_Store
+*.swp

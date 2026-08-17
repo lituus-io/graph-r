@@ -1,0 +1,46 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+#
+# cargo-deny configuration. Run by .github/workflows/security.yml.
+
+[graph]
+# Check every feature combination's dependency set, not just the default one.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Advisories deliberately accepted must be listed here WITH a reason, never
+# silently suppressed by loosening the gate above.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+
+# This crate is proprietary and publish = false; cargo-deny must not flag the
+# workspace's own members for lacking an SPDX-allowed license.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc deeed3523ef554030cec2080e911076e77a2b3d3b14f0ccd24fda51dab89232c # shrinks to ops = [Pin { n: 9, on: false }, Upsert { n: 9, hash: 0, pinned: true }]
+cc f2a5dbf9dc742f7b15a74de8bd7635e90ec24774f71605c0e7af0055869c1b42 # shrinks to ops = [Upsert { n: 5, hash: 0, pinned: false }, Touch { n: 5, unchanged: false }, Compact, Remove { n: 5 }, Upsert { n: 5, hash: 501, pinned: true }]
+cc 93cd2c11e021f96b0203c40812aa1257bbd1cdad4e45719374ce75e440d2f63f # shrinks to ops = [Upsert { n: 5, hash: 0, pinned: true }, Compact, Upsert { n: 5, hash: 0, pinned: false }, Upsert { n: 5, hash: 7415500387564, pinned: false }]
+cc 38419b0a9713faf5ec44567cb67f4313ac2f17d9680340a03c74f7cc45fbff90 # shrinks to ops = [Upsert { n: 3, hash: 0, pinned: false }, Touch { n: 3, unchanged: false }, Touch { n: 3, unchanged: true }]

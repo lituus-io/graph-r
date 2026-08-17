@@ -1,0 +1,66 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+
+[package]
+name = "graph-r"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+description = "Embedded, persistent knowledge-graph backend for link-r: TTL-driven freshness, zero-copy mmap snapshots, token-budgeted local lookups"
+repository = "https://github.com/lituus-io/graph-r"
+authors = ["lituus-io <spicyzhug@gmail.com>"]
+publish = false
+keywords = ["knowledge-graph", "embedded", "mmap", "ttl", "index"]
+categories = ["database-implementations", "caching", "data-structures"]
+
+[features]
+# Install-by-requirement: the default build is the pure embedded graph store
+# (persistence, snapshots, lookups, TTL, ranking) with zero optional deps.
+default = []
+# The URI-link ingest path: absorb documents/edges from a link-r index and
+# drive its refresh loop from graph-r due-lists.
+bridge = ["dep:link-r"]
+# The LLM enrichment seam: a vendor-free trait for proposing segment
+# importance and related-edges. Zero deps — just the trait and plumbing.
+llm = []
+
+[dependencies]
+# The base snapshot is always mmapped; reads are zero-copy against the file.
+memmap2 = "0.9"
+# xxh3 is the single hash family: keys, section checksums, file trailers.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror = "1.0"
+smallvec = { version = "1.13", features = ["union", "const_generics"] }
+compact_str = "0.8"
+link-r = { path = "../link-r", optional = true, default-features = false, features = ["crawl", "hash", "html", "markdown", "fs"] }
+
+# flock() for the cross-process single-writer lock lives in the os unsafe
+# island; libc is already in the tree transitively via memmap2.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+bytes = "1.7" # constructing link-r payloads in bridge tests
+proptest = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.12"
+futures = "0.3"
+
+[[bench]]
+name = "store_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+debug = true
+
+[workspace]
+members = []

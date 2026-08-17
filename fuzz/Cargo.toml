@@ -1,0 +1,47 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+
+[package]
+name = "graph-r-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+graph-r = { path = "..", default-features = false }
+
+[[bin]]
+name = "fuzz_base_parse"
+path = "fuzz_targets/fuzz_base_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_replay"
+path = "fuzz_targets/fuzz_wal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_op_decode"
+path = "fuzz_targets/fuzz_op_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_postings_decode"
+path = "fuzz_targets/fuzz_postings_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Detached from the parent workspace on purpose (mirrors link-r's layout).
+[workspace]
+members = ["."]
