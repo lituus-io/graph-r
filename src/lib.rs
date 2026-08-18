@@ -4,7 +4,7 @@
 //! # graph-r
 //!
 //! An embedded, persistent knowledge graph that acts as the durable backend
-//! for [`link-r`]: link-r acquires and ranks (crawl, extract, hybrid search);
+//! for `link-r`: link-r acquires and ranks (crawl, extract, hybrid search);
 //! graph-r remembers and serves (historical graph, adaptive freshness,
 //! token-budgeted local lookups). The two share one foreign key — the 64-bit
 //! xxh3 of a canonical URL — so a link-r index can be absorbed and then

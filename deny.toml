@@ -12,7 +12,19 @@ version = 2
 yanked = "deny"
 # Advisories deliberately accepted must be listed here WITH a reason, never
 # silently suppressed by loosening the gate above.
-ignore = []
+#
+# All three below are `unmaintained` notices on *transitive* dependencies with
+# no vulnerability attached, and none is reachable by a fix on our side short of
+# dropping the crate that pulls it in.
+ignore = [
+    # fxhash, via scraper -> selectors (the HTML extractor). Replacing it means
+    # replacing scraper; revisit when scraper updates its selectors dependency.
+    "RUSTSEC-2025-0057",
+    # number_prefix, via criterion -> indicatif. Dev/bench only; never shipped.
+    "RUSTSEC-2025-0119",
+    # paste, transitive and dev-only. Never shipped.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -29,6 +41,17 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # Added after the first CI run rejected real dependencies. All three are
+    # permissive and compatible with shipping a proprietary binary:
+    #   NCSA                 University of Illinois/NCSA -- BSD+MIT hybrid,
+    #                        reached via "(MIT OR Apache-2.0) AND NCSA".
+    #   CDLA-Permissive-2.0  Community Data License Agreement, permissive
+    #                        variant; carries no copyleft obligation.
+    #   BSL-1.0              Boost Software License; permissive, no attribution
+    #                        requirement in binary form.
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
 ]
 
 # This crate is proprietary and publish = false; cargo-deny must not flag the
