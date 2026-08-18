@@ -1,0 +1,14 @@
+{
+  "read/due_scan/1000": 52806.70312990833,
+  "read/due_scan/10000": 898929.7056511056,
+  "read/neighbors_walk/1000": 48.189505899287056,
+  "read/neighbors_walk/10000": 43.63702546723641,
+  "read/point_lookup/1000": 55.29831329792191,
+  "read/point_lookup/10000": 53.55068185803562,
+  "read/query/1000": 201371.51218390805,
+  "read/query/10000": 1833423.497432194,
+  "read_under_write/lookup_idle_writer": 60.80977358018309,
+  "read_under_write/lookup_under_write": 341.1900277105475,
+  "write/commit_100_upserts_fsync_never": 61107.26674836602,
+  "write/compact_10k_nodes": 65411604.0
+}

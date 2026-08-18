@@ -1,0 +1,64 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Criterion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      - name: Run benchmarks
+        run: cargo bench --features llm
+
+      # Compared against the committed baseline in benches/baselines/. Advisory
+      # on a shared runner: benchmark noise there routinely reaches double
+      # digits, and a gate that fires on noise gets switched off within a week.
+      # The comparison table lands in the job summary so a real regression is
+      # visible in review; the exit status is not allowed to fail the build.
+      - name: Compare against the committed baseline
+        continue-on-error: true
+        run: |
+          python3 scripts/bench.py --check | tee bench.txt
+          {
+            echo "### Benchmarks vs committed baseline"
+            echo ""
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Growth is checked separately, and this one *does* gate: it is a
+      # correctness property, not a timing measurement, so it is immune to
+      # runner noise. Fifty no-op compactions must produce byte-identical
+      # sections, which is what stops the store growing on idle refresh cycles.
+      - name: Memory-expansion regression
+        run: cargo test --features llm --test regression fifty_no_op_compactions_are_byte_identical
+
+      - name: Upload criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion/
+          retention-days: 14

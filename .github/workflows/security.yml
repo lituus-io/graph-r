@@ -1,0 +1,79 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+name: Security
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # Weekly, Monday 09:00 UTC
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-audit is a tool, not part of the build: install it with a current
+      # stable toolchain rather than the crate's pinned nightly.
+      - name: Install cargo-audit
+        run: RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
+      - run: cargo audit
+
+  deny:
+    name: Cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  suite:
+    name: Security suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # tests/security.rs is the untrusted-input and access-control boundary:
+      # hostile base/WAL files, resource-exhaustion bounds, writer exclusion,
+      # and the promise that only caller-supplied metadata reaches the file.
+      - name: Security tests
+        run: cargo test --features llm --test security
+      - name: Regression tests
+        run: cargo test --features llm --test regression
+
+  panic-lints:
+    name: Panic-path lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # Advisory, not gating. The library's own unwrap/expect calls are
+      # documented invariants on paths that cannot fail (a snapshot pins a
+      # populated slot; a cell below the frontier is initialized), and the test
+      # suites use them freely by design. Surfacing the list keeps a genuinely
+      # new panic path visible in review instead of silent.
+      - name: Report panic-capable paths
+        continue-on-error: true
+        run: |
+          cargo clippy --features llm --all-targets -- \
+            -W clippy::unwrap_used \
+            -W clippy::expect_used \
+            -W clippy::panic \
+            2>&1 | tee lints.txt
+          {
+            echo "### Panic-capable paths (advisory)"
+            echo ""
+            echo "count: $(grep -c 'clippy::\(unwrap_used\|expect_used\|panic\)' lints.txt || true)"
+          } >> "$GITHUB_STEP_SUMMARY"

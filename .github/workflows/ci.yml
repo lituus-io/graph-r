@@ -1,0 +1,174 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+  CARGO_TERM_COLOR: always
+
+# Two things shape this file.
+#
+# 1. The toolchain is NOT selected by dtolnay/rust-toolchain. That action exports
+#    RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml -- so using it would
+#    silently test a different compiler than developers run, which is exactly the
+#    failure the dated pin exists to prevent. `rustup show` installs the toolchain
+#    named in rust-toolchain.toml, with its rustfmt/clippy components, keeping one
+#    source of truth.
+#
+# 2. `bridge` is an optional feature backed by a *relative path* dependency
+#    (`link-r = { path = "../link-r" }`), so `--all-features` cannot resolve in a
+#    standalone checkout of this repo. Every ordinary job therefore builds
+#    everything except `bridge`; one dedicated job checks out link-r as a sibling
+#    and covers the bridge for real. That keeps the bulk of CI self-contained and
+#    makes the cross-repo requirement explicit in one place instead of an
+#    inscrutable "path not found" in every job.
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features llm --all-targets
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs: fmt
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm }
+          - { name: macos-arm64, runner: macos-15 }
+          # Windows exercises the non-flock LockFile fallback, whose
+          # release-on-drop path cannot run on any unix host.
+          - { name: windows-x86_64, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo test --features llm
+
+  bridge:
+    name: Bridge (with link-r)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      # `path = "../link-r"` is relative to this crate's Cargo.toml, so both
+      # repos are checked out as siblings under the workspace root.
+      - uses: actions/checkout@v4
+        with:
+          path: graph-r
+      - uses: actions/checkout@v4
+        with:
+          repository: lituus-io/link-r
+          path: link-r
+          # link-r is private, and a workflow's GITHUB_TOKEN is scoped to its own
+          # repository, so reading a sibling needs an explicit read-only PAT.
+          # Without the secret the job is skipped rather than failing red, so a
+          # fork or an unconfigured clone still gets a green, honest CI run.
+          token: ${{ secrets.SIBLING_REPO_TOKEN }}
+        continue-on-error: true
+        id: sibling
+      - name: Report a missing sibling checkout
+        if: steps.sibling.outcome != 'success'
+        run: |
+          echo "::notice::link-r checkout unavailable (SIBLING_REPO_TOKEN not set);"\
+               "skipping the bridge feature. Every other job still covers the crate."
+      - run: rustup show
+        if: steps.sibling.outcome == 'success'
+        working-directory: graph-r
+      - uses: Swatinem/rust-cache@v2
+        if: steps.sibling.outcome == 'success'
+        with:
+          workspaces: graph-r
+          key: bridge
+      - name: Clippy and test with every feature
+        if: steps.sibling.outcome == 'success'
+        working-directory: graph-r
+        run: |
+          cargo clippy --all-features --all-targets
+          cargo test --all-features
+
+  features:
+    name: Feature matrix
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # `default = []` is the product promise: the pure embedded store pulls in
+      # no optional dependency. Each feature must also stand alone, or "install
+      # by requirement" is only true for the combinations someone happened to
+      # try. `bridge` is covered by the job above, where link-r is present.
+      - name: Default (no features)
+        run: cargo check --no-default-features --all-targets
+      - name: llm only
+        run: cargo check --no-default-features --features llm --all-targets
+
+  docs:
+    name: Docs
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # The crate is #![deny(missing_docs)]; this additionally catches broken
+      # intra-doc links, which compile fine but rot silently.
+      - run: cargo doc --features llm --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  coverage:
+    name: Coverage
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      # Reported, not gated. Publishing the number first means the floor that
+      # follows is a measurement rather than a guess.
+      - name: Measure
+        run: |
+          cargo llvm-cov --features llm --summary-only | tee coverage.txt
+          {
+            echo "### Coverage (excluding the bridge feature)"
+            echo ""
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
