@@ -7,7 +7,6 @@
 # order of magnitude, not allocator noise.
 
 import gc
-import resource
 import sys
 import tracemalloc
 
@@ -18,8 +17,12 @@ import graph_r
 RSS_CEILING_KIB = 64 * 1024  # 64 MiB of growth across the whole run = a leak
 PY_ALLOC_CEILING_BYTES = 8 * 1024 * 1024
 
-if sys.platform == "win32":  # resource is POSIX-only; RSS half skips there
+# The guard must run BEFORE the import: `import resource` itself raises on
+# Windows, so putting it at the top interrupted collection there.
+if sys.platform == "win32":
     pytest.skip("resource.getrusage is POSIX-only", allow_module_level=True)
+
+import resource  # noqa: E402 - deliberately after the platform guard
 
 
 def _rss_kib() -> int:
