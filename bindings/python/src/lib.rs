@@ -563,6 +563,14 @@ impl PyStore {
         py.detach(|| self.inner.compact().map(|s| s.generation).map_err(map_err))
     }
 
+    /// For read-only stores: pick up commits/compactions made by a writing
+    /// process since this handle (or its last reload) opened. Cheap when
+    /// nothing changed — a header comparison, no remap. Returns True when
+    /// anything new became visible.
+    fn reload_if_stale(&self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| self.inner.reload_if_stale().map_err(map_err))
+    }
+
     /// The base generation currently serving reads.
     #[getter]
     fn generation(&self, py: Python<'_>) -> u64 {

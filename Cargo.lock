@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "graph-r"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "compact_str",

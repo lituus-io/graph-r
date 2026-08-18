@@ -167,6 +167,14 @@ class Store:
         next compaction. A later re-add is a new document."""
     def compact(self) -> int:
         """Fold the WAL into a fresh immutable base; returns the generation."""
+    def reload_if_stale(self) -> bool:
+        """Pick up commits made by a writing process (read-only handles).
+
+        Cheap when nothing changed — a header comparison, no remap.
+        Returns True when anything new became visible.
+        """
+        ...
+
     @property
     def generation(self) -> int:
         """The base generation currently serving reads."""

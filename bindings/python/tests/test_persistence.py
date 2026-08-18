@@ -115,3 +115,24 @@ def test_stamp_style_atomic_replace_beside_the_store(tmp_path):
         tmp.write_text('{"checked_at": %d}' % i)
         os.replace(tmp, stamp)  # atomic overwrite, including over an existing file
     assert '"checked_at": 2' in stamp.read_text()
+
+
+def test_reload_if_stale_sees_writer_commits(tmp_path):
+    """A long-lived read-only handle picks up a writer's commit without
+    reopening — the MCP-server-while-background-sync shape. New in 0.2.1."""
+    path = str(tmp_path / "kb")
+    writer = graph_r.Store.create(path)
+    seed(writer)
+
+    reader = graph_r.Store.open_read_only(path)
+    assert len(reader) == 4
+    assert reader.reload_if_stale() is False  # nothing changed: cheap no-op
+
+    writer.add("https://x.dev/fresh", content_hash=77, title="Fresh",
+               snippet="freshly committed sprocket")
+    writer.compact()
+
+    assert reader.reload_if_stale() is True
+    assert len(reader) == 5
+    assert any(h.url == "https://x.dev/fresh" for h in reader.query("sprocket"))
+    assert reader.reload_if_stale() is False  # converged again

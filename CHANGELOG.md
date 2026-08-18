@@ -4,6 +4,17 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.1
+
+### Python bindings
+
+- `Store.reload_if_stale()` is now exposed: read-only handles pick up commits
+  and compactions made by a writing process — cheap when nothing changed (a
+  header comparison, no remap), returning True when a new generation or fresh
+  WAL frames became visible. The Rust API always had it; the binding gap made
+  long-lived readers (e.g. an MCP server holding a read-only store while a
+  background sync writes) serve stale results until reopen.
+
 ## 0.2.0
 
 ### GitHub repositories as a first-class source
