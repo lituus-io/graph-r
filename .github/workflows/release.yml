@@ -27,7 +27,13 @@ jobs:
       - name: Tag must match every manifest
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          # On a tag, the tag is the authority; on a manual dispatch there is
+          # no tag, so the root manifest is — either way all three must agree.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+          else
+            tag=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          fi
           for f in Cargo.toml bindings/python/Cargo.toml bindings/python/pyproject.toml; do
             grep -q "^version = \"$tag\"" "$f" \
               || { echo "::error::$f does not declare version $tag"; exit 1; }
