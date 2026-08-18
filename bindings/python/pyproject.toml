@@ -12,6 +12,7 @@ description = "Embedded persistent knowledge graph: absorb a crawl, keep it fres
 # abi3-py312 is the floor the Rust side builds against; a lower declaration
 # here would promise interpreters the wheel cannot actually load.
 requires-python = ">=3.12"
+readme = "README.md"
 license = { text = "AGPL-3.0-or-later OR LicenseRef-Commercial" }
 authors = [{ name = "lituus-io", email = "spicyzhug@gmail.com" }]
 keywords = ["knowledge-graph", "embedded", "crawler", "index", "ttl"]
