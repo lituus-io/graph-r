@@ -142,12 +142,20 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
 
   python:
-    name: Python bindings
+    name: Python bindings (${{ matrix.os }})
     needs: fmt
-    runs-on: ubuntu-latest
+    # The persisted store must be readable AND writable on every OS a user
+    # runs, so the binding suite (persistence, threading, memory profile)
+    # runs on all three per push — not only at release time.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the link-r sibling
+        shell: bash
         run: |
           git clone --depth 1 \
             "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
@@ -156,7 +164,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bindings/python
-          key: pyo3
+          key: pyo3-${{ matrix.os }}
       - uses: actions/setup-python@v5
         with:
           # 3.12 is the abi3 floor the binding builds against; the resulting
@@ -169,9 +177,10 @@ jobs:
           cargo clippy --all-targets
       - name: Build and test the wheel in place
         working-directory: bindings/python
+        shell: bash
         run: |
           python -m venv .venv
-          . .venv/bin/activate
+          . .venv/bin/activate 2>/dev/null || . .venv/Scripts/activate
           pip install maturin pytest
           maturin develop --release
           pytest tests/ -v

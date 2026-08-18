@@ -83,8 +83,8 @@ class Store:
         """Open read-only; coexists with a live writer in another process."""
     def sync(
         self,
-        root: str,
-        depth: int = 2,
+        source: str,
+        depth: Optional[int] = None,
         max_pages: int = 1000,
         concurrency: int = 8,
         token: Optional[str] = None,
@@ -94,16 +94,33 @@ class Store:
         extensions: Optional[List[str]] = None,
         index_path_contains: Optional[List[str]] = None,
         pin: bool = False,
+        max_bytes: Optional[int] = None,
+        api_base: Optional[str] = None,
+        raw_base: Optional[str] = None,
     ) -> SyncReport:
-        """Crawl ``root`` and absorb the result — the whole loop in one call.
+        """Acquire ``source`` and absorb the result — the whole loop in one call.
 
-        A fresh in-memory link-r index is seeded with the graph's stored
-        validators, so previously seen pages revalidate with ``If-None-Match``
-        and transfer no body when unchanged. New/changed pages are upserted
-        with segments and edges, unchanged pages' freshness intervals grow,
-        gone pages are tombstoned, the store compacts, and the index is
-        discarded. ``scope`` is one of ``'path'`` (default), ``'host'``,
-        ``'subdomains'``.
+        Two source forms, routed automatically:
+
+        - **A GitHub repository spec** —
+          ``https://github.com/owner/repo[/tree/ref[/dir]]`` or
+          ``github:owner/repo@ref[//dir]``. One tree-API call lists every file
+          with its blob SHA; files whose SHA the graph already stores are
+          revalidated without any fetch, so an unchanged repository costs
+          exactly one HTTPS request. ``depth`` = directory levels below the
+          subdir (default unlimited). ``token`` (a PAT; required for
+          private/internal repos) is sent only to the GitHub API and raw
+          hosts. ``api_base``/``raw_base`` (set together) point at a GitHub
+          Enterprise deployment. Crawl-only options raise ``ValueError``.
+        - **Any other http(s) URL** — the recursive crawler. ``depth`` = link
+          hops (default 2); stored ``ETag``s make unchanged pages answer 304
+          with no body. ``scope`` is ``'path'`` (default), ``'host'``, or
+          ``'subdomains'``.
+
+        Either way the outcome flows into the graph (new/changed documents
+        upserted with segments and edges, unchanged documents' freshness
+        intervals grown, gone documents tombstoned), the store compacts, and
+        the ephemeral index is discarded.
         """
     def query(self, text: str, k: int = 20, depth: int = 3, budget_tokens: int = 2000) -> List[Hit]:
         """Ranked URL + anchor references for a plain-language query, rendered

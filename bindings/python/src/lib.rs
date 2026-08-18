@@ -199,6 +199,25 @@ fn runtime() -> PyResult<tokio::runtime::Runtime> {
         .map_err(|e| GraphRError::new_err(format!("tokio runtime: {e}")))
 }
 
+/// One SyncReport from the crawl-side and graph-side halves of a sync.
+fn merge_report(
+    crawl: &link_r::facade::UpdateReport,
+    ingest: &bridge::BridgeReport,
+) -> PySyncReport {
+    PySyncReport {
+        added: crawl.added,
+        updated: crawl.updated,
+        unchanged: crawl.unchanged,
+        skipped: crawl.skipped,
+        failed: crawl.failed,
+        upserted: ingest.upserted,
+        touched: ingest.touched,
+        tombstoned: ingest.tombstoned,
+        edges: ingest.edges,
+        segments: ingest.segments,
+    }
+}
+
 fn wrap(inner: Store) -> PyResult<PyStore> {
     Ok(PyStore { inner, rt: runtime()? })
 }
@@ -233,28 +252,35 @@ impl PyStore {
         wrap(Store::open_read_only(&path).map_err(map_err)?)
     }
 
-    /// Crawl `root` and absorb the result — the whole loop in one call.
+    /// Acquire `source` and absorb the result — the whole loop in one call.
     ///
-    /// A fresh in-memory link-r index is seeded with the graph's stored
-    /// validators and edges, so pages this store has seen before revalidate
-    /// with `If-None-Match` and transfer no body when unchanged. The crawl's
-    /// outcome flows into the graph (new/changed pages upserted with segments
-    /// and edges, unchanged pages' freshness intervals grown, gone pages
-    /// tombstoned), the store compacts, and the index is discarded — bodies
-    /// and vectors never outlive the call.
+    /// Two source forms, routed automatically:
     ///
-    /// `scope` is one of `'path'` (default), `'host'`, `'subdomains'`.
-    /// `path_contains` confines *crawling*; `index_path_contains` narrows
-    /// *indexing* the same way; `extensions` (e.g. `['md']`) indexes only
-    /// matching pages while still following others for links. `token` sets a
-    /// bearer credential scoped to the root's host.
-    #[pyo3(signature = (root, depth=2, max_pages=1000, concurrency=8, token=None, scope=None, min_delay_ms=0, path_contains=None, extensions=None, index_path_contains=None, pin=false))]
+    /// - **A GitHub repository spec** — `https://github.com/owner/repo[/tree/ref[/dir]]`
+    ///   or `github:owner/repo@ref[//dir]`. One tree-API call lists every file
+    ///   with its blob SHA; files whose SHA the graph already stores are
+    ///   revalidated without any fetch, so an unchanged repository costs
+    ///   exactly one HTTPS request. `depth` = directory levels below the
+    ///   subdir. `token` (a PAT; required for private/internal repos) is sent
+    ///   only to the GitHub API and raw hosts. Crawl-only options (`scope`,
+    ///   `path_contains`, `index_path_contains`, `min_delay_ms`) are invalid
+    ///   here and raise `ValueError`.
+    /// - **Any other http(s) URL** — the recursive crawler. `depth` = link
+    ///   hops; stored `ETag`s make unchanged pages answer 304 with no body.
+    ///
+    /// Either way: a fresh in-memory link-r index is seeded from the graph's
+    /// stored validators, the outcome flows into the graph (new/changed
+    /// documents upserted with segments and edges, unchanged documents'
+    /// freshness intervals grown, gone documents tombstoned), the store
+    /// compacts, and the index is discarded — bodies and vectors never
+    /// outlive the call.
+    #[pyo3(signature = (source, depth=None, max_pages=1000, concurrency=8, token=None, scope=None, min_delay_ms=0, path_contains=None, extensions=None, index_path_contains=None, pin=false, max_bytes=None, api_base=None, raw_base=None))]
     #[allow(clippy::too_many_arguments)] // a flat keyword surface is the point for Python
     fn sync(
         &self,
         py: Python<'_>,
-        root: String,
-        depth: u16,
+        source: String,
+        depth: Option<u16>,
         max_pages: usize,
         concurrency: usize,
         token: Option<String>,
@@ -264,15 +290,79 @@ impl PyStore {
         extensions: Option<Vec<String>>,
         index_path_contains: Option<Vec<String>>,
         pin: bool,
+        max_bytes: Option<u64>,
+        api_base: Option<String>,
+        raw_base: Option<String>,
     ) -> PyResult<PySyncReport> {
+        if link_r::GithubSpec::matches(&source) {
+            // Crawl-only knobs are meaningless against the tree API; passing
+            // them is a caller bug, not something to ignore silently.
+            if scope.is_some()
+                || path_contains.is_some()
+                || index_path_contains.is_some()
+                || min_delay_ms != 0
+            {
+                return Err(PyValueError::new_err(
+                    "scope/path_contains/index_path_contains/min_delay_ms are crawl options; \
+                     they do not apply to a GitHub repository spec",
+                ));
+            }
+            if api_base.is_some() != raw_base.is_some() {
+                return Err(PyValueError::new_err(
+                    "api_base and raw_base must be set together (GitHub Enterprise \
+                     deployments move both hosts as a pair)",
+                ));
+            }
+            return py.detach(|| {
+                self.rt.block_on(async {
+                    let seed = bridge::crawl_seed(&self.inner);
+                    let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
+                    let mut update = index
+                        .update_github(&source)
+                        .map_err(map_linkr)?
+                        .concurrency(concurrency)
+                        .validators(seed.validators);
+                    // GitHub Enterprise (and hermetic tests): the pairing
+                    // guard above already ensured both bases move together.
+                    if let (Some(api), Some(raw)) = (&api_base, &raw_base) {
+                        update = update.bases(api.as_str(), raw.as_str());
+                    }
+                    if let Some(d) = depth {
+                        update = update.depth(d);
+                    }
+                    if let Some(b) = max_bytes {
+                        update = update.max_bytes(b);
+                    }
+                    for ext in extensions.into_iter().flatten() {
+                        update = update.accept_extension(ext);
+                    }
+                    if let Some(t) = token {
+                        update = update.token(t);
+                    }
+                    if pin {
+                        update = update.pin();
+                    }
+                    let report = update.run().await.map_err(map_linkr)?;
+                    let ingest =
+                        bridge::ingest_update(&self.inner, &index, &report).map_err(map_err)?;
+                    Ok(merge_report(&report, &ingest))
+                })
+            });
+        }
+
+        if api_base.is_some() || raw_base.is_some() {
+            return Err(PyValueError::new_err(
+                "api_base/raw_base apply only to a GitHub repository spec",
+            ));
+        }
         let crawl_scope = parse_scope(scope.as_deref())?;
         py.detach(|| {
             self.rt.block_on(async {
                 let seed = bridge::crawl_seed(&self.inner);
                 let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
                 let mut update = index
-                    .update(root)
-                    .depth(depth)
+                    .update(source)
+                    .depth(depth.unwrap_or(2))
                     .max_pages(max_pages)
                     .concurrency(concurrency)
                     .scope(crawl_scope)
@@ -296,18 +386,7 @@ impl PyStore {
                 }
                 let crawl = update.run().await.map_err(map_linkr)?;
                 let ingest = bridge::ingest_update(&self.inner, &index, &crawl).map_err(map_err)?;
-                Ok(PySyncReport {
-                    added: crawl.added,
-                    updated: crawl.updated,
-                    unchanged: crawl.unchanged,
-                    skipped: crawl.skipped,
-                    failed: crawl.failed,
-                    upserted: ingest.upserted,
-                    touched: ingest.touched,
-                    tombstoned: ingest.tombstoned,
-                    edges: ingest.edges,
-                    segments: ingest.segments,
-                })
+                Ok(merge_report(&crawl, &ingest))
             })
         })
     }

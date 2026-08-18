@@ -4,6 +4,40 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0
+
+### GitHub repositories as a first-class source
+
+`Store.sync` now routes by source form: a GitHub repository spec
+(`https://github.com/owner/repo[/tree/ref[/dir]]` or
+`github:owner/repo@ref[//dir]`) goes through link-r's new tree-API source —
+one API call lists every file with its blob SHA, files whose SHA the graph
+already stores are revalidated **without any fetch**, and only new/changed
+blobs transfer. An unchanged repository costs exactly one HTTPS request per
+sync, from a cold start included: the SHAs ride the existing `etag` →
+`crawl_seed` → validators plumbing, unchanged.
+
+- `depth` means directory levels below the subdir on this path (link hops on
+  the crawl path, as before); `max_bytes` skips oversized files from the
+  tree's own size field, no fetch issued.
+- `token` (a PAT) reaches only the GitHub API and raw hosts — never a host a
+  document links to. Public, private, and internal repositories all work.
+- `api_base`/`raw_base` (set together) target GitHub Enterprise.
+- Crawl-only options passed with a GitHub spec raise `ValueError` rather than
+  being silently ignored.
+
+### Cross-platform persistence and memory, tested
+
+- The binding CI job now runs the full suite on Linux, macOS, and Windows on
+  every push. New `test_persistence.py` pins the file contract per-OS:
+  write→close→reopen→write-again cycles, stores under paths with spaces and
+  non-ASCII characters, fifty open/close cycles proving the lock releases
+  every time, a cross-process write via a child interpreter, and
+  `os.replace` stamp atomicity beside the store.
+- New `test_memory.py` pins the harness read path's zero-growth property:
+  hundreds of query/due cycles — and a reader running under a live writer —
+  hold RSS flat and leave no Python-heap accumulation.
+
 ## 0.1.0
 
 Initial release: an embedded, persistent knowledge graph that serves as the

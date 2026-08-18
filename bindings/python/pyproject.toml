@@ -11,7 +11,7 @@ build-backend = "maturin"
 # `pip install` name carries the prefix; the module this wheel ships is still
 # `graph_r`.
 name = "uu-graph-r"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embedded persistent knowledge graph: absorb a crawl, keep it fresh on an adaptive TTL, answer with URLs and anchors inside a token budget."
 # abi3-py312 is the floor the Rust side builds against; a lower declaration
 # here would promise interpreters the wheel cannot actually load.

@@ -3,7 +3,7 @@
 
 [package]
 name = "graph-r"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
@@ -33,7 +33,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "1.0"
 smallvec = { version = "1.13", features = ["union", "const_generics"] }
 compact_str = "0.8"
-link-r = { path = "../link-r", optional = true, default-features = false, features = ["crawl", "hash", "html", "markdown", "fs"] }
+link-r = { path = "../link-r", optional = true, default-features = false, features = ["crawl", "hash", "html", "markdown", "fs", "github"] }
 
 # flock() for the cross-process single-writer lock lives in the os unsafe
 # island; libc is already in the tree transitively via memmap2.
