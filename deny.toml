@@ -62,6 +62,11 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A path dependency carries no version requirement, which cargo-deny counts as a
+# wildcard. That is the normal shape for crates developed together (graph-r's
+# optional link-r edge, and the fuzz crate's edge back to its parent), so path
+# deps are exempted while a genuine `version = "*"` from crates.io still fails.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
