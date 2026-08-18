@@ -141,74 +141,153 @@ fn map_linkr(e: &link_r::Error) -> crate::Error {
     crate::Error::format(format!("link-r: {e}"))
 }
 
+/// The conditional-crawl seeds stored in this graph, in link-r's vocabulary.
+///
+/// Produced by [`crawl_seed`]; feed both fields straight into
+/// `UpdateBuilder::validators` / `known_edges`.
+#[derive(Clone, Debug, Default)]
+pub struct CrawlSeed {
+    /// Stored `ETag` validators by canonical-URL key: each becomes an
+    /// `If-None-Match`, so an unchanged page answers 304 and transfers nothing.
+    pub validators: Vec<(link_r::UrlKey, compact_str::CompactString)>,
+    /// Known outbound edges by canonical-URL key: they keep the crawl frontier
+    /// alive through a 304, which yields no body to parse links from.
+    pub known_edges: Vec<(link_r::UrlKey, Vec<link_r::Url>)>,
+}
+
+/// Extract the conditional-crawl seeds from the graph.
+///
+/// This is the piece that makes the whole design stateless: the link-r index
+/// is meant to be absorbed and *discarded* (bodies and vectors never outlive
+/// the session), and this hands the graph's durable `ETag`s and edges back to
+/// a fresh index, so a re-crawl after a process restart revalidates for free —
+/// zero body transfers for anything unchanged:
+///
+/// ```no_run
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// # let store = graph_r::Store::open("kb")?;
+/// let seed = graph_r::bridge::crawl_seed(&store);
+/// let mut index = link_r::LinkIndex::in_memory()?;
+/// let report = index
+///     .update("https://docs.example.com/")
+///     .validators(seed.validators)
+///     .known_edges(seed.known_edges)
+///     .run()
+///     .await?;
+/// graph_r::bridge::ingest_update(&store, &index, &report)?;
+/// # Ok(()) }
+/// ```
+///
+/// Tombstoned and stub nodes are excluded — a stub has no URL to crawl, and a
+/// tombstone was already observed gone.
+#[must_use]
+pub fn crawl_seed(store: &Store) -> CrawlSeed {
+    let snap = store.snapshot();
+    let mut seed = CrawlSeed::default();
+    let mut keys: Vec<UrlKey> = Vec::new();
+    snap.for_each_live(|n| {
+        if let Some(etag) = n.etag {
+            seed.validators.push((link_r::UrlKey(n.key.0), etag.into()));
+        }
+        keys.push(n.key);
+    });
+    for key in keys {
+        let mut children = Vec::new();
+        let mut it = snap.neighbors(key);
+        while let Some(e) = crate::traverse::LendingIterator::next(&mut it) {
+            // A stub target has no URL label yet; there is nothing to hand a
+            // crawler for it.
+            if let Some(u) = e.dst_url.and_then(|u| link_r::Url::parse(u).ok()) {
+                children.push(u);
+            }
+        }
+        if !children.is_empty() {
+            seed.known_edges.push((link_r::UrlKey(key.0), children));
+        }
+    }
+    seed
+}
+
 fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Result<BridgeReport> {
     let mut report = BridgeReport::default();
     if pages.is_empty() {
         return Ok(report);
     }
     let now = now_ms();
-    // One pass over the export to resolve full metadata + edges per key.
-    let by_key: HashMap<u64, (usize, Vec<link_r::UrlKey>)> = index
-        .export()
-        .map_err(|e| map_linkr(&e))?
-        .enumerate()
-        .map(|(i, d)| (d.meta.url_key.raw(), (i, d.edges.to_vec())))
-        .collect();
-    let metas: Vec<_> = index.export().map_err(|e| map_linkr(&e))?.map(|d| d.meta).collect();
-
     let mut w = store.writer()?;
+
+    // Only Added/Updated pages need document metadata; the touch-only outcomes
+    // never read the export. Map those pages by key, then walk the export ONCE,
+    // borrowing metadata and edge lists in place — the previous shape
+    // materialized the whole export twice (a keyed map cloning every edge list,
+    // plus a parallel metadata vec), which made a 64-page refresh against a
+    // large index pay for every document it was not touching.
+    let wanted: HashMap<u64, &PageOutcome> = pages
+        .iter()
+        .filter(|p| matches!(p.change, PageChange::Added | PageChange::Updated))
+        .map(|p| (p.url_key.raw(), p))
+        .collect();
+
+    if !wanted.is_empty() {
+        for doc in index.export().map_err(|e| map_linkr(&e))? {
+            let Some(page) = wanted.get(&doc.meta.url_key.raw()) else { continue };
+            let m = doc.meta;
+            let key = UrlKey(m.url_key.raw());
+            let changed = page.change == PageChange::Updated;
+            w.upsert_node(&DocRecord {
+                url: &m.url,
+                url_key: key,
+                content_hash: m.content_hash,
+                fetched_at_ms: m.fetched_at_ms,
+                title: m.title.as_deref(),
+                snippet: (!m.snippet.is_empty()).then_some(m.snippet.as_str()),
+                etag: m.etag.as_deref(),
+                pinned: m.pinned,
+            })?;
+            let keywords: Vec<&str> =
+                page.keywords.iter().map(compact_str::CompactString::as_str).collect();
+            let segs: Vec<SegmentRecord<'_>> = page
+                .headings
+                .iter()
+                .enumerate()
+                .map(|(i, (depth, h))| SegmentRecord {
+                    label: h.as_str(),
+                    byte_range: None,
+                    depth: *depth,
+                    importance: seg_importance(*depth, i, h, &keywords),
+                })
+                .collect();
+            report.segments += segs.len();
+            w.set_segments(key, &segs)?;
+            let graph_edges: Vec<(UrlKey, EdgeType, u16)> =
+                doc.edges.iter().map(|&e| (gk(e), EdgeType::Link, 65_535)).collect();
+            report.edges += graph_edges.len();
+            w.set_edges(key, &graph_edges);
+            report.upserted += 1;
+            if changed {
+                // Cut the revalidation interval: the source is moving. (An
+                // Added page has no committed node yet, so a touch would be a
+                // no-op — its freshness starts from the upsert itself.)
+                if w.touch(
+                    key,
+                    Touch {
+                        checked_at_ms: now,
+                        outcome: Outcome::Changed,
+                        content_hash: Some(m.content_hash),
+                        etag: m.etag.as_deref(),
+                    },
+                )? {
+                    report.touched += 1;
+                }
+            }
+        }
+    }
+
+    // Touch-only outcomes: the node already exists committed, so the writer
+    // computes each next interval from real prior state.
     for page in pages {
         let key = UrlKey(page.url_key.raw());
         match page.change {
-            PageChange::Added | PageChange::Updated => {
-                let Some((mi, edges)) = by_key.get(&page.url_key.raw()) else { continue };
-                let m = metas[*mi];
-                let changed = page.change == PageChange::Updated;
-                w.upsert_node(&DocRecord {
-                    url: &m.url,
-                    url_key: key,
-                    content_hash: m.content_hash,
-                    fetched_at_ms: m.fetched_at_ms,
-                    title: m.title.as_deref(),
-                    snippet: (!m.snippet.is_empty()).then_some(m.snippet.as_str()),
-                    etag: m.etag.as_deref(),
-                    pinned: m.pinned,
-                })?;
-                let keywords: Vec<&str> =
-                    page.keywords.iter().map(compact_str::CompactString::as_str).collect();
-                let segs: Vec<SegmentRecord<'_>> = page
-                    .headings
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (depth, h))| SegmentRecord {
-                        label: h.as_str(),
-                        byte_range: None,
-                        depth: *depth,
-                        importance: seg_importance(*depth, i, h, &keywords),
-                    })
-                    .collect();
-                report.segments += segs.len();
-                w.set_segments(key, &segs)?;
-                let graph_edges: Vec<(UrlKey, EdgeType, u16)> =
-                    edges.iter().map(|&e| (gk(e), EdgeType::Link, 65_535)).collect();
-                report.edges += graph_edges.len();
-                w.set_edges(key, &graph_edges);
-                report.upserted += 1;
-                if changed {
-                    // Cut the revalidation interval: the source is moving.
-                    if w.touch(
-                        key,
-                        Touch {
-                            checked_at_ms: now,
-                            outcome: Outcome::Changed,
-                            content_hash: Some(m.content_hash),
-                            etag: m.etag.as_deref(),
-                        },
-                    )? {
-                        report.touched += 1;
-                    }
-                }
-            }
             PageChange::Unchanged => {
                 if w.touch(
                     key,
@@ -238,7 +317,7 @@ fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Resu
                     report.tombstoned += 1;
                 }
             }
-            PageChange::Skipped => {}
+            PageChange::Added | PageChange::Updated | PageChange::Skipped => {}
         }
     }
     w.commit()?;

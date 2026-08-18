@@ -128,6 +128,17 @@ impl WriteState {
 pub struct Writer<'s> {
     store: &'s Store,
     state: MutexGuard<'s, WriteState>,
+    /// Committed-state view, cached for the duration of one staging batch.
+    ///
+    /// Several staging methods read committed state (segment identity for
+    /// enrichment carry, the other tier's edges, freshness counters, node
+    /// existence). Taking a fresh snapshot per staged op folds the overlay
+    /// arena every time — during a bulk ingest that made staging O(batch ×
+    /// pending-ops). Nothing can commit while this writer holds the mutex, so
+    /// one snapshot is exactly as current as a fresh one for the whole batch;
+    /// [`Writer::commit`] drops it, both because the world changes there and so
+    /// the pinned generation slot is free before any auto-compaction installs.
+    snap: Option<crate::snapshot::Snapshot<'s>>,
 }
 
 fn check_label(name: &str, s: &str) -> Result<()> {
@@ -139,7 +150,15 @@ fn check_label(name: &str, s: &str) -> Result<()> {
 
 impl<'s> Writer<'s> {
     pub(crate) fn new(store: &'s Store, state: MutexGuard<'s, WriteState>) -> Self {
-        Self { store, state }
+        Self { store, state, snap: None }
+    }
+
+    /// The cached committed-state view (created on first use per batch).
+    fn view(&mut self) -> &crate::snapshot::Snapshot<'s> {
+        if self.snap.is_none() {
+            self.snap = Some(self.store.snapshot());
+        }
+        self.snap.as_ref().expect("just filled")
     }
 
     /// Stage a node create/replace.
@@ -176,7 +195,7 @@ impl<'s> Writer<'s> {
         }
         // Carry forward LLM-scored importance by segment identity.
         let carried: Vec<(u64, u16)> = {
-            let snap = self.store.snapshot();
+            let snap = self.view();
             snap.segments(key)
                 .iter()
                 .filter(|s| s.flags & sflags::LLM_SCORED != 0)
@@ -226,7 +245,7 @@ impl<'s> Writer<'s> {
         // enrichment edges and vice versa. New edges win a destination tie.
         let writing_enrich = extra_flags & crate::format::base::eflags::TIER_ENRICH != 0;
         let preserved: Vec<(UrlKey, u8, u8, u16)> = {
-            let snap = self.store.snapshot();
+            let snap = self.view();
             let mut kept = Vec::new();
             let mut it = snap.neighbors(key);
             while let Some(e) = crate::traverse::LendingIterator::next(&mut it) {
@@ -284,7 +303,7 @@ impl<'s> Writer<'s> {
             check_label("etag", e)?;
         }
         let (interval_s, checks, changes, last_change_ms, content_hash, etag) = {
-            let snap = self.store.snapshot();
+            let snap = self.view();
             let Some(node) = snap.node(key) else { return Ok(false) };
             let cfg = snap.ttl();
             let next = cfg.next_interval(node.interval_s.max(1), t.outcome);
@@ -337,7 +356,7 @@ impl<'s> Writer<'s> {
             .staged
             .iter()
             .any(|op| matches!(op, Op::UpsertNode { key: k, .. } if *k == key))
-            || self.store.snapshot().node(key).is_some();
+            || self.view().node(key).is_some();
         if !exists {
             return Ok(false);
         }
@@ -362,6 +381,9 @@ impl<'s> Writer<'s> {
     /// then auto-compact past thresholds. Returns the last committed
     /// sequence number.
     pub fn commit(&mut self) -> Result<u64> {
+        // The cached view is about to go stale, and its pinned generation slot
+        // must be free before any auto-compaction below installs a new one.
+        self.snap = None;
         if self.state.staged.is_empty() {
             return Ok(self.state.next_seq.saturating_sub(1));
         }

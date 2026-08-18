@@ -411,3 +411,69 @@ fn enrichment_tier_survives_crawl_replacement() {
     let segs = snap.segments(guide);
     assert_eq!(segs[0].importance, 65_000, "and across compaction");
 }
+
+/// The community and discovery surface had no coverage at all — it was public
+/// API whose behaviour nothing pinned. Two link clusters joined by one weak
+/// bridge: each cluster is one community, the summary names and sizes it, and
+/// the bridge edge is the top surprise.
+#[test]
+fn communities_and_surprises_reflect_cluster_structure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    {
+        let mut w = store.writer().unwrap();
+        // Cluster A: three docs fully interlinked. Cluster B: likewise.
+        let cluster = |prefix: &str| -> Vec<String> {
+            (0..3).map(|i| format!("https://{prefix}.x.dev/p{i}")).collect()
+        };
+        let (a, b) = (cluster("a"), cluster("b"));
+        for (urls, title) in [(&a, "Alpha"), (&b, "Beta")] {
+            for (i, url) in urls.iter().enumerate() {
+                w.upsert_node(&DocRecord {
+                    url,
+                    url_key: key(url),
+                    content_hash: i as u64 + 1,
+                    fetched_at_ms: 1_000,
+                    title: Some(title),
+                    snippet: None,
+                    etag: None,
+                    pinned: false,
+                })
+                .unwrap();
+                let edges: Vec<(UrlKey, EdgeType, u16)> = urls
+                    .iter()
+                    .filter(|u| *u != url)
+                    .map(|u| (key(u), EdgeType::Link, 65_535))
+                    .collect();
+                w.set_edges(key(url), &edges);
+            }
+        }
+        // One weak bridge from A to B — the cross-community edge.
+        let mut bridge_edges: Vec<(UrlKey, EdgeType, u16)> =
+            a.iter().skip(1).map(|u| (key(u), EdgeType::Link, 65_535)).collect();
+        bridge_edges.push((key(&b[0]), EdgeType::Related, 200));
+        w.set_edges(key(&a[0]), &bridge_edges);
+        w.commit().unwrap();
+    }
+    store.compact().unwrap(); // ranks + communities are computed here
+
+    let snap = store.snapshot();
+    let a0 = key("https://a.x.dev/p0");
+    let b0 = key("https://b.x.dev/p0");
+
+    // Each cluster resolves to one community of three; the two differ.
+    let ca = snap.community_summary(a0, 5).expect("a0 is ranked");
+    let cb = snap.community_summary(b0, 5).expect("b0 is ranked");
+    assert_eq!(ca.size, 3, "cluster A is one community");
+    assert_eq!(cb.size, 3, "cluster B is one community");
+    assert_ne!(ca.id, cb.id, "the weak bridge must not merge the clusters");
+    assert_eq!(ca.top_urls.len(), 3);
+    assert!(!ca.name.is_empty(), "the summary names its top member");
+
+    // The bridge edge is the surprise: exactly one cross-community pair.
+    let surprises = snap.surprises(10);
+    assert_eq!(surprises.len(), 1, "one community pair, one representative edge");
+    let (from, to) = &surprises[0];
+    assert_eq!(from.key, a0);
+    assert_eq!(to.key, b0);
+}

@@ -644,19 +644,6 @@ impl<'s> Snapshot<'s> {
         out
     }
 
-    /// Documents worth pinning: highest-ranked live nodes not already pinned.
-    #[must_use]
-    pub fn pin_suggestions(&self, k: usize) -> Vec<&str> {
-        let mut ranked: Vec<(u16, u64, &str)> = Vec::new();
-        self.for_each_live(|n| {
-            if !n.pinned() && !n.url.is_empty() {
-                ranked.push((n.rank_permille, n.key.0, n.url));
-            }
-        });
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        ranked.into_iter().take(k).map(|(_, _, u)| u).collect()
-    }
-
     /// Keys touched by the overlay visible to this snapshot (unsorted).
     pub(crate) fn overlay_keys(&self) -> Vec<u64> {
         self.overlay().map.keys().copied().collect()

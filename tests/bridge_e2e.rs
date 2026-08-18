@@ -189,3 +189,86 @@ fn absorb_offloads_whole_index() {
     assert!(!hits.is_empty());
     assert!(hits[0].url.contains("beta"));
 }
+
+/// The stateless-loop seeds: after absorbing a crawl and discarding the index,
+/// `crawl_seed` must hand back every stored validator and edge so a fresh crawl
+/// revalidates for free. (The crawl side of that contract is proven in link-r's
+/// `conditional_recrawl` suite; this pins the extraction side.)
+#[test]
+fn crawl_seed_extracts_validators_and_edges_from_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    {
+        let mut w = store.writer().unwrap();
+        for (url, etag, links) in [
+            ("https://x.dev/docs", Some("\"r1\""), vec!["https://x.dev/docs/a"]),
+            ("https://x.dev/docs/a", Some("\"a1\""), vec!["https://x.dev/docs/b"]),
+            ("https://x.dev/docs/b", None, vec![]), // no validator stored
+        ] {
+            w.upsert_node(&graph_r::DocRecord {
+                url,
+                url_key: UrlKey::of(url),
+                content_hash: 1,
+                fetched_at_ms: 1_000,
+                title: None,
+                snippet: None,
+                etag,
+                pinned: false,
+            })
+            .unwrap();
+            let edges: Vec<(UrlKey, graph_r::EdgeType, u16)> =
+                links.iter().map(|l| (UrlKey::of(l), graph_r::EdgeType::Link, 65_535)).collect();
+            w.set_edges(UrlKey::of(url), &edges);
+        }
+        w.commit().unwrap();
+    }
+    store.compact().unwrap();
+
+    let seed = bridge::crawl_seed(&store);
+
+    // Validators: exactly the two documents that stored an etag, keyed by the
+    // same xxh3 link-r would compute for the canonical URL.
+    let mut validators: Vec<(u64, String)> =
+        seed.validators.iter().map(|(k, e)| (k.raw(), e.to_string())).collect();
+    validators.sort();
+    let mut expected = vec![
+        (UrlKey::of("https://x.dev/docs").0, "\"r1\"".to_string()),
+        (UrlKey::of("https://x.dev/docs/a").0, "\"a1\"".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(validators, expected);
+
+    // Known edges: both linking documents, with resolvable target URLs. The
+    // edge to /docs/b resolves because b is a real node with a URL label.
+    assert_eq!(seed.known_edges.len(), 2);
+    let edges_of = |url: &str| -> Vec<String> {
+        seed.known_edges
+            .iter()
+            .find(|(k, _)| k.raw() == UrlKey::of(url).0)
+            .map(|(_, kids)| kids.iter().map(std::string::ToString::to_string).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(edges_of("https://x.dev/docs"), vec!["https://x.dev/docs/a".to_string()]);
+    assert_eq!(edges_of("https://x.dev/docs/a"), vec!["https://x.dev/docs/b".to_string()]);
+
+    // A tombstoned document leaves the seed set: it was observed gone.
+    {
+        let mut w = store.writer().unwrap();
+        w.touch(
+            UrlKey::of("https://x.dev/docs/a"),
+            graph_r::Touch {
+                checked_at_ms: 2_000,
+                outcome: graph_r::Outcome::Gone,
+                content_hash: None,
+                etag: None,
+            },
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+    let seed = bridge::crawl_seed(&store);
+    assert!(
+        !seed.validators.iter().any(|(k, _)| k.raw() == UrlKey::of("https://x.dev/docs/a").0),
+        "a tombstoned document must not be re-crawled"
+    );
+}
