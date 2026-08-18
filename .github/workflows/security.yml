@@ -45,7 +45,15 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
             "$GITHUB_WORKSPACE/../link-r"
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # cargo-deny is installed and run directly rather than through
+      # EmbarkStudios/cargo-deny-action. That action runs in a Docker container
+      # which mounts only the workspace, so the link-r sibling cloned beside it
+      # is invisible inside the container and `cargo metadata` fails on the path
+      # dependency. Installing the tool keeps it on the host filesystem, where
+      # the sibling exists -- and matches how cargo-audit is handled above.
+      - name: Install cargo-deny
+        run: RUSTUP_TOOLCHAIN=stable cargo install cargo-deny --locked
+      - run: cargo deny check
 
   suite:
     name: Security suite
