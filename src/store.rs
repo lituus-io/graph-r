@@ -6,8 +6,14 @@
 //!
 //! # Concurrency model
 //!
-//! - Any number of snapshots; at most one writer per directory (cross-process
-//!   via the lock file, in-process via a mutex).
+//! - Any number of snapshots; at most one writer per directory. Two layers
+//!   enforce that, and they cover different scopes. The `flock` taken at
+//!   [`Store::open`] admits only one read-write *handle* per directory —
+//!   `flock` is per open file description, so a second handle is refused with
+//!   [`Error::Locked`] whether it is opened by another process **or by this
+//!   one**. The mutex inside a handle then serializes [`Writer`]s across
+//!   threads sharing it. [`Store::open_read_only`] takes no lock, so readers
+//!   always coexist with a live writer.
 //! - A fixed ring of generation slots each holds an mmapped base plus its
 //!   committed-op overlay behind an `RwLock`. Readers only ever `try_read` —
 //!   the sole moment a `try_read` can fail is the microseconds in which a
@@ -238,8 +244,12 @@ impl Store {
         }
     }
 
-    /// Acquire the single writer. `Error::ReadOnly` on read-only stores;
-    /// blocks if another in-process writer exists (flock covers processes).
+    /// Acquire the single writer. `Error::ReadOnly` on read-only stores.
+    ///
+    /// Blocks while another thread holds a [`Writer`] on *this* handle. A second
+    /// handle on the same directory cannot exist at all — [`Store::open`] would
+    /// have been refused with [`Error::Locked`] — so this mutex is the only
+    /// contention a caller can encounter.
     pub fn writer(&self) -> Result<Writer<'_>> {
         if self.read_only {
             return Err(Error::ReadOnly);

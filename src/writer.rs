@@ -264,8 +264,21 @@ impl<'s> Writer<'s> {
     }
 
     /// Record a revalidation outcome. Freshness policy (interval growth/cut,
-    /// counters) is computed here from the node's current state and the
-    /// store's [`crate::TtlConfig`]; returns `false` when `key` is unknown.
+    /// counters) is computed here from the node's current state and the store's
+    /// [`crate::TtlConfig`], and the resulting op carries the node's *full*
+    /// effective state so replay never re-derives policy.
+    ///
+    /// Returns `false`, staging nothing, when `key` is not a **committed** node.
+    /// That is the important word: the state is read through a snapshot, which
+    /// sees committed ops only, so a node staged earlier in this same batch is
+    /// not yet visible. Commit the upsert before touching it — the link-r bridge
+    /// already does.
+    ///
+    /// The same rule means two touches of one key inside a single uncommitted
+    /// batch do not accumulate: both are computed from the pre-batch state and
+    /// the second wins under last-wins overlay folding. Commit between
+    /// observations of the same document. Pinned by `touch_requires_a_committed_node`
+    /// in `tests/regression.rs`.
     pub fn touch(&mut self, key: UrlKey, t: Touch<'_>) -> Result<bool> {
         if let Some(e) = t.etag {
             check_label("etag", e)?;

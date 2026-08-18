@@ -116,15 +116,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn second_lock_acquisition_in_process_succeeds_after_drop() {
-        // flock is per-open-file: within one process a second open+flock on
-        // the same path *would* succeed, so the in-process writer mutex (not
-        // this lock) is what serializes same-process writers. This test pins
-        // the cross-open release behavior we rely on.
+    fn lock_is_released_on_drop() {
+        // flock is per open file *description*, so dropping the handle closes
+        // the fd and releases the lock. This pins the cross-open release
+        // behavior the store relies on when a writer is dropped and reopened.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("graph.lock");
         let l1 = LockFile::acquire(&p).unwrap();
         drop(l1);
         let _l2 = LockFile::acquire(&p).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_live_lock_is_refused_even_in_one_process() {
+        // A separate `open()` creates a separate open file description, so
+        // flock conflicts with it — including within a single process. An
+        // earlier comment here claimed the opposite (that only the in-process
+        // mutex serializes same-process writers); it was wrong, and
+        // tests/security.rs pins the same guarantee at the Store level.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("graph.lock");
+        let _held = LockFile::acquire(&p).unwrap();
+        assert!(
+            matches!(LockFile::acquire(&p), Err(Error::Locked)),
+            "a second live flock on the same path must be refused"
+        );
     }
 }
