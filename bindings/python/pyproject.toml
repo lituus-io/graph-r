@@ -6,7 +6,11 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "graph-r"
+# The distribution is `uu-graph-r`, matching its sibling `uu-link-r` (whose
+# unprefixed name PyPI's similarity rule blocks outright). Only the
+# `pip install` name carries the prefix; the module this wheel ships is still
+# `graph_r`.
+name = "uu-graph-r"
 version = "0.1.0"
 description = "Embedded persistent knowledge graph: absorb a crawl, keep it fresh on an adaptive TTL, answer with URLs and anchors inside a token budget."
 # abi3-py312 is the floor the Rust side builds against; a lower declaration

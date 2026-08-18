@@ -1,5 +1,8 @@
 # graph-r
 
+`pip install uu-graph-r` → `import graph_r` (Python ≥ 3.12, one `abi3` wheel
+per platform).
+
 An embedded, persistent knowledge graph. Point it at a URL once; it crawls,
 distills each page into compact lookup metadata (title, snippet, heading
 anchors, links), and remembers. From then on, lookups answer **locally** —

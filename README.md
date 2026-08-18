@@ -111,8 +111,8 @@ over-allocation).
 
 ## Python
 
-The same loop, one class, from PyPI (`pip install graph-r`; Python >= 3.12,
-one abi3 wheel per platform):
+The same loop, one class, from PyPI (`pip install uu-graph-r`, then
+`import graph_r`; Python >= 3.12, one abi3 wheel per platform):
 
 ```python
 import graph_r
