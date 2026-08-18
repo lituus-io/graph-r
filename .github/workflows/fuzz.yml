@@ -38,6 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
+
       # rust-toolchain.toml already pins a nightly, which is what cargo-fuzz
       # needs to build the instrumented target.
       - name: Install the pinned toolchain

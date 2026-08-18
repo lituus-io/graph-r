@@ -24,6 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       # cargo-audit is a tool, not part of the build: install it with a current
       # stable toolchain rather than the crate's pinned nightly.
       - name: Install cargo-audit
@@ -35,6 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   suite:
@@ -42,21 +52,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # tests/security.rs is the untrusted-input and access-control boundary:
       # hostile base/WAL files, resource-exhaustion bounds, writer exclusion,
       # and the promise that only caller-supplied metadata reaches the file.
       - name: Security tests
-        run: cargo test --features llm --test security
+        run: cargo test --all-features --test security
       - name: Regression tests
-        run: cargo test --features llm --test regression
+        run: cargo test --all-features --test regression
 
   panic-lints:
     name: Panic-path lints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # Advisory, not gating. The library's own unwrap/expect calls are
@@ -67,7 +87,7 @@ jobs:
       - name: Report panic-capable paths
         continue-on-error: true
         run: |
-          cargo clippy --features llm --all-targets -- \
+          cargo clippy --all-features --all-targets -- \
             -W clippy::unwrap_used \
             -W clippy::expect_used \
             -W clippy::panic \

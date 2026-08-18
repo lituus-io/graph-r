@@ -19,19 +19,19 @@ env:
 # Two things shape this file.
 #
 # 1. The toolchain is NOT selected by dtolnay/rust-toolchain. That action exports
-#    RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml -- so using it would
-#    silently test a different compiler than developers run, which is exactly the
-#    failure the dated pin exists to prevent. `rustup show` installs the toolchain
-#    named in rust-toolchain.toml, with its rustfmt/clippy components, keeping one
-#    source of truth.
+#    RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml, so CI would silently
+#    test a different compiler than developers run -- the exact failure the dated
+#    pin exists to prevent. `rustup show` installs the toolchain the file names.
 #
-# 2. `bridge` is an optional feature backed by a *relative path* dependency
-#    (`link-r = { path = "../link-r" }`), so `--all-features` cannot resolve in a
-#    standalone checkout of this repo. Every ordinary job therefore builds
-#    everything except `bridge`; one dedicated job checks out link-r as a sibling
-#    and covers the bridge for real. That keeps the bulk of CI self-contained and
-#    makes the cross-repo requirement explicit in one place instead of an
-#    inscrutable "path not found" in every job.
+# 2. `bridge` is an optional feature backed by a relative path dependency
+#    (link-r = { path = "../link-r" }). Cargo reads a path dependency's manifest
+#    while resolving metadata **whether or not the feature is enabled**, so
+#    without the sibling present *every* cargo invocation fails -- including
+#    `cargo fmt` and `--no-default-features`. The sibling is therefore fetched in
+#    every job, not just the ones that exercise the bridge.
+#
+#    actions/checkout cannot write outside $GITHUB_WORKSPACE, and `../link-r`
+#    resolves above it, so the sibling is cloned with git directly.
 
 jobs:
   fmt:
@@ -39,6 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - name: Install the pinned toolchain
         run: rustup show
       - run: cargo fmt --check
@@ -49,9 +54,14 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --features llm --all-targets
+      - run: cargo clippy --all-features --all-targets
 
   test:
     name: Test (${{ matrix.name }})
@@ -64,57 +74,24 @@ jobs:
           - { name: linux-x86_64, runner: ubuntu-latest }
           - { name: linux-arm64, runner: ubuntu-24.04-arm }
           - { name: macos-arm64, runner: macos-15 }
-          # Windows exercises the non-flock LockFile fallback, whose
-          # release-on-drop path cannot run on any unix host.
+          # Windows is the only place the non-flock LockFile fallback runs; its
+          # release-on-drop path is unverifiable on any unix host.
           - { name: windows-x86_64, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
-      - run: cargo test --features llm
-
-  bridge:
-    name: Bridge (with link-r)
-    needs: fmt
-    runs-on: ubuntu-latest
-    steps:
-      # `path = "../link-r"` is relative to this crate's Cargo.toml, so both
-      # repos are checked out as siblings under the workspace root.
-      - uses: actions/checkout@v4
-        with:
-          path: graph-r
-      - uses: actions/checkout@v4
-        with:
-          repository: lituus-io/link-r
-          path: link-r
-          # link-r is private, and a workflow's GITHUB_TOKEN is scoped to its own
-          # repository, so reading a sibling needs an explicit read-only PAT.
-          # Without the secret the job is skipped rather than failing red, so a
-          # fork or an unconfigured clone still gets a green, honest CI run.
-          token: ${{ secrets.SIBLING_REPO_TOKEN }}
-        continue-on-error: true
-        id: sibling
-      - name: Report a missing sibling checkout
-        if: steps.sibling.outcome != 'success'
-        run: |
-          echo "::notice::link-r checkout unavailable (SIBLING_REPO_TOKEN not set);"\
-               "skipping the bridge feature. Every other job still covers the crate."
-      - run: rustup show
-        if: steps.sibling.outcome == 'success'
-        working-directory: graph-r
-      - uses: Swatinem/rust-cache@v2
-        if: steps.sibling.outcome == 'success'
-        with:
-          workspaces: graph-r
-          key: bridge
-      - name: Clippy and test with every feature
-        if: steps.sibling.outcome == 'success'
-        working-directory: graph-r
-        run: |
-          cargo clippy --all-features --all-targets
-          cargo test --all-features
+      - name: Test
+        shell: bash
+        run: cargo test --all-features
 
   features:
     name: Feature matrix
@@ -122,16 +99,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # `default = []` is the product promise: the pure embedded store pulls in
       # no optional dependency. Each feature must also stand alone, or "install
-      # by requirement" is only true for the combinations someone happened to
-      # try. `bridge` is covered by the job above, where link-r is present.
-      - name: Default (no features)
-        run: cargo check --no-default-features --all-targets
-      - name: llm only
-        run: cargo check --no-default-features --features llm --all-targets
+      # by requirement" is only true for the combinations someone happened to try.
+      - name: Each feature combination
+        run: |
+          set -euo pipefail
+          for f in "" "bridge" "llm" "bridge,llm"; do
+            echo "::group::features=${f:-none}"
+            if [ -z "$f" ]; then
+              cargo check --no-default-features --all-targets
+            else
+              cargo check --no-default-features --features "$f" --all-targets
+            fi
+            echo "::endgroup::"
+          done
 
   docs:
     name: Docs
@@ -139,11 +128,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # The crate is #![deny(missing_docs)]; this additionally catches broken
       # intra-doc links, which compile fine but rot silently.
-      - run: cargo doc --features llm --no-deps
+      - run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -153,6 +147,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -164,9 +163,9 @@ jobs:
       # follows is a measurement rather than a guess.
       - name: Measure
         run: |
-          cargo llvm-cov --features llm --summary-only | tee coverage.txt
+          cargo llvm-cov --all-features --summary-only | tee coverage.txt
           {
-            echo "### Coverage (excluding the bridge feature)"
+            echo "### Coverage"
             echo ""
             echo '```'
             cat coverage.txt

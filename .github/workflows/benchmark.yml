@@ -23,13 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench
 
       - name: Run benchmarks
-        run: cargo bench --features llm
+        run: cargo bench --all-features
 
       # Compared against the committed baseline in benches/baselines/. Advisory
       # on a shared runner: benchmark noise there routinely reaches double
@@ -53,7 +58,7 @@ jobs:
       # runner noise. Fifty no-op compactions must produce byte-identical
       # sections, which is what stops the store growing on idle refresh cycles.
       - name: Memory-expansion regression
-        run: cargo test --features llm --test regression fifty_no_op_compactions_are_byte_identical
+        run: cargo test --all-features --test regression fifty_no_op_compactions_are_byte_identical
 
       - name: Upload criterion report
         if: always()
