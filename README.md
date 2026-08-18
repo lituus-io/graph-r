@@ -111,4 +111,10 @@ over-allocation).
 
 ## License
 
-Copyright: lituus-io, all rights reserved.
+Dual-licensed:
+
+- **AGPL-3.0-or-later** for open-source use. See [LICENSE](LICENSE).
+- **Commercial**, for use in proprietary or closed-source software without the
+  AGPL's copyleft requirements. Contact spicyzhug@gmail.com.
+
+Copyright (c) 2024-2026 Lituus-io. All rights reserved.
