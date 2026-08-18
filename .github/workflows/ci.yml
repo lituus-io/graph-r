@@ -141,6 +141,41 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  python:
+    name: Python bindings
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/python
+          key: pyo3
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 is the abi3 floor the binding builds against; the resulting
+          # wheel loads on every later version from the same artifact.
+          python-version: "3.12"
+      - name: Fmt and clippy the binding
+        working-directory: bindings/python
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets
+      - name: Build and test the wheel in place
+        working-directory: bindings/python
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest
+          maturin develop --release
+          pytest tests/ -v
+
   coverage:
     name: Coverage
     needs: fmt

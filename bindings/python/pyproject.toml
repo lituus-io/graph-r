@@ -1,0 +1,36 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "graph-r"
+version = "0.1.0"
+description = "Embedded persistent knowledge graph: absorb a crawl, keep it fresh on an adaptive TTL, answer with URLs and anchors inside a token budget."
+# abi3-py312 is the floor the Rust side builds against; a lower declaration
+# here would promise interpreters the wheel cannot actually load.
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later OR LicenseRef-Commercial" }
+authors = [{ name = "lituus-io", email = "spicyzhug@gmail.com" }]
+keywords = ["knowledge-graph", "embedded", "crawler", "index", "ttl"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Text Processing :: Indexing",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.maturin]
+module-name = "graph_r"
+# Type stub shipped alongside the compiled module.
+include = ["graph_r.pyi"]
+# The wheel builds against the stable ABI: one cp312-abi3 artifact per
+# platform loads on 3.12 and every later version.

@@ -51,6 +51,20 @@ durable backend for [link-r](https://github.com/lituus-io/link-r).
 - Features: `default = []` (the pure embedded store), `bridge` (link-r ingest
   and due-list refresh loop), `llm` (a vendor-free `Enricher` trait seam).
 
+### The stateless loop and the Python wheel
+
+- `bridge::crawl_seed` extracts the graph's stored validators and edges in
+  link-r's vocabulary, so a *fresh* index revalidates a known site with zero
+  body transfers — the "absorb and discard the index" design now survives a
+  process restart.
+- Change detection in the bridge is graph-relative: a changed page arriving as
+  `Added` from an ephemeral index still cuts its refresh interval, because the
+  committed content hash — not the crawl's index — decides what changed.
+- Python bindings (`pip install graph-r`, abi3, Python ≥ 3.12): one `Store`
+  class carrying the whole loop — `sync` (crawl → absorb → compact in a single
+  call, interpreter detached), `query`/`related`/`due`, the `add`/`touch`
+  writer seam, `pin`/`remove`/`compact`. Usable from any thread.
+
 ### Verification
 
 - Unit, hermetic lifecycle, bridge end-to-end, and concurrency-stress suites.

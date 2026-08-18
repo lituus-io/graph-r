@@ -1,0 +1,36 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+
+[package]
+name = "graph-r-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+description = "Python bindings for graph-r (PyO3)."
+publish = false
+
+[lib]
+name = "graph_r"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py312: one wheel per platform serves every Python from 3.12 up.
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
+# The crawl inside `Store.sync` is async; the binding owns a private runtime
+# and blocks on it, detached from the interpreter.
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Aliased to `graphr` because this crate's own lib is named `graph_r` (the
+# Python module). `bridge` pulls the exact matching link-r in statically —
+# the binding reaches it through `graphr::bridge::link_r`, so there is no
+# second path dependency to keep in sync.
+graphr = { path = "../..", package = "graph-r", features = ["bridge"] }
+
+# Detach from the parent crate's build so the main `cargo test` never needs Python.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

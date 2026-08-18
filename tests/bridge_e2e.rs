@@ -272,3 +272,54 @@ fn crawl_seed_extracts_validators_and_edges_from_the_graph() {
         "a tombstoned document must not be re-crawled"
     );
 }
+
+/// The stateless loop's change detection is graph-relative, not index-relative.
+///
+/// Every sync builds a fresh index, so a page this graph has known for months
+/// arrives as `Added` — the crawl is honest about *its* index, which has never
+/// seen anything. The graph is the memory: whether the freshness interval gets
+/// cut must depend on whether the committed content hash moved. Before the fix
+/// this test pins, a changed page in a fresh-index sync skipped its `Changed`
+/// touch entirely — the interval quietly reset to baseline instead of cutting,
+/// and the check was never counted.
+#[test]
+fn a_change_arriving_as_added_still_cuts_the_interval() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_corpus(corpus.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+
+    // Session one: absorb, then discard the index.
+    let (index, report) = build_index(corpus.path());
+    bridge::ingest_update(&store, &index, &report).unwrap();
+    drop(index);
+
+    let alpha = link_r::Url::from_file_path(corpus.path().join("alpha.md")).unwrap();
+    let key = UrlKey::of(&link_r::canonicalize(&alpha));
+    let (baseline_hash, baseline_checks) = {
+        let snap = store.snapshot();
+        let n = snap.node(key).unwrap();
+        (n.content_hash, n.checks)
+    };
+
+    // The document changes on disk; session two uses a FRESH index, so the
+    // crawl reports it as Added.
+    std::fs::File::create(corpus.path().join("alpha.md"))
+        .unwrap()
+        .write_all(b"# Alpha Install\n\nCompletely rewritten alpha instructions.\n")
+        .unwrap();
+    let (index, report) = build_index(corpus.path());
+    assert_eq!(report.added, 2, "a fresh index has never seen either page: {report:?}");
+    let ingest = bridge::ingest_update(&store, &index, &report).unwrap();
+
+    let snap = store.snapshot();
+    let n = snap.node(key).unwrap();
+    assert_ne!(n.content_hash, baseline_hash, "the new content landed");
+    assert_eq!(n.checks, baseline_checks + 1, "the change was counted as a check");
+    assert_eq!(n.changes, 1, "…and as a change");
+    assert!(ingest.touched >= 1, "the graph-relative change produced a touch: {ingest:?}");
+    // The unchanged sibling must NOT have been touched: identical hash, no cut.
+    let beta = link_r::Url::from_file_path(corpus.path().join("beta.md")).unwrap();
+    let b = snap.node(UrlKey::of(&link_r::canonicalize(&beta))).unwrap();
+    assert_eq!(b.changes, 0, "an identical page re-absorbed must not count a change");
+}

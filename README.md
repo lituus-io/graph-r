@@ -109,6 +109,28 @@ read-latency-under-write), `cargo +nightly fuzz run <target>` (every decoder:
 arbitrary bytes must produce a typed error, never a panic or an
 over-allocation).
 
+## Python
+
+The same loop, one class, from PyPI (`pip install graph-r`; Python >= 3.12,
+one abi3 wheel per platform):
+
+```python
+import graph_r
+
+store = graph_r.Store.open_or_create("kb")
+store.sync("https://docs.example.com/", depth=2)   # crawl -> absorb -> compact
+for hit in store.query("install on linux"):
+    print(hit.url, hit.anchor.label if hit.anchor else "")
+```
+
+`sync` seeds a fresh in-memory link-r index from the graph's stored
+validators, so a re-sync of an unchanged site transfers zero bodies — from a
+cold start included. The index is discarded when the call returns; bodies and
+vectors never outlive it. Safe from any thread (`asyncio.to_thread` works);
+blocking calls detach from the interpreter. See `bindings/python/graph_r.pyi`
+for the full surface (`add`/`touch` for non-crawl producers, `due`, `related`,
+`pin`, `remove`, `compact`).
+
 ## License
 
 Dual-licensed:

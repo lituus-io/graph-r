@@ -33,6 +33,12 @@
 //! # Ok(()) }
 //! ```
 
+// The bridge's whole vocabulary is link-r's, so the crate is re-exported:
+// a consumer driving the loop (crawl -> ingest -> seed) needs the *exact*
+// link-r this bridge was compiled against, and this is the one place to get
+// it without a second dependency to keep in sync.
+pub use link_r;
+
 use crate::error::Result;
 use crate::key::{EdgeType, UrlKey};
 use crate::store::Store;
@@ -208,6 +214,7 @@ pub fn crawl_seed(store: &Store) -> CrawlSeed {
     seed
 }
 
+#[allow(clippy::too_many_lines)] // one linear pass over the export, then the touches
 fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Result<BridgeReport> {
     let mut report = BridgeReport::default();
     if pages.is_empty() {
@@ -228,12 +235,23 @@ fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Resu
         .map(|p| (p.url_key.raw(), p))
         .collect();
 
+    // The crawl's Added/Updated distinction is relative to *its* index — and in
+    // the stateless loop that index is fresh every time, so a page this graph
+    // has known for months arrives as "Added". The graph is the memory: what
+    // decides whether the freshness interval gets cut is whether the committed
+    // content hash moved, not what an ephemeral index happened to have seen.
+    let committed_hashes: HashMap<u64, u64> = {
+        let snap = store.snapshot();
+        wanted.keys().filter_map(|&k| snap.node(UrlKey(k)).map(|n| (k, n.content_hash))).collect()
+    };
+
     if !wanted.is_empty() {
         for doc in index.export().map_err(|e| map_linkr(&e))? {
             let Some(page) = wanted.get(&doc.meta.url_key.raw()) else { continue };
             let m = doc.meta;
             let key = UrlKey(m.url_key.raw());
-            let changed = page.change == PageChange::Updated;
+            let changed = page.change == PageChange::Updated
+                || committed_hashes.get(&key.0).is_some_and(|&h| h != m.content_hash);
             w.upsert_node(&DocRecord {
                 url: &m.url,
                 url_key: key,
@@ -265,9 +283,9 @@ fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Resu
             w.set_edges(key, &graph_edges);
             report.upserted += 1;
             if changed {
-                // Cut the revalidation interval: the source is moving. (An
-                // Added page has no committed node yet, so a touch would be a
-                // no-op — its freshness starts from the upsert itself.)
+                // Cut the revalidation interval: the source is moving. (A
+                // genuinely new page has no committed node yet, so the touch
+                // is a no-op — its freshness starts from the upsert itself.)
                 if w.touch(
                     key,
                     Touch {
