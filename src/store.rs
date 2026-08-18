@@ -368,3 +368,137 @@ fn load_generation(
     }
     Ok((inner, next_seq, ops, good_len as u64))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::DocRecord;
+    use crate::UrlKey;
+
+    fn doc(url: &str, hash: u64) -> DocRecord<'_> {
+        DocRecord {
+            url,
+            url_key: UrlKey::of(url),
+            content_hash: hash,
+            fetched_at_ms: 1,
+            title: None,
+            snippet: None,
+            etag: None,
+            pinned: false,
+        }
+    }
+
+    fn write(store: &Store, url: &str, hash: u64) {
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc(url, hash)).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// A snapshot is frozen at the moment it is taken. Commits landing afterwards
+    /// are invisible to it, which is the whole reason readers never need a lock.
+    #[test]
+    fn a_snapshot_does_not_observe_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+
+        let before = store.snapshot();
+        assert_eq!(before.len(), 1);
+
+        write(&store, "https://x.dev/b", 2);
+        assert_eq!(before.len(), 1, "an existing snapshot must not grow");
+        assert_eq!(store.snapshot().len(), 2, "a fresh snapshot sees the commit");
+    }
+
+    /// Compaction installs a new generation into a free ring slot and swaps the
+    /// current pointer. A snapshot taken beforehand keeps reading the generation
+    /// it pinned, untouched, until it drops.
+    #[test]
+    fn compaction_leaves_an_existing_snapshot_on_its_own_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        store.compact().unwrap();
+
+        let pinned = store.snapshot();
+        let pinned_gen = pinned.generation();
+
+        write(&store, "https://x.dev/b", 2);
+        store.compact().unwrap();
+
+        assert_eq!(pinned.generation(), pinned_gen, "a pinned generation must not move");
+        assert_eq!(pinned.len(), 1, "the old generation still reads its own state");
+        let fresh = store.snapshot();
+        assert!(fresh.generation() > pinned_gen, "the store advanced");
+        assert_eq!(fresh.len(), 2);
+    }
+
+    /// The generation number increments once per compaction and is what the WAL
+    /// checks itself against on replay.
+    #[test]
+    fn each_compaction_advances_the_generation_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+
+        let mut prev = store.snapshot().generation();
+        for _ in 0..6 {
+            store.compact().unwrap();
+            let now = store.snapshot().generation();
+            assert_eq!(now, prev + 1, "a compaction must advance the generation by one");
+            prev = now;
+        }
+    }
+
+    /// The ring is finite. Holding a snapshot on every slot leaves compaction
+    /// nowhere to install the new generation — a documented, retryable refusal
+    /// rather than a stall or a corrupted swap. The new base is already durable
+    /// on disk, so the retry only has to redo the in-memory install.
+    #[test]
+    fn exhausting_the_generation_ring_is_a_retryable_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+
+        // Compaction never reuses the current slot, so with GEN_SLOTS slots it
+        // can install GEN_SLOTS - 1 new generations while each previous one
+        // stays pinned. Pin before every compaction so none can be recycled.
+        let mut pins = Vec::new();
+        for round in 0..GEN_SLOTS - 1 {
+            pins.push(store.snapshot());
+            store.compact().unwrap_or_else(|e| panic!("round {round} should still fit: {e}"));
+        }
+
+        // Pinning the newest generation too leaves the next install nowhere to go.
+        pins.push(store.snapshot());
+        assert!(
+            matches!(store.compact(), Err(Error::Busy { .. })),
+            "a full ring must refuse with Busy, not stall or corrupt the swap"
+        );
+
+        // Releasing the pins makes the very same call succeed.
+        drop(pins);
+        store.compact().expect("compaction must succeed once a slot frees up");
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    /// A read-only handle must be able to pick up another process's work without
+    /// reopening, and report whether anything actually changed.
+    #[test]
+    fn a_read_only_handle_reloads_a_newer_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        store.compact().unwrap();
+
+        let reader = Store::open_read_only(dir.path()).unwrap();
+        assert_eq!(reader.snapshot().len(), 1);
+        assert!(!reader.reload_if_stale().unwrap(), "nothing has changed yet");
+
+        write(&store, "https://x.dev/b", 2);
+        store.compact().unwrap();
+
+        assert!(reader.reload_if_stale().unwrap(), "a new generation is visible");
+        assert_eq!(reader.snapshot().len(), 2);
+    }
+}

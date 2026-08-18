@@ -377,3 +377,115 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
         bytes: bytes.len(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::key::EdgeType;
+    use crate::store::Config;
+    use crate::writer::DocRecord;
+    use crate::{Store, UrlKey};
+
+    fn doc(url: &str) -> DocRecord<'_> {
+        DocRecord {
+            url,
+            url_key: UrlKey::of(url),
+            content_hash: 1,
+            fetched_at_ms: 1,
+            title: None,
+            snippet: None,
+            etag: None,
+            pinned: false,
+        }
+    }
+
+    /// An edge to a document that has not been ingested still has to resolve to
+    /// *something*, or the graph would silently lose the fact that the link
+    /// exists. Compaction materializes those targets as stubs: addressable,
+    /// countable as in-degree, but excluded from the live set.
+    #[test]
+    fn a_referenced_but_unknown_target_becomes_a_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let src = "https://x.dev/a";
+        let dst = "https://x.dev/never-ingested";
+        {
+            let mut w = store.writer().unwrap();
+            w.upsert_node(&doc(src)).unwrap();
+            w.set_edges(UrlKey::of(src), &[(UrlKey::of(dst), EdgeType::Link, 65_535)]);
+            w.commit().unwrap();
+        }
+        store.compact().unwrap();
+
+        let snap = store.snapshot();
+        let stub = snap.node(UrlKey::of(dst)).expect("the target must exist as a stub");
+        assert!(stub.is_stub(), "an un-ingested edge target is a stub");
+        assert_eq!(stub.url, "", "a stub carries no URL label until it is ingested");
+        assert_eq!(snap.len(), 1, "stubs are not live documents");
+    }
+
+    /// A stub only exists to anchor an edge. Once nothing points at it, keeping
+    /// it would leak a node per removed link, so compaction drops it.
+    #[test]
+    fn a_stub_is_dropped_once_nothing_references_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let src = "https://x.dev/a";
+        let dst = "https://x.dev/never-ingested";
+        {
+            let mut w = store.writer().unwrap();
+            w.upsert_node(&doc(src)).unwrap();
+            w.set_edges(UrlKey::of(src), &[(UrlKey::of(dst), EdgeType::Link, 65_535)]);
+            w.commit().unwrap();
+        }
+        store.compact().unwrap();
+        assert!(store.snapshot().node(UrlKey::of(dst)).is_some(), "stub present while referenced");
+
+        // Drop the edge, then compact: the stub has nothing holding it up.
+        {
+            let mut w = store.writer().unwrap();
+            w.set_edges(UrlKey::of(src), &[]);
+            w.commit().unwrap();
+        }
+        store.compact().unwrap();
+        assert!(
+            store.snapshot().node(UrlKey::of(dst)).is_none(),
+            "an unreferenced stub must not survive compaction"
+        );
+    }
+
+    /// Ingesting a document that was previously only a stub must promote it in
+    /// place, keeping the inbound edge that created it.
+    #[test]
+    fn ingesting_a_stub_promotes_it_and_keeps_its_inbound_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let src = "https://x.dev/a";
+        let dst = "https://x.dev/later";
+        {
+            let mut w = store.writer().unwrap();
+            w.upsert_node(&doc(src)).unwrap();
+            w.set_edges(UrlKey::of(src), &[(UrlKey::of(dst), EdgeType::Link, 65_535)]);
+            w.commit().unwrap();
+        }
+        store.compact().unwrap();
+
+        {
+            let mut w = store.writer().unwrap();
+            w.upsert_node(&doc(dst)).unwrap();
+            w.commit().unwrap();
+        }
+        store.compact().unwrap();
+
+        let snap = store.snapshot();
+        let promoted = snap.node(UrlKey::of(dst)).unwrap();
+        assert!(!promoted.is_stub(), "ingesting a stub must promote it");
+        assert_eq!(promoted.url, dst);
+        assert_eq!(snap.len(), 2, "both documents are now live");
+
+        // The edge that created the stub still resolves to it.
+        let mut it = snap.neighbors(UrlKey::of(src));
+        let e = crate::traverse::LendingIterator::next(&mut it).expect("edge survives promotion");
+        assert_eq!(e.dst_key, UrlKey::of(dst));
+        assert_eq!(e.dst_url, Some(dst), "the edge now resolves to a real URL");
+    }
+}
