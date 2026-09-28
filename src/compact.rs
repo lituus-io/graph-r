@@ -345,6 +345,7 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     atomic_write(&base_path(&store.dir), &bytes)?;
     atomic_write(&wal_path(&store.dir), &wal::encode_header(new_generation, now_ms()))?;
     state.reset_after_compact(wal_applied_seq + 1);
+    store.due.store(false, Ordering::Release);
 
     // ---- 5. install into a free ring slot -----------------------------------
     let map = crate::os::MappedFile::open(&base_path(&store.dir))?;

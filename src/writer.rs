@@ -439,7 +439,12 @@ impl<'s> Writer<'s> {
         if self.state.ops_since_compact >= self.store.cfg.compact_after_ops
             || self.state.wal_bytes >= self.store.cfg.compact_after_wal_bytes
         {
-            crate::compact::compact_locked(self.store, &mut self.state)?;
+            if self.store.compact_inline.load(Ordering::Relaxed) {
+                crate::compact::compact_locked(self.store, &mut self.state)?;
+            } else {
+                // Off the hot path: the owner compacts when it chooses.
+                self.store.due.store(true, Ordering::Release);
+            }
         }
         Ok(last)
     }

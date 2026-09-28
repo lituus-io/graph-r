@@ -74,6 +74,9 @@ jobs:
         run: cargo test --all-features --test security
       - name: Regression tests
         run: cargo test --all-features --test regression
+      # Stores written by 0.2.1 must open, read and compact identically.
+      - name: Golden compatibility (0.2.1 fixtures)
+        run: cargo test --all-features --test golden_v021
 
   panic-lints:
     name: Panic-path lints

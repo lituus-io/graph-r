@@ -55,6 +55,34 @@ if !due.is_empty() {
 Without `bridge`, graph-r is a standalone embedded graph store: feed it
 `DocRecord`/`SegmentRecord`s from any source through `Store::writer()`.
 
+## Durable on object storage (`graph-r-mirror`)
+
+The `mirror/` crate keeps a store directory in sync with Google Cloud
+Storage (or a local directory, or memory) through
+[objstore-r](../objstore-r). graph-r itself is untouched: the mirror moves
+its files byte for byte, so a stateless instance can keep the store on tmpfs
+and still lose nothing.
+
+```rust,ignore
+use graph_r_mirror::Mirror;
+
+let objects = objstore_r::Gcs::new("my-bucket", objstore_r::token::Adc::discover()?, Default::default())?;
+let mirror = Mirror::new(&objects, "kb/runbooks")?;
+
+mirror.pull_into(dir).await?;                 // rebuild graph.base + graph.wal (verified)
+let store = graph_r::Store::open(dir)?;       // the unchanged API
+mirror.acquire_lease("instance-7", 60_000).await?;
+// ... writer.commit() as usual ...
+mirror.publish(&store).await?;                // ships only the new WAL frames
+```
+
+Remote layout: `HEAD` (a checksummed manifest, compare-and-swap only),
+`base/{generation}.base`, and `wal/{generation}/{start}-{end}.seg`. A second
+writer publishing from the same state is fenced; replicas follow with
+`refresh_into` (one metadata request when nothing changed). For flat commit
+latency, `Store::set_compact_inline(false)` plus `Store::compaction_due()`
+move compaction off the commit path.
+
 ## What's inside
 
 - **Storage**: two files. `graph.base` — an immutable, mmapped, checksummed,

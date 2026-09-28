@@ -14,7 +14,8 @@
 //!   scenario, in which case a SIGBUS is accepted (same posture as link-r).
 //! - The lock is `flock(LOCK_EX | LOCK_NB)` on a dedicated zero-byte file:
 //!   advisory, per-open-file, and released automatically by the kernel when
-//!   the process dies — which is exactly why it beats a PID file.
+//!   the process dies — which is exactly why it beats a PID file. Elsewhere
+//!   the same guarantee comes from std's `File::try_lock` (`LockFileEx`).
 
 #![allow(unsafe_code)]
 
@@ -53,17 +54,11 @@ impl MappedFile {
 /// Holds the exclusive writer lock for a store directory until dropped.
 #[derive(Debug)]
 pub(crate) struct LockFile {
-    /// Kept open for the lifetime of the lock. On unix nothing ever *reads*
-    /// this — holding the descriptor open is itself the lock, and closing it on
-    /// drop is what releases the flock — so the field is intentionally inert
-    /// there. The non-unix fallback does read it, to close the handle before
-    /// unlinking the file.
-    #[cfg_attr(unix, allow(dead_code))]
-    file: Option<File>,
-    /// Only the non-unix fallback needs the path: there, lock ownership *is*
-    /// the file's existence, so releasing means unlinking it.
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
+    /// Kept open for the lifetime of the lock. Nothing ever *reads* this —
+    /// holding the handle open is itself the lock, and closing it on drop is
+    /// what releases it — so the field is intentionally inert.
+    #[allow(dead_code)]
+    file: File,
 }
 
 #[cfg(unix)]
@@ -77,7 +72,7 @@ impl LockFile {
         // SAFETY: plain FFI call on an owned, open fd; no memory is shared.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            Ok(Self { file: Some(file) })
+            Ok(Self { file })
         } else {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -91,34 +86,19 @@ impl LockFile {
 
 #[cfg(not(unix))]
 impl LockFile {
-    /// Weaker non-unix fallback: exclusive lock-file creation. Unlike flock this
-    /// does not self-release on process *death* — a lock left behind by a killed
-    /// process surfaces as `Error::Locked` and must be removed by hand. It does
-    /// release on a normal drop; see the `Drop` impl below.
+    /// An OS lock on the file (`LockFileEx` on Windows), released by the
+    /// kernel when the handle closes — including when the process dies, so a
+    /// crash can no longer leave a store permanently locked (0.2 created the
+    /// file exclusively and relied on unlinking it, which a killed process
+    /// never did). Never blocks.
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
-        match std::fs::OpenOptions::new().create_new(true).write(true).open(path) {
-            Ok(file) => Ok(Self { file: Some(file), path: path.to_path_buf() }),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Locked),
-            Err(e) => Err(e.into()),
+        let file =
+            std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::Locked),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
         }
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for LockFile {
-    /// Release the lock by unlinking the file.
-    ///
-    /// This body used to be empty under a comment promising exactly this, which
-    /// made the lock permanent: because ownership here is the file's existence,
-    /// a store directory could be opened once and then never again — every later
-    /// `Store::open` saw the leftover file and returned `Error::Locked`.
-    ///
-    /// The handle is closed first. Windows refuses to unlink a file that still
-    /// has an open handle without `FILE_SHARE_DELETE`, which `File::open` does
-    /// not request, so dropping the handle has to happen before the unlink.
-    fn drop(&mut self) {
-        drop(self.file.take());
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -135,7 +115,6 @@ mod tests {
         assert_eq!(m.bytes(), b"abc123");
     }
 
-    #[cfg(unix)]
     #[test]
     fn lock_is_released_on_drop() {
         // flock is per open file *description*, so dropping the handle closes
@@ -148,7 +127,6 @@ mod tests {
         let _l2 = LockFile::acquire(&p).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_second_live_lock_is_refused_even_in_one_process() {
         // A separate `open()` creates a separate open file description, so

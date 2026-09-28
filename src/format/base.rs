@@ -281,7 +281,7 @@ impl BaseDir {
             if offset < dir_end || end > trailer_off {
                 return Err(Error::format("section out of bounds"));
             }
-            if offset % ALIGN != 0 {
+            if !offset.is_multiple_of(ALIGN) {
                 return Err(Error::format("section misaligned"));
             }
             if xxh3_64(&bytes[offset..end]) != sum {

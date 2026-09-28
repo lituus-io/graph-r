@@ -369,21 +369,81 @@ pub fn parse_header(bytes: &[u8]) -> Result<u64> {
     Ok(crate::bytesio::get_u64(bytes, 16))
 }
 
+/// The frame checksum: xxh3 over `seq‖payload`, streamed so neither side
+/// needs a concatenated copy (the value is identical to the one-shot hash).
+fn frame_sum(seq: u64, payload: &[u8]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&seq.to_le_bytes());
+    h.update(payload);
+    h.digest()
+}
+
 /// Serialize one frame.
 #[must_use]
 pub fn encode_frame(seq: u64, op: &Op) -> Vec<u8> {
-    let mut payload = Vec::new();
-    op.encode(&mut payload);
-    debug_assert!(payload.len() <= MAX_FRAME);
-    let mut sum_input = Vec::with_capacity(8 + payload.len());
-    sum_input.extend_from_slice(&seq.to_le_bytes());
-    sum_input.extend_from_slice(&payload);
-    let mut out = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
-    put_u32(&mut out, payload.len() as u32);
-    put_u64(&mut out, xxh3_64(&sum_input));
-    put_u64(&mut out, seq);
-    out.extend_from_slice(&payload);
+    // Encode the payload in place after a reserved frame head: one buffer.
+    let mut out = vec![0u8; FRAME_OVERHEAD];
+    op.encode(&mut out);
+    let len = out.len() - FRAME_OVERHEAD;
+    debug_assert!(len <= MAX_FRAME);
+    let sum = frame_sum(seq, &out[FRAME_OVERHEAD..]);
+    out[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+    out[4..12].copy_from_slice(&sum.to_le_bytes());
+    out[12..20].copy_from_slice(&seq.to_le_bytes());
     out
+}
+
+/// One intact frame at `pos`: its sequence, op, and the offset just past it.
+/// `None` at the first torn, corrupt or undecodable frame (the crash model).
+fn next_frame(bytes: &[u8], pos: usize) -> Option<(u64, Op, usize)> {
+    if bytes.len() - pos < FRAME_OVERHEAD {
+        return None;
+    }
+    let len = crate::bytesio::get_u32(bytes, pos) as usize;
+    if len > MAX_FRAME || bytes.len() - pos - FRAME_OVERHEAD < len {
+        return None;
+    }
+    let sum = crate::bytesio::get_u64(bytes, pos + 4);
+    let seq = crate::bytesio::get_u64(bytes, pos + 12);
+    let payload = &bytes[pos + FRAME_OVERHEAD..pos + FRAME_OVERHEAD + len];
+    if frame_sum(seq, payload) != sum {
+        return None;
+    }
+    let mut r = Reader::new(payload);
+    let op = Op::decode(&mut r).ok()?;
+    if r.remaining() != 0 {
+        return None;
+    }
+    Some((seq, op, pos + FRAME_OVERHEAD + len))
+}
+
+/// Byte length of the intact prefix of a WAL image — exactly the
+/// [`Replay::good_len`] that [`replay`] would report, without collecting the
+/// ops — or 0 when the header itself is invalid. This is the length that is
+/// safe to copy elsewhere: it ends on a frame boundary and every frame in it
+/// is committed.
+#[must_use]
+pub fn committed_len(image: &[u8]) -> usize {
+    if parse_header(image).is_err() {
+        return 0;
+    }
+    HEADER_LEN + committed_frames_len(&image[HEADER_LEN..])
+}
+
+/// Like [`committed_len`] for a run of frames with no header (for example
+/// the bytes appended since a previously measured frame boundary).
+#[must_use]
+pub fn committed_frames_len(frames: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut last = None;
+    while let Some((seq, _, next)) = next_frame(frames, pos) {
+        if last.is_some_and(|l| seq <= l) {
+            break; // a regression is corruption, never a committed frame
+        }
+        last = Some(seq);
+        pos = next;
+    }
+    pos
 }
 
 /// The result of replaying a WAL byte image.
@@ -404,28 +464,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay> {
     let base_generation = parse_header(bytes)?;
     let mut ops = Vec::new();
     let mut pos = HEADER_LEN;
-    loop {
-        if bytes.len() - pos < FRAME_OVERHEAD {
-            break;
-        }
-        let len = crate::bytesio::get_u32(bytes, pos) as usize;
-        if len > MAX_FRAME || bytes.len() - pos - FRAME_OVERHEAD < len {
-            break;
-        }
-        let sum = crate::bytesio::get_u64(bytes, pos + 4);
-        let seq = crate::bytesio::get_u64(bytes, pos + 12);
-        let payload = &bytes[pos + FRAME_OVERHEAD..pos + FRAME_OVERHEAD + len];
-        let mut sum_input = Vec::with_capacity(8 + len);
-        sum_input.extend_from_slice(&seq.to_le_bytes());
-        sum_input.extend_from_slice(payload);
-        if xxh3_64(&sum_input) != sum {
-            break;
-        }
-        let mut r = Reader::new(payload);
-        let Ok(op) = Op::decode(&mut r) else { break };
-        if r.remaining() != 0 {
-            break;
-        }
+    while let Some((seq, op, next)) = next_frame(bytes, pos) {
         // Sequences must be strictly increasing; a regression means foreign
         // tampering, not a torn tail.
         if let Some(&(last, _)) = ops.last() {
@@ -434,7 +473,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay> {
             }
         }
         ops.push((seq, op));
-        pos += FRAME_OVERHEAD + len;
+        pos = next;
     }
     Ok(Replay { ops, good_len: pos, base_generation })
 }
@@ -532,6 +571,34 @@ mod tests {
         let mut bad_header = encode_header(1, 0);
         bad_header[3] ^= 0xff;
         assert!(replay(&bad_header).is_err());
+    }
+
+    #[test]
+    fn committed_len_matches_replay_at_every_cut() {
+        let mut image = encode_header(3, 0);
+        for (i, op) in sample_ops().into_iter().enumerate() {
+            image.extend_from_slice(&encode_frame(i as u64 + 1, &op));
+        }
+        for cut in 0..=image.len() {
+            let want = replay(&image[..cut]).map_or(0, |r| r.good_len);
+            assert_eq!(committed_len(&image[..cut]), want, "cut {cut}");
+            if cut >= HEADER_LEN {
+                assert_eq!(committed_frames_len(&image[HEADER_LEN..cut]) + HEADER_LEN, want);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_frame_checksum_equals_the_one_shot_hash() {
+        // Pins byte-compatibility with files written by 0.2.x.
+        let op = Op::Remove { key: UrlKey(42) };
+        let frame = encode_frame(7, &op);
+        let mut payload = Vec::new();
+        op.encode(&mut payload);
+        let mut one_shot = 7u64.to_le_bytes().to_vec();
+        one_shot.extend_from_slice(&payload);
+        assert_eq!(crate::bytesio::get_u64(&frame, 4), xxh3_64(&one_shot));
+        assert_eq!(&frame[FRAME_OVERHEAD..], &payload[..]);
     }
 
     #[test]

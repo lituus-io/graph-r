@@ -42,6 +42,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_wal_committed_len"
+path = "fuzz_targets/fuzz_wal_committed_len.rs"
+test = false
+doc = false
+bench = false
+
 # Detached from the parent workspace on purpose (mirrors link-r's layout).
 [workspace]
 members = ["."]

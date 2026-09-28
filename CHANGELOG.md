@@ -4,6 +4,68 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+Additive release: every 0.2 API, file format and default behaviour is
+unchanged (`cargo semver-checks` against 0.2.1: no breaking change), and
+stores written by 0.2.1 open and read identically (golden fixtures in
+`tests/fixtures/v0.2.1`, including byte-identical compaction output and WAL
+frames).
+
+### New: `graph-r-mirror` (separate crate in `mirror/`)
+
+Keeps a store directory in sync with an object store (Google Cloud Storage,
+a local directory, or memory) through objstore-r. The files are moved byte
+for byte, so a store can live on tmpfs on a stateless instance and be durable
+in a bucket: `pull_into`, incremental `publish` (only new WAL frames; the new
+base after a compaction; coalescing of long segment runs), `refresh_into` for
+read-only replicas, a `HEAD` compare-and-swap that fences a second writer,
+and an optional writer lease. It is a separate crate so graph-r's own
+manifest gains no dependency.
+
+### New API
+
+- `Store::dir()`, `Store::generation()`.
+- `Store::set_compact_inline(bool)` and `Store::compaction_due()`: move
+  compaction off the commit path (inline remains the default).
+- `format::wal::committed_len` and `committed_frames_len`: the intact prefix
+  `replay` would report, without collecting ops.
+- `store::{BASE_FILE, WAL_FILE, LOCK_FILE}`.
+
+### Fixes and performance
+
+- `Store::reload_if_stale` is now cheap when nothing changed (two `stat`
+  calls; no remap, no read — the 0.2.1 notes promised this, but every call
+  re-mapped the base and re-read the whole WAL), and re-reads only the log
+  when only the log grew.
+- Temporary files are named by pid **and** a process-wide counter and created
+  exclusively, so two stores or threads in one process can never collide on a
+  temporary, and a leftover from a crash is never reused.
+- Windows: the writer lock is now an OS file lock (`LockFileEx` via std),
+  released by the kernel when the process dies. 0.2 created the lock file
+  exclusively and relied on deleting it, so a crashed writer left the store
+  locked until someone removed `graph.lock` by hand. (Do not run a 0.2 and a
+  0.3 writer on the same directory concurrently on Windows; unix is
+  unaffected — both use `flock`.)
+- WAL framing hashes `seq‖payload` by streaming (identical checksums) instead
+  of building a concatenated copy per frame, on both encode and replay.
+
+### Security
+
+- Lockfiles (crate and Python binding) move to rustls 0.23.45 for
+  RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption
+  levels); reached through link-r's HTTP fetcher under `bridge`.
+
+### Tooling
+
+- New fuzz target `fuzz_wal_committed_len` (and `fuzz_manifest` in
+  `mirror/fuzz`).
+- CI: a mirror job (memory, local directory, GCS emulator), a semver job
+  (additive-only against the previous tag), the 0.2.1 golden suite in the
+  security workflow, and `scripts/ci-local.sh` running every gate locally.
+- `rust-version` is now 1.89 (std file locking); the pinned nightly is
+  unchanged.
+
 ## 0.2.1
 
 ### Python bindings

@@ -215,3 +215,66 @@ jobs:
             cat coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  mirror:
+    name: Mirror (graph-r-mirror)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the link-r and objstore-r siblings
+        run: |
+          for r in link-r objstore-r; do
+            git clone --depth 1 \
+              "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/$r.git" \
+              "$GITHUB_WORKSPACE/../$r"
+          done
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mirror
+          key: mirror
+      # The GCS emulator needs command-line flags, so it is started with
+      # docker run rather than as a service container.
+      - name: Start fake-gcs-server
+        run: |
+          docker run -d --name fakegcs -p 4443:4443 fsouza/fake-gcs-server \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443
+          for i in $(seq 1 30); do curl -sf "http://127.0.0.1:4443/storage/v1/b?project=test" && break; sleep 1; done
+      - name: Fmt, clippy, test (memory, local directory, GCS emulator)
+        working-directory: mirror
+        env:
+          OBJSTORE_FAKE_GCS: http://127.0.0.1:4443
+          PROPTEST_CASES: "256"
+        run: |
+          cargo fmt --check
+          cargo clippy --all-features --all-targets
+          cargo test --all-features
+          cargo bench --all-features -- --test
+
+  semver:
+    name: Semver (additive only)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch the link-r sibling
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
+            "$GITHUB_WORKSPACE/../link-r"
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver
+      # The baseline is checked out as a sibling worktree so its own
+      # `../link-r` path dependency resolves too.
+      - name: API compatibility against the previous release tag
+        run: |
+          prev=$(git tag --sort=-v:refname --merged HEAD | grep -v "^v$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')$" | head -1)
+          echo "baseline: $prev"
+          git worktree add "$GITHUB_WORKSPACE/../graph-r-baseline" "$prev"
+          RUSTUP_TOOLCHAIN=stable cargo install cargo-semver-checks --locked
+          cargo semver-checks --baseline-root "$GITHUB_WORKSPACE/../graph-r-baseline" --all-features --release-type minor

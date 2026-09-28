@@ -35,6 +35,7 @@ jobs:
           - fuzz_wal_replay
           - fuzz_op_decode
           - fuzz_postings_decode
+          - fuzz_wal_committed_len
     steps:
       - uses: actions/checkout@v4
 
@@ -70,3 +71,28 @@ jobs:
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
+
+  fuzz-mirror:
+    name: Fuzz (fuzz_manifest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the link-r and objstore-r siblings
+        run: |
+          for r in link-r objstore-r; do
+            git clone --depth 1 \
+              "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/$r.git" \
+              "$GITHUB_WORKSPACE/../$r"
+          done
+      - run: rustup show
+      - name: Install cargo-fuzz
+        run: RUSTUP_TOOLCHAIN=stable cargo install cargo-fuzz --locked
+      - name: Run fuzzer
+        working-directory: mirror
+        run: cargo fuzz run fuzz_manifest -- -max_total_time=${{ env.FUZZ_DURATION }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-fuzz_manifest
+          path: mirror/fuzz/artifacts/fuzz_manifest/

@@ -36,7 +36,7 @@ use crate::writer::{WriteState, Writer};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
 /// Number of generation ring slots. Three retired generations may stay pinned
@@ -113,27 +113,93 @@ pub struct Store {
     pub(crate) current: AtomicUsize,
     pub(crate) gens: [GenSlot; GEN_SLOTS],
     pub(crate) write: Mutex<WriteState>,
+    /// Compact inside `commit` past the thresholds (the 0.2 behaviour).
+    pub(crate) compact_inline: AtomicBool,
+    /// Thresholds reached while inline compaction is off.
+    pub(crate) due: AtomicBool,
+    /// What the files looked like at the last load, for cheap staleness checks.
+    stamp: Mutex<Option<Stamp>>,
 }
+
+/// The base file's identity plus the WAL length. Equal stamps mean nothing a
+/// reader could observe has changed: the base is only ever replaced by rename
+/// (new inode, or new creation time where there are no inodes) and the WAL
+/// only grows within a generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    base: FileId,
+    wal_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ino: (u64, u64),
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileId {
+    fn of(md: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: md.len(),
+            modified: md.modified().ok(),
+            #[cfg(unix)]
+            ino: (md.dev(), md.ino()),
+            #[cfg(not(unix))]
+            created: md.created().ok(),
+        }
+    }
+}
+
+impl Stamp {
+    /// Two `stat` calls; `None` when either file cannot be examined (the
+    /// caller then falls back to a full load, which reports the real error).
+    fn read(dir: &Path) -> Option<Self> {
+        let base = FileId::of(&fs::metadata(base_path(dir)).ok()?);
+        let wal_len = match fs::metadata(wal_path(dir)) {
+            Ok(md) => md.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return None,
+        };
+        Some(Self { base, wal_len })
+    }
+}
+
+/// File name of the immutable base snapshot inside a store directory.
+pub const BASE_FILE: &str = "graph.base";
+/// File name of the append-only op log inside a store directory.
+pub const WAL_FILE: &str = "graph.wal";
+/// File name of the writer lock inside a store directory.
+pub const LOCK_FILE: &str = "graph.lock";
 
 /// Paths inside a store directory.
 pub(crate) fn base_path(dir: &Path) -> PathBuf {
-    dir.join("graph.base")
+    dir.join(BASE_FILE)
 }
 pub(crate) fn wal_path(dir: &Path) -> PathBuf {
-    dir.join("graph.wal")
+    dir.join(WAL_FILE)
 }
 fn lock_path(dir: &Path) -> PathBuf {
-    dir.join("graph.lock")
+    dir.join(LOCK_FILE)
 }
 
 /// Write `bytes` to `path` atomically (sibling temp + fsync + rename), then
 /// best-effort fsync the directory so the rename itself is durable.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().ok_or_else(|| Error::format("path has no parent"))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    // pid + a process-wide counter: two stores (or threads) in one process
+    // can never share a temporary, and `create_new` refuses a stale leftover.
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
@@ -197,6 +263,7 @@ impl Store {
 
     fn open_with(dir: &Path, cfg: Config, read_only: bool) -> Result<Self> {
         let lock = if read_only { None } else { Some(LockFile::acquire(&lock_path(dir))?) };
+        let stamp = Stamp::read(dir);
         let (inner, next_seq, wal_ops, wal_bytes) = load_generation(dir, read_only)?;
         let generation = inner.dir.header.generation;
         let store = Self {
@@ -210,6 +277,9 @@ impl Store {
                 inner: RwLock::new(None),
             }),
             write: Mutex::new(WriteState::new(next_seq, wal_ops.len(), wal_bytes)),
+            compact_inline: AtomicBool::new(true),
+            due: AtomicBool::new(false),
+            stamp: Mutex::new(stamp),
         };
         *store.gens[0].inner.write().expect("fresh lock") = Some(inner);
         store.gens[0].seq.store(generation, Ordering::Release);
@@ -227,6 +297,35 @@ impl Store {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The directory this store lives in.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The generation currently served (advances by one per compaction, or
+    /// when [`Store::reload_if_stale`] installs a newer one).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.gens[self.current.load(Ordering::Acquire)].seq.load(Ordering::Acquire)
+    }
+
+    /// Whether [`Writer::commit`] compacts inline once the configured
+    /// thresholds are reached (the default, and the 0.2 behaviour). Services
+    /// that must keep commit latency flat turn it off and call
+    /// [`Store::compact`] off the hot path whenever [`Store::compaction_due`]
+    /// says so.
+    pub fn set_compact_inline(&self, inline: bool) {
+        self.compact_inline.store(inline, Ordering::Relaxed);
+    }
+
+    /// True when a threshold was reached while inline compaction was off and
+    /// no compaction has run since.
+    #[must_use]
+    pub fn compaction_due(&self) -> bool {
+        self.due.load(Ordering::Acquire)
     }
 
     /// Pin the current generation and return a read view. Never blocks in
@@ -270,7 +369,62 @@ impl Store {
 
     /// For read-only stores: pick up commits/compactions made by the writing
     /// process. Returns `true` when anything new became visible.
+    ///
+    /// Cheap when nothing changed: two `stat` calls, no mapping, no reads.
+    /// When only the WAL grew, the base is not re-mapped.
     pub fn reload_if_stale(&self) -> Result<bool> {
+        let now = Stamp::read(&self.dir);
+        let mut last = self.stamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some(n), Some(l)) = (now, *last) {
+            if n == l {
+                return Ok(false);
+            }
+            if n.base == l.base {
+                if let Some(changed) = self.reload_wal_only()? {
+                    *last = now;
+                    return Ok(changed);
+                }
+            }
+        }
+        let changed = self.reload_full()?;
+        *last = now;
+        Ok(changed)
+    }
+
+    /// Same base file: replay the WAL and publish frames not yet seen.
+    /// `None` when the WAL belongs to another generation (full load needed).
+    fn reload_wal_only(&self) -> Result<Option<bool>> {
+        let cur = self.current.load(Ordering::Acquire);
+        let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
+        let Some(g) = guard.as_ref() else { return Ok(None) };
+        let raw = match fs::read(wal_path(&self.dir)) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(false)),
+            Err(e) => return Err(e.into()),
+        };
+        if raw.is_empty() {
+            return Ok(Some(false));
+        }
+        let replayed = wal::replay(&raw)?;
+        if replayed.base_generation != g.dir.header.generation {
+            return Ok(None);
+        }
+        let applied = g.dir.header.wal_applied_seq;
+        let have = g.arena.len();
+        let mut fresh =
+            replayed.ops.into_iter().filter(|&(s, _)| s > applied).skip(have).peekable();
+        if fresh.peek().is_none() {
+            return Ok(Some(false));
+        }
+        for (seq, op) in fresh {
+            if !g.arena.publish(seq, op) {
+                return Err(Error::busy("overlay arena full"));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    fn reload_full(&self) -> Result<bool> {
         let cur = self.current.load(Ordering::Acquire);
         let cur_gen = self.gens[cur].seq.load(Ordering::Acquire);
         let (inner, _, wal_ops, _) = load_generation(&self.dir, true)?;
