@@ -26,6 +26,9 @@ graph-r = { path = "..", default-features = false }
 objstore-r = { path = "../../objstore-r" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "1.0"
+# try_join_all: fetch the base and every segment concurrently on the caller's
+# task (no spawn).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 objstore-r = { path = "../../objstore-r", features = ["testing"] }

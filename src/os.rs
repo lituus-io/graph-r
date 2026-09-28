@@ -23,14 +23,24 @@ use crate::error::{Error, Result};
 use std::fs::File;
 use std::path::Path;
 
-/// A read-only memory-mapped file.
+/// A read-only base image: a memory-mapped file, or bytes already in memory
+/// (an object fetched from storage) served in place.
 pub(crate) struct MappedFile {
-    mmap: memmap2::Mmap,
+    backing: Backing,
+}
+
+enum Backing {
+    Map(memmap2::Mmap),
+    Heap(bytes::Bytes),
 }
 
 impl std::fmt::Debug for MappedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MappedFile").field("len", &self.mmap.len()).finish()
+        let kind = match self.backing {
+            Backing::Map(_) => "mmap",
+            Backing::Heap(_) => "heap",
+        };
+        f.debug_struct("MappedFile").field("kind", &kind).field("len", &self.bytes().len()).finish()
     }
 }
 
@@ -42,12 +52,20 @@ impl MappedFile {
         // it only via atomic rename (the old inode stays alive under this
         // map); hostile in-place truncation faults, which we accept.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self { mmap })
+        Ok(Self { backing: Backing::Map(mmap) })
     }
 
-    /// The mapped bytes.
+    /// Serve `bytes` in place (no copy; no file, so no SIGBUS exposure).
+    pub(crate) fn from_bytes(bytes: bytes::Bytes) -> Self {
+        Self { backing: Backing::Heap(bytes) }
+    }
+
+    /// The image bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.mmap
+        match &self.backing {
+            Backing::Map(m) => m,
+            Backing::Heap(b) => b,
+        }
     }
 }
 
@@ -105,6 +123,13 @@ impl LockFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_images_are_served_in_place() {
+        let b = bytes::Bytes::from_static(b"image");
+        let m = MappedFile::from_bytes(b.clone());
+        assert_eq!(m.bytes().as_ptr(), b.as_ptr(), "no copy");
+    }
 
     #[test]
     fn mmap_reads_file_bytes() {

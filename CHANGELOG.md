@@ -20,11 +20,32 @@ for byte, so a store can live on tmpfs on a stateless instance and be durable
 in a bucket: `pull_into`, incremental `publish` (only new WAL frames; the new
 base after a compaction; coalescing of long segment runs), `refresh_into` for
 read-only replicas, a `HEAD` compare-and-swap that fences a second writer,
-and an optional writer lease. It is a separate crate so graph-r's own
+and an optional writer lease. `load_image` / `refresh_image` keep a replica
+entirely in memory; the base and all segments are fetched concurrently. It is a separate crate so graph-r's own
 manifest gains no dependency.
+
+### New: `graph-r-kb` (separate crate in `kb/`)
+
+graph-r + link-r as **one knowledge base** on one object store: a writer
+(lease-holding, graph on tmpfs, durability in the bucket) crawls
+conditionally — validators and known links come from the graph, so unchanged
+pages cost a 304 — absorbs through the bridge, and publishes both halves
+concurrently, fenced; `refresh_due` revalidates exactly what the graph's
+adaptive freshness says is due. A replica needs no disk: the graph base and
+the link index are served in place from the fetched bytes, and refreshes cost
+two metadata requests when nothing changed. `lookup` fuses graph-r's
+anchored, graph-aware ranking with link-r's hybrid search (reciprocal-rank
+fusion; the graph work overlaps a remote query embedding). Tested end to end
+on memory, local-directory, fake-gcs-server and a live bucket, with a
+writer-vs-replica property test.
 
 ### New API
 
+- `Store::open_image(base, wal)` and `Store::reload_image`: read-only stores
+  served straight from memory (e.g. objects fetched from a bucket) — the base
+  is used in place, fully validated, no file or mapping; `Store::is_image`.
+- `bridge::{absorb_with, ingest_update_with, ingest_refresh_with}`: the
+  bridge for link-r indexes built with any embedder.
 - `Store::dir()`, `Store::generation()`.
 - `Store::set_compact_inline(bool)` and `Store::compaction_due()`: move
   compaction off the commit path (inline remains the default).
@@ -34,6 +55,8 @@ manifest gains no dependency.
 
 ### Fixes and performance
 
+- Loading is one validated code path for files and images; replaying a
+  generation no longer clones every op into the overlay twice.
 - `Store::reload_if_stale` is now cheap when nothing changed (two `stat`
   calls; no remap, no read — the 0.2.1 notes promised this, but every call
   re-mapped the base and re-read the whole WAL), and re-reads only the log
@@ -58,7 +81,7 @@ manifest gains no dependency.
 
 ### Tooling
 
-- New fuzz target `fuzz_wal_committed_len` (and `fuzz_manifest` in
+- New fuzz targets `fuzz_wal_committed_len` and `fuzz_open_image` (and `fuzz_manifest` in
   `mirror/fuzz`).
 - CI: a mirror job (memory, local directory, GCS emulator), a semver job
   (additive-only against the previous tag), the 0.2.1 golden suite in the

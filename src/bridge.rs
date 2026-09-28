@@ -95,6 +95,14 @@ fn seg_importance(depth: u8, ordinal: usize, heading: &str, keywords: &[&str]) -
 /// crawl; `absorb` is the bulk offload path — after it returns, the link-r
 /// index may be dropped or kept purely in memory.
 pub fn absorb(store: &Store, index: &LinkIndex) -> Result<BridgeReport> {
+    absorb_with(store, index)
+}
+
+/// [`absorb`] for an index built with any embedder (`LinkIndex<E>`).
+pub fn absorb_with<E: link_r::Embedder>(
+    store: &Store,
+    index: &LinkIndex<E>,
+) -> Result<BridgeReport> {
     let mut report = BridgeReport::default();
     let mut w = store.writer()?;
     for doc in index.export().map_err(|e| map_linkr(&e))? {
@@ -132,12 +140,30 @@ pub fn ingest_update(
     ingest_pages(store, index, &report.pages)
 }
 
+/// [`ingest_update`] for an index built with any embedder.
+pub fn ingest_update_with<E: link_r::Embedder>(
+    store: &Store,
+    index: &LinkIndex<E>,
+    report: &UpdateReport,
+) -> Result<BridgeReport> {
+    ingest_pages(store, index, &report.pages)
+}
+
 /// Fold a [`RefreshReport`]'s outcomes: updated pages re-upsert, unchanged
 /// pages touch (interval grows), removed pages tombstone (interval cut path
 /// is driven by `Changed`). Compacts afterwards.
 pub fn ingest_refresh(
     store: &Store,
     index: &LinkIndex,
+    report: &RefreshReport,
+) -> Result<BridgeReport> {
+    ingest_pages(store, index, &report.pages)
+}
+
+/// [`ingest_refresh`] for an index built with any embedder.
+pub fn ingest_refresh_with<E: link_r::Embedder>(
+    store: &Store,
+    index: &LinkIndex<E>,
     report: &RefreshReport,
 ) -> Result<BridgeReport> {
     ingest_pages(store, index, &report.pages)
@@ -215,7 +241,11 @@ pub fn crawl_seed(store: &Store) -> CrawlSeed {
 }
 
 #[allow(clippy::too_many_lines)] // one linear pass over the export, then the touches
-fn ingest_pages(store: &Store, index: &LinkIndex, pages: &[PageOutcome]) -> Result<BridgeReport> {
+fn ingest_pages<E: link_r::Embedder>(
+    store: &Store,
+    index: &LinkIndex<E>,
+    pages: &[PageOutcome],
+) -> Result<BridgeReport> {
     let mut report = BridgeReport::default();
     if pages.is_empty() {
         return Ok(report);

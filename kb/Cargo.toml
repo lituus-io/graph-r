@@ -1,0 +1,46 @@
+# Copyright: lituus-io, all rights reserved.
+# Author: terekete <spicyzhug@gmail.com>
+
+[package]
+name = "graph-r-kb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "AGPL-3.0-or-later"
+description = "One knowledge base from graph-r + link-r on an object store: crawl/refresh through the bridge, fenced publish, zero-copy hydration, fused lookups"
+repository = "https://github.com/lituus-io/graph-r"
+authors = ["lituus-io <spicyzhug@gmail.com>"]
+publish = false
+
+[features]
+default = []
+gcs = ["objstore-r/gcs", "graph-r-mirror/gcs", "link-r-objstore/gcs"]
+
+[dependencies]
+graph-r = { path = "..", features = ["bridge"] }
+graph-r-mirror = { path = "../mirror" }
+link-r = { path = "../../link-r" }
+link-r-objstore = { path = "../../link-r/objstore" }
+objstore-r = { path = "../../objstore-r" }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+compact_str = "0.8"
+thiserror = "1.0"
+
+[dev-dependencies]
+bytes = "1.7"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+tempfile = "3.12"
+url = "2.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = "1.5"
+
+[[bench]]
+name = "kb_bench"
+harness = false
+
+[profile.bench]
+debug = true
+
+[workspace]
+members = ["."]

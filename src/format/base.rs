@@ -139,7 +139,7 @@ impl Header {
         put_u64(out, sum);
     }
 
-    fn parse(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_LEN {
             return Err(Error::format("file shorter than header"));
         }

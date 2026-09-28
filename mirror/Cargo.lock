@@ -449,6 +449,7 @@ dependencies = [
 name = "graph-r"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "compact_str",
  "libc",
  "memmap2",
@@ -463,6 +464,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "futures",
+ "futures-util",
  "graph-r",
  "objstore-r",
  "proptest",

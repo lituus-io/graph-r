@@ -326,3 +326,62 @@ fn prefixes_are_validated_and_isolated() {
     block_on(Mirror::new(&mem, "one").unwrap().pull_into(dst.path())).unwrap();
     assert_eq!(Store::open_read_only(dst.path()).unwrap().len(), 1);
 }
+
+#[test]
+fn a_memory_only_replica_follows_commits_coalescing_and_compactions() {
+    let (_dir, store) = writer();
+    let mem = Mem::default();
+    let w = Mirror::new(&mem, "kb").unwrap();
+    assert!(block_on(Mirror::new(&mem, "kb").unwrap().load_image()).unwrap().is_none());
+    golden::seed(&store);
+    block_on(w.publish(&store)).unwrap();
+
+    let r = Mirror::new(&mem, "kb").unwrap();
+    let replica = block_on(r.load_image()).unwrap().unwrap();
+    assert!(replica.is_image());
+    assert_eq!(golden::dump(&replica), golden::dump(&store));
+    assert!(!block_on(r.refresh_image(&replica)).unwrap(), "unchanged: one metadata request");
+
+    golden::churn(&store);
+    block_on(w.publish(&store)).unwrap();
+    assert!(block_on(r.refresh_image(&replica)).unwrap());
+    assert_eq!(golden::dump(&replica), golden::dump(&store));
+
+    for i in 0..(COALESCE_SEGMENTS as u64 + 3) {
+        page(&store, i);
+        block_on(w.publish(&store)).unwrap();
+        if i % 5 == 0 {
+            block_on(r.refresh_image(&replica)).unwrap();
+            assert_eq!(replica.len(), store.len(), "step {i}");
+        }
+    }
+    block_on(r.refresh_image(&replica)).unwrap();
+    assert_eq!(golden::dump(&replica), golden::dump(&store));
+
+    store.compact().unwrap();
+    page(&store, 1000);
+    block_on(w.publish(&store)).unwrap();
+    assert!(block_on(r.refresh_image(&replica)).unwrap());
+    assert_eq!(replica.generation(), store.generation());
+    assert_eq!(golden::dump(&replica), golden::dump(&store));
+}
+
+#[test]
+fn a_memory_only_replica_refuses_tampered_objects() {
+    let (_d, store) = writer();
+    golden::seed(&store);
+    store.compact().unwrap();
+    golden::churn(&store);
+    let mem = Mem::default();
+    block_on(Mirror::new(&mem, "kb").unwrap().publish(&store)).unwrap();
+    for victim in mem.keys() {
+        let original = block_on(mem.get(&victim)).unwrap().unwrap().bytes;
+        let mut bad = original.to_vec();
+        let at = bad.len() / 2;
+        bad[at] ^= 0x01;
+        block_on(mem.put(&victim, Bytes::from(bad), Cond::None)).unwrap();
+        let r = block_on(Mirror::new(&mem, "kb").unwrap().load_image());
+        assert!(matches!(r, Err(Error::Corrupt { .. })), "{victim}: {r:?}");
+        block_on(mem.put(&victim, original, Cond::None)).unwrap();
+    }
+}

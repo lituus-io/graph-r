@@ -153,3 +153,59 @@ fn many_stores_in_one_process_compact_concurrently() {
         }
     });
 }
+
+#[test]
+fn an_image_store_serves_from_memory_and_follows_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    write(&store, "https://x.dev/a", 1);
+    let read = |f: &str| std::fs::read(dir.path().join(f)).unwrap();
+    let base = bytes::Bytes::from(read(BASE_FILE));
+    let image = Store::open_image(base.clone(), &read(WAL_FILE)).unwrap();
+    assert!(image.is_image() && image.dir().as_os_str().is_empty());
+    assert_eq!(image.snapshot().len(), 1);
+    assert!(matches!(image.writer(), Err(Error::ReadOnly)));
+    assert!(!image.reload_if_stale().unwrap(), "no files to watch");
+
+    // New frames, same generation.
+    write(&store, "https://x.dev/b", 2);
+    assert!(image.reload_image(None, &read(WAL_FILE)).unwrap());
+    assert!(!image.reload_image(None, &read(WAL_FILE)).unwrap(), "nothing new");
+    assert_eq!(image.snapshot().len(), 2);
+
+    // A compaction: the log alone cannot be applied; with the new base it can.
+    store.compact().unwrap();
+    write(&store, "https://x.dev/c", 3);
+    assert!(image.reload_image(None, &read(WAL_FILE)).is_err());
+    assert!(image
+        .reload_image(Some(bytes::Bytes::from(read(BASE_FILE))), &read(WAL_FILE))
+        .unwrap());
+    assert_eq!(image.generation(), 2);
+    assert_eq!(image.snapshot().len(), 3);
+    let q = image.snapshot().query("t", &QueryOpts::default()).len();
+    assert_eq!(q, store.snapshot().query("t", &QueryOpts::default()).len());
+}
+
+#[test]
+fn image_stores_reject_hostile_bytes_and_read_any_alignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    write(&store, "https://x.dev/a", 1);
+    store.compact().unwrap();
+    let base = std::fs::read(dir.path().join(BASE_FILE)).unwrap();
+    let wal = std::fs::read(dir.path().join(WAL_FILE)).unwrap();
+    for shift in 0..8 {
+        let mut buf = vec![0u8; shift];
+        buf.extend_from_slice(&base);
+        let img = Store::open_image(bytes::Bytes::from(buf).slice(shift..), &wal).unwrap();
+        assert_eq!(img.snapshot().len(), 1, "shift {shift}");
+    }
+    for at in (0..base.len()).step_by(7) {
+        let mut bad = base.clone();
+        bad[at] ^= 0x20;
+        assert!(Store::open_image(bytes::Bytes::from(bad), &wal).is_err(), "flip at {at}");
+    }
+    let mut torn = wal.clone();
+    torn.extend_from_slice(&[9, 9, 9]);
+    assert_eq!(Store::open_image(bytes::Bytes::from(base), &torn).unwrap().snapshot().len(), 1);
+}

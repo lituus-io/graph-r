@@ -79,6 +79,8 @@ proptest! {
         let r = Mirror::new(&mem, "p").unwrap();
         block_on(r.pull_into(rdir.path())).unwrap();
         let replica = Store::open_read_only(rdir.path()).unwrap();
+        let im = Mirror::new(&mem, "p").unwrap();
+        let image = block_on(im.load_image()).unwrap().unwrap();
         let mut published = state(&store);
         let mut next = 0;
         for op in &ops {
@@ -89,6 +91,8 @@ proptest! {
                 Op::Refresh => {
                     block_on(r.refresh_into(&replica)).unwrap();
                     prop_assert_eq!(state(&replica), published.clone());
+                    block_on(im.refresh_image(&image)).unwrap();
+                    prop_assert_eq!(state(&image), published.clone());
                 }
             }
         }
@@ -100,5 +104,7 @@ proptest! {
         }
         block_on(r.refresh_into(&replica)).unwrap();
         prop_assert_eq!(golden::dump(&replica), golden::dump(&store));
+        block_on(im.refresh_image(&image)).unwrap();
+        prop_assert_eq!(golden::dump(&image), golden::dump(&store));
     }
 }

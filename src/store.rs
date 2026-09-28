@@ -264,10 +264,54 @@ impl Store {
     fn open_with(dir: &Path, cfg: Config, read_only: bool) -> Result<Self> {
         let lock = if read_only { None } else { Some(LockFile::acquire(&lock_path(dir))?) };
         let stamp = Stamp::read(dir);
-        let (inner, next_seq, wal_ops, wal_bytes) = load_generation(dir, read_only)?;
-        let generation = inner.dir.header.generation;
+        let built = load_generation(dir, read_only)?;
+        Ok(Self::assemble(dir.to_path_buf(), cfg, read_only, lock, stamp, built))
+    }
+
+    /// Serve a store straight from memory: `base` is a `graph.base` image and
+    /// `wal` a `graph.wal` image (possibly empty), e.g. objects fetched from a
+    /// bucket. The base is read in place — no copy, no file, no mapping — and
+    /// fully validated exactly like [`Store::open`]. The store is read-only
+    /// and has no directory ([`Store::dir`] is empty); keep it current with
+    /// [`Store::reload_image`].
+    pub fn open_image(base: bytes::Bytes, wal: &[u8]) -> Result<Self> {
+        let built = build_generation(MappedFile::from_bytes(base), wal)?;
+        Ok(Self::assemble(PathBuf::new(), Config::default(), true, None, None, built))
+    }
+
+    /// Keep an image store current. Pass the new base when the generation
+    /// changed (a compaction), else `None` and the current log image: frames
+    /// not yet visible are published. Returns `true` when anything new
+    /// became visible. Works on file-backed read-only stores too.
+    pub fn reload_image(&self, base: Option<bytes::Bytes>, wal: &[u8]) -> Result<bool> {
+        match base {
+            Some(b) => self.install_or_apply(MappedFile::from_bytes(b), wal),
+            None => match self.apply_wal_bytes(wal)? {
+                Some(changed) => Ok(changed),
+                None => {
+                    Err(Error::format("log image belongs to another generation; pass its base"))
+                }
+            },
+        }
+    }
+
+    /// True for a store served from memory ([`Store::open_image`]).
+    #[must_use]
+    pub fn is_image(&self) -> bool {
+        self.dir.as_os_str().is_empty()
+    }
+
+    fn assemble(
+        dir: PathBuf,
+        cfg: Config,
+        read_only: bool,
+        lock: Option<LockFile>,
+        stamp: Option<Stamp>,
+        built: Built,
+    ) -> Self {
+        let generation = built.inner.dir.header.generation;
         let store = Self {
-            dir: dir.to_path_buf(),
+            dir,
             cfg,
             read_only,
             _lock: lock,
@@ -276,14 +320,18 @@ impl Store {
                 seq: AtomicU64::new(0),
                 inner: RwLock::new(None),
             }),
-            write: Mutex::new(WriteState::new(next_seq, wal_ops.len(), wal_bytes)),
+            write: Mutex::new(WriteState::new(
+                built.next_seq,
+                built.replayed,
+                built.good_len as u64,
+            )),
             compact_inline: AtomicBool::new(true),
             due: AtomicBool::new(false),
             stamp: Mutex::new(stamp),
         };
-        *store.gens[0].inner.write().expect("fresh lock") = Some(inner);
+        *store.gens[0].inner.write().expect("fresh lock") = Some(built.inner);
         store.gens[0].seq.store(generation, Ordering::Release);
-        Ok(store)
+        store
     }
 
     /// Number of live (non-tombstoned, non-stub) documents in the current
@@ -373,6 +421,9 @@ impl Store {
     /// Cheap when nothing changed: two `stat` calls, no mapping, no reads.
     /// When only the WAL grew, the base is not re-mapped.
     pub fn reload_if_stale(&self) -> Result<bool> {
+        if self.is_image() {
+            return Ok(false); // no files to watch; see reload_image
+        }
         let now = Stamp::read(&self.dir);
         let mut last = self.stamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let (Some(n), Some(l)) = (now, *last) {
@@ -394,18 +445,23 @@ impl Store {
     /// Same base file: replay the WAL and publish frames not yet seen.
     /// `None` when the WAL belongs to another generation (full load needed).
     fn reload_wal_only(&self) -> Result<Option<bool>> {
-        let cur = self.current.load(Ordering::Acquire);
-        let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
-        let Some(g) = guard.as_ref() else { return Ok(None) };
-        let raw = match fs::read(wal_path(&self.dir)) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(false)),
-            Err(e) => return Err(e.into()),
-        };
+        match fs::read(wal_path(&self.dir)) {
+            Ok(raw) => self.apply_wal_bytes(&raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Publish the frames of a log image that the current generation has not
+    /// seen. `None` when the image belongs to another generation.
+    fn apply_wal_bytes(&self, raw: &[u8]) -> Result<Option<bool>> {
         if raw.is_empty() {
             return Ok(Some(false));
         }
-        let replayed = wal::replay(&raw)?;
+        let cur = self.current.load(Ordering::Acquire);
+        let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
+        let Some(g) = guard.as_ref() else { return Ok(None) };
+        let replayed = wal::replay(raw)?;
         if replayed.base_generation != g.dir.header.generation {
             return Ok(None);
         }
@@ -425,36 +481,31 @@ impl Store {
     }
 
     fn reload_full(&self) -> Result<bool> {
+        let map = MappedFile::open(&base_path(&self.dir))?;
+        let raw = match fs::read(wal_path(&self.dir)) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        self.install_or_apply(map, &raw)
+    }
+
+    /// Same generation as served: publish new frames. Otherwise rebuild the
+    /// generation from `map` + `raw` and install it into a free ring slot.
+    fn install_or_apply(&self, map: MappedFile, raw: &[u8]) -> Result<bool> {
         let cur = self.current.load(Ordering::Acquire);
         let cur_gen = self.gens[cur].seq.load(Ordering::Acquire);
-        let (inner, _, wal_ops, _) = load_generation(&self.dir, true)?;
-        let new_gen = inner.dir.header.generation;
+        let new_gen = base::Header::parse(map.bytes())?.generation;
         if new_gen == cur_gen {
-            // Same generation: publish any WAL frames we have not seen yet.
-            let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
-            let Some(g) = guard.as_ref() else { return Ok(false) };
-            let have = g.arena.len();
-            if wal_ops.len() <= have {
-                return Ok(false);
-            }
-            for (seq, op) in wal_ops.into_iter().skip(have) {
-                if !g.arena.publish(seq, op) {
-                    return Err(Error::busy("overlay arena full"));
-                }
-            }
-            return Ok(true);
+            return Ok(self.apply_wal_bytes(raw)?.unwrap_or(false));
         }
-        // New generation: install into a free slot and swap.
+        let built = build_generation(map, raw)?;
         for (i, slot) in self.gens.iter().enumerate() {
             if i == cur {
                 continue;
             }
             if let Ok(mut w) = slot.inner.try_write() {
-                let fresh = GenInner { map: inner.map, dir: inner.dir, arena: Arena::new() };
-                for (seq, op) in wal_ops {
-                    let _ = fresh.arena.publish(seq, op);
-                }
-                *w = Some(fresh);
+                *w = Some(built.inner);
                 drop(w);
                 slot.seq.store(new_gen, Ordering::Release);
                 self.current.store(i, Ordering::Release);
@@ -465,62 +516,102 @@ impl Store {
     }
 }
 
-/// Load `graph.base` + replay `graph.wal` for `dir`. Returns the generation,
-/// the next WAL sequence, the replayed ops (already filtered to those newer
-/// than the base), and the WAL byte length.
-#[allow(clippy::type_complexity)]
-fn load_generation(
-    dir: &Path,
-    read_only: bool,
-) -> Result<(GenInner, u64, Vec<(u64, wal::Op)>, u64)> {
-    let map = MappedFile::open(&base_path(dir))?;
+/// A generation rebuilt from a base image and a log image, before any disk
+/// side effects.
+struct Built {
+    inner: GenInner,
+    next_seq: u64,
+    replayed: usize,
+    good_len: usize,
+    log: LogState,
+}
+
+/// What the log image turned out to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogState {
+    /// No log at all.
+    Empty,
+    /// A log from before the base's generation: every op is already folded.
+    Stale,
+    /// The base's own log; `torn` when bytes follow the last intact frame.
+    Current { torn: bool },
+}
+
+/// Validate `map` as a base and replay `raw` against it. Pure: shared by the
+/// file-backed and in-memory (image) paths.
+fn build_generation(map: MappedFile, raw: &[u8]) -> Result<Built> {
     let bdir = base::BaseDir::parse(map.bytes())?;
     let header = bdir.header;
+    let inner = GenInner { map, dir: bdir, arena: Arena::new() };
+    if raw.is_empty() {
+        return Ok(Built {
+            inner,
+            next_seq: header.wal_applied_seq + 1,
+            replayed: 0,
+            good_len: 0,
+            log: LogState::Empty,
+        });
+    }
+    let replayed = wal::replay(raw)?;
+    if replayed.base_generation > header.generation {
+        return Err(Error::corrupt("wal is newer than base"));
+    }
+    if replayed.base_generation < header.generation {
+        return Ok(Built {
+            inner,
+            next_seq: header.wal_applied_seq + 1,
+            replayed: 0,
+            good_len: wal::HEADER_LEN,
+            log: LogState::Stale,
+        });
+    }
+    let torn = replayed.good_len < raw.len();
+    let next_seq = replayed
+        .ops
+        .last()
+        .map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
+    let mut count = 0;
+    for (seq, op) in replayed.ops.into_iter().filter(|&(s, _)| s > header.wal_applied_seq) {
+        if !inner.arena.publish(seq, op) {
+            return Err(Error::busy("overlay arena full during replay"));
+        }
+        count += 1;
+    }
+    Ok(Built {
+        inner,
+        next_seq,
+        replayed: count,
+        good_len: replayed.good_len,
+        log: LogState::Current { torn },
+    })
+}
 
+/// Load `graph.base` + replay `graph.wal` for `dir`; a writable opener also
+/// resets a stale log and truncates a torn tail.
+fn load_generation(dir: &Path, read_only: bool) -> Result<Built> {
+    let map = MappedFile::open(&base_path(dir))?;
     let wal_file = wal_path(dir);
     let raw = match fs::read(&wal_file) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && read_only => Vec::new(),
         Err(e) => return Err(e.into()),
     };
-    let (ops, good_len, next_seq) = if raw.is_empty() {
-        (Vec::new(), 0, header.wal_applied_seq + 1)
-    } else {
-        let replayed = wal::replay(&raw)?;
-        if replayed.base_generation > header.generation {
-            return Err(Error::corrupt("wal is newer than base"));
-        }
-        if replayed.base_generation < header.generation {
-            // Stale log from before the last compaction; every op is already
-            // folded. A writable opener resets it.
-            if !read_only {
-                atomic_write(&wal_file, &wal::encode_header(header.generation, now_ms()))?;
+    let built = build_generation(map, &raw)?;
+    if !read_only {
+        match built.log {
+            LogState::Stale => {
+                let generation = built.inner.dir.header.generation;
+                atomic_write(&wal_file, &wal::encode_header(generation, now_ms()))?;
             }
-            (Vec::new(), wal::HEADER_LEN, header.wal_applied_seq + 1)
-        } else {
-            if !read_only && replayed.good_len < raw.len() {
-                // Torn tail: truncate back to the last intact frame.
+            LogState::Current { torn: true } => {
                 let f = fs::OpenOptions::new().write(true).open(&wal_file)?;
-                f.set_len(replayed.good_len as u64)?;
+                f.set_len(built.good_len as u64)?;
                 f.sync_all()?;
             }
-            let next = replayed
-                .ops
-                .last()
-                .map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
-            let ops: Vec<(u64, wal::Op)> =
-                replayed.ops.into_iter().filter(|&(s, _)| s > header.wal_applied_seq).collect();
-            (ops, replayed.good_len, next)
-        }
-    };
-
-    let inner = GenInner { map, dir: bdir, arena: Arena::new() };
-    for (seq, op) in &ops {
-        if !inner.arena.publish(*seq, op.clone()) {
-            return Err(Error::busy("overlay arena full during replay"));
+            LogState::Empty | LogState::Current { torn: false } => {}
         }
     }
-    Ok((inner, next_seq, ops, good_len as u64))
+    Ok(built)
 }
 
 #[cfg(test)]

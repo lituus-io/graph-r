@@ -50,16 +50,38 @@ async fn mirror_round_trip_on_the_emulator() {
         return;
     };
     let objects = bucket(&endpoint).await;
-    let prefix = format!("t{}", graph_r::store::now_ms());
+    round_trip(&objects, &format!("t{}", graph_r::store::now_ms())).await;
+}
+
+/// A real bucket through Application Default Credentials, under a unique
+/// `objstore-r-live/mirror-…` prefix that is deleted afterwards.
+#[tokio::test(flavor = "current_thread")]
+async fn mirror_round_trip_on_a_live_bucket() {
+    let Ok(bucket) = std::env::var("OBJSTORE_LIVE_BUCKET") else {
+        eprintln!("OBJSTORE_LIVE_BUCKET unset: skipped");
+        return;
+    };
+    let objects =
+        Gcs::new(&bucket, objstore_r::token::Adc::discover().unwrap(), GcsConfig::default())
+            .unwrap();
+    round_trip(
+        &objects,
+        &format!("objstore-r-live/mirror-{}-{}", std::process::id(), graph_r::store::now_ms()),
+    )
+    .await;
+}
+
+async fn round_trip<T: objstore_r::token::TokenProvider>(objects: &Gcs<T>, prefix: &str) {
+    let prefix = prefix.to_owned();
     let wdir = tempfile::tempdir().unwrap();
     let store = Store::create(wdir.path(), Config::default()).unwrap();
     golden::seed(&store);
-    let w = Mirror::new(&objects, &prefix).unwrap();
+    let w = Mirror::new(objects, &prefix).unwrap();
     w.acquire_lease("writer-1", 60_000).await.unwrap();
     w.publish(&store).await.unwrap();
 
     let rdir = tempfile::tempdir().unwrap();
-    let r = Mirror::new(&objects, &prefix).unwrap();
+    let r = Mirror::new(objects, &prefix).unwrap();
     r.pull_into(rdir.path()).await.unwrap().unwrap();
     let replica = Store::open_read_only(rdir.path()).unwrap();
     assert_eq!(golden::dump(&replica), golden::dump(&store));
@@ -71,10 +93,20 @@ async fn mirror_round_trip_on_the_emulator() {
     w.publish(&store).await.unwrap();
     assert!(r.refresh_into(&replica).await.unwrap());
     assert!(!r.refresh_into(&replica).await.unwrap());
-    assert_eq!(golden::dump(&replica), golden::dump(&store));
 
     assert!(matches!(r.acquire_lease("writer-2", 60_000).await, Err(Error::Leased { .. })));
+
+    // A memory-only replica on the same bucket.
+    let im = Mirror::new(objects, &prefix).unwrap();
+    let image = im.load_image().await.unwrap().unwrap();
+    assert_eq!(golden::dump(&image), golden::dump(&store));
+    golden::churn(&store);
+    w.publish(&store).await.unwrap();
+    assert!(im.refresh_image(&image).await.unwrap());
+    assert_eq!(golden::dump(&image), golden::dump(&store));
     w.release_lease().await.unwrap();
+    assert!(r.refresh_into(&replica).await.unwrap());
+    assert_eq!(golden::dump(&replica), golden::dump(&store));
     // Clean the prefix up.
     use objstore_r::ObjectStore;
     for m in objects.list(&format!("{prefix}/")).await.unwrap() {

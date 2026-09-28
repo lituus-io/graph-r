@@ -31,6 +31,9 @@ memmap2 = "0.9"
 # xxh3 is the single hash family: keys, section checksums, file trailers.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "1.0"
+# Shared, reference-counted byte buffers: a base image fetched from object
+# storage is served in place (Store::open_image), never copied.
+bytes = "1.7"
 smallvec = { version = "1.13", features = ["union", "const_generics"] }
 compact_str = "0.8"
 link-r = { path = "../link-r", optional = true, default-features = false, features = ["crawl", "hash", "html", "markdown", "fs", "github"] }
@@ -41,7 +44,6 @@ link-r = { path = "../link-r", optional = true, default-features = false, featur
 libc = "0.2"
 
 [dev-dependencies]
-bytes = "1.7" # constructing link-r payloads in bridge tests
 proptest = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.12"

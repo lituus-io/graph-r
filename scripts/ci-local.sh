@@ -16,7 +16,7 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mskip: %s\033[0m\n' "$*"; }
 have() { cargo "$1" --version >/dev/null 2>&1; }
 
-step fmt; cargo fmt --check; (cd mirror && cargo fmt --check)
+step fmt; cargo fmt --check; (cd mirror && cargo fmt --check); (cd kb && cargo fmt --check)
 step clippy; cargo clippy -q --all-features --all-targets
 step "feature matrix"
 for f in "" bridge llm bridge,llm; do
@@ -48,16 +48,25 @@ step "mirror"
 (cd mirror && cargo clippy -q --all-features --all-targets && PROPTEST_CASES="${PROPTEST_CASES:-256}" cargo test -q --all-features \
   && cargo bench -q --all-features -- --test >/dev/null)
 
+step "knowledge base"
+(cd kb && cargo clippy -q --all-features --all-targets && PROPTEST_CASES="${PROPTEST_CASES:-64}" cargo test -q --all-features \
+  && cargo bench -q --all-features -- --test >/dev/null)
+if [ -n "${OBJSTORE_LIVE_BUCKET:-}" ]; then
+  step "live bucket (${OBJSTORE_LIVE_BUCKET}, ADC; unique prefixes, cleaned up)"
+  (cd mirror && cargo test -q --features gcs --test gcs mirror_round_trip_on_a_live_bucket)
+  (cd kb && cargo test -q --features gcs --test gcs knowledge_base_on_a_live_bucket)
+fi
+
 step "fuzz (${FUZZ_SECS}s per target)"
 if have fuzz; then
-  for t in fuzz_base_parse fuzz_wal_replay fuzz_op_decode fuzz_postings_decode fuzz_wal_committed_len; do
+  for t in fuzz_base_parse fuzz_wal_replay fuzz_op_decode fuzz_postings_decode fuzz_wal_committed_len fuzz_open_image; do
     (cd fuzz && cargo fuzz run "$t" -- -max_total_time="$FUZZ_SECS" 2>&1 | tail -1)
   done
   (cd mirror/fuzz && cargo fuzz run fuzz_manifest -- -max_total_time="$FUZZ_SECS" 2>&1 | tail -1)
 else warn "cargo-fuzz not installed"; fi
 
 step "supply chain"
-if have deny; then cargo deny check; (cd mirror && cargo deny --manifest-path Cargo.toml check --config ../deny.toml); else warn "cargo-deny not installed"; fi
+if have deny; then cargo deny check; (cd mirror && cargo deny check --config ../deny.toml); (cd kb && cargo deny check --config ../deny.toml); else warn "cargo-deny not installed"; fi
 if have audit; then cargo audit; else warn "cargo-audit not installed"; fi
 
 step "semver vs previous tag"

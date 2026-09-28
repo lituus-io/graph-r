@@ -458,6 +458,7 @@ dependencies = [
 name = "graph-r"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "compact_str",
  "libc",
  "link-r",
@@ -775,7 +776,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "link-r"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "bytes",

@@ -154,6 +154,8 @@ struct Holder {
 struct State {
     remote: Option<Remote>,
     holder: Option<Holder>,
+    /// The log image behind a memory-only replica ([`Mirror::load_image`]).
+    image_wal: Vec<u8>,
 }
 
 /// The local cut a publish ships, taken under the store's writer lock.
@@ -279,21 +281,105 @@ impl<'o, O: ObjectStore> Mirror<'o, O> {
         Ok(obj.bytes)
     }
 
-    /// Download and verify everything `m` names.
+    /// Download and verify everything `m` names — the base and every
+    /// segment concurrently.
     async fn fetch_all(&self, m: &Manifest) -> Result<(Bytes, Vec<Bytes>)> {
-        let base =
-            self.fetch_verified(&self.base_key(m.generation), m.base_len, m.base_sum).await?;
+        let base_key = self.base_key(m.generation);
+        let base = self.fetch_verified(&base_key, m.base_len, m.base_sum);
+        let segs = self.fetch_segments(m, m.segments.iter());
+        let (base, segs) = futures_util::future::try_join(base, segs).await?;
         let dir = base::BaseDir::parse(&base).map_err(|e| corrupt(format!("base: {e}")))?;
         if dir.header.generation != m.generation {
             return Err(corrupt("base generation differs from the manifest"));
         }
-        let mut segs = Vec::with_capacity(m.segments.len());
-        for s in &m.segments {
-            let b = self.fetch_verified(&self.seg_key(m.generation, s), s.len, s.sum).await?;
-            check_framing(&b, s.start, m.generation)?;
-            segs.push(b);
-        }
         Ok((base, segs))
+    }
+
+    /// Fetch and verify segments concurrently, in manifest order.
+    async fn fetch_segments<'s>(
+        &'s self,
+        m: &'s Manifest,
+        wanted: impl Iterator<Item = &'s Segment>,
+    ) -> Result<Vec<Bytes>> {
+        let keys: Vec<(String, Segment)> =
+            wanted.map(|s| (self.seg_key(m.generation, s), *s)).collect();
+        futures_util::future::try_join_all(keys.iter().map(|(key, s)| async move {
+            let b = self.fetch_verified(key, s.len, s.sum).await?;
+            check_framing(&b, s.start, m.generation)?;
+            Ok::<_, Error>(b)
+        }))
+        .await
+    }
+
+    /// Serve the published store straight from memory — no directory, no
+    /// file writes: the base is used in place ([`Store::open_image`]). `None`
+    /// when nothing has been published. Keep it current with
+    /// [`Mirror::refresh_image`].
+    pub fn load_image(&self) -> impl Future<Output = Result<Option<Store>>> + '_ {
+        async move {
+            let Some(remote) = self.fetch_remote().await? else { return Ok(None) };
+            if remote.manifest.generation == 0 {
+                return Ok(None);
+            }
+            let (base, segs) = self.fetch_all(&remote.manifest).await?;
+            let wal = concat(&segs, remote.manifest.wal_len());
+            let store = Store::open_image(base, &wal)?;
+            let mut st = self.lock();
+            st.image_wal = wal;
+            st.remote = Some(Remote { local_verified: true, ..remote });
+            Ok(Some(store))
+        }
+    }
+
+    /// Keep a [`Mirror::load_image`] replica current: one metadata request
+    /// when nothing changed, only the new log bytes when the log grew, the
+    /// new base after a compaction. Returns `true` when anything new became
+    /// visible.
+    pub fn refresh_image<'a>(
+        &'a self,
+        store: &'a Store,
+    ) -> impl Future<Output = Result<bool>> + 'a {
+        async move {
+            let cached = self.lock().remote.clone();
+            let meta = self.objects.head(&self.head_key()).await?;
+            match (&meta, &cached) {
+                (None, _) => return Ok(false),
+                (Some(m), Some(c)) if m.generation == c.head_gen => return Ok(false),
+                _ => {}
+            }
+            let Some(remote) = self.fetch_remote().await? else { return Ok(false) };
+            let m = &remote.manifest;
+            if m.generation == 0 {
+                return Ok(false);
+            }
+            let appendable = cached.as_ref().filter(|c| {
+                c.manifest.generation == m.generation
+                    && c.manifest.base_sum == m.base_sum
+                    && m.wal_len() >= c.manifest.wal_len()
+            });
+            let changed = if let Some(c) = appendable {
+                let have = c.manifest.wal_len();
+                let wanted = || m.segments.iter().filter(|s| s.end() > have);
+                let segs = self.fetch_segments(m, wanted()).await?;
+                let mut st = self.lock();
+                if st.image_wal.len() as u64 != have {
+                    return Err(corrupt("replica log image out of step with the manifest"));
+                }
+                for (s, b) in wanted().zip(&segs) {
+                    let skip = usize::try_from(have.saturating_sub(s.start)).unwrap_or(usize::MAX);
+                    st.image_wal.extend_from_slice(&b[skip.min(b.len())..]);
+                }
+                store.reload_image(None, &st.image_wal)?
+            } else {
+                let (base, segs) = self.fetch_all(m).await?;
+                let wal = concat(&segs, m.wal_len());
+                let changed = store.reload_image(Some(base), &wal)?;
+                self.lock().image_wal = wal;
+                changed
+            };
+            self.remember(Some(Remote { local_verified: true, ..remote }));
+            Ok(changed)
+        }
     }
 
     /// Rebuild `graph.base` and `graph.wal` in `dir` from the published
@@ -351,14 +437,16 @@ impl<'o, O: ObjectStore> Mirror<'o, O> {
             });
             if let Some(c) = appendable {
                 let have = c.manifest.wal_len();
-                let mut tail = Vec::new();
-                for s in m.segments.iter().filter(|s| s.end() > have) {
-                    let b =
-                        self.fetch_verified(&self.seg_key(m.generation, s), s.len, s.sum).await?;
-                    check_framing(&b, s.start, m.generation)?;
-                    let skip = usize::try_from(have.saturating_sub(s.start)).unwrap_or(usize::MAX);
-                    tail.push(b.slice(skip.min(b.len())..));
-                }
+                let wanted = || m.segments.iter().filter(|s| s.end() > have);
+                let segs = self.fetch_segments(m, wanted()).await?;
+                let tail: Vec<Bytes> = wanted()
+                    .zip(segs)
+                    .map(|(s, b)| {
+                        let skip =
+                            usize::try_from(have.saturating_sub(s.start)).unwrap_or(usize::MAX);
+                        b.slice(skip.min(b.len())..)
+                    })
+                    .collect();
                 let parts: Vec<&[u8]> = tail.iter().map(AsRef::as_ref).collect();
                 fsio::append(&wal_path, &parts)?;
             } else {
@@ -546,6 +634,15 @@ fn check_framing(b: &[u8], start: u64, generation: u64) -> Result<()> {
     } else {
         Err(corrupt("segment is not a run of committed frames"))
     }
+}
+
+/// Join segments into one log image (replay needs it contiguous).
+fn concat(segs: &[Bytes], len: u64) -> Vec<u8> {
+    let mut wal = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    for s in segs {
+        wal.extend_from_slice(s);
+    }
+    wal
 }
 
 /// Base first, then the log — graph-r's own compaction order, so a reader in

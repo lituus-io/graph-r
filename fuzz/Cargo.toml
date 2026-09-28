@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+bytes = "1.7"
 graph-r = { path = "..", default-features = false }
 
 [[bin]]
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "fuzz_wal_committed_len"
 path = "fuzz_targets/fuzz_wal_committed_len.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_open_image"
+path = "fuzz_targets/fuzz_open_image.rs"
 test = false
 doc = false
 bench = false
