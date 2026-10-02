@@ -70,6 +70,7 @@ pub mod bytesio;
 mod compact;
 pub mod error;
 pub mod format;
+pub mod hash;
 pub mod key;
 mod os;
 mod overlay;

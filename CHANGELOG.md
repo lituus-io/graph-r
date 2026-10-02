@@ -4,6 +4,12 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- `hash`: the crate's xxh3 family (`xxh3_64`, `xxh3_64_seeded`, `xxh3_128`,
+  streaming `Hasher`) as thin public wrappers, so dependants fingerprint with
+  the exact function behind `UrlKey` without a second hashing crate.
+
 ## 0.3.0
 
 Additive release: every 0.2 API, file format and default behaviour is
