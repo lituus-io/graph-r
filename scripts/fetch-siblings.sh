@@ -10,6 +10,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 token="${SIBLING_TOKEN:-}"
 auth="${token:+x-access-token:${token}@}"
 while read -r name ref; do
+  # A Windows checkout may hand the file over with CRLF line endings.
+  ref="${ref%$'\r'}"
   [[ -z "${name}" || "${name}" == \#* ]] && continue
   dest="${root}/../${name}"
   [[ -e "${dest}" ]] && continue
