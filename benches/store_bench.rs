@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Criterion benches for the store's hot paths, including the load-bearing
 //! claim: reader latency stays flat while a writer commits and compacts.
@@ -66,7 +66,7 @@ fn build_store(dir: &std::path::Path, n: usize) -> Store {
 
 fn bench_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("read");
-    for &n in &[1_000usize, 10_000] {
+    for &n in &[1_000usize, 10_000, 100_000] {
         let dir = tempfile::tempdir().unwrap();
         let store = build_store(dir.path(), n);
         let snap = store.snapshot();
@@ -87,6 +87,28 @@ fn bench_reads(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("query", n), &n, |b, _| {
             b.iter(|| {
                 black_box(snap.query("benchmark configuration details", &QueryOpts::default()))
+            });
+        });
+        let needle = format!("page {}", n / 3);
+        group.bench_with_input(BenchmarkId::new("query_selective", n), &n, |b, _| {
+            b.iter(|| black_box(snap.query(black_box(&needle), &QueryOpts::default())));
+        });
+        let mut walk = graph_r::Walk::new();
+        group.bench_with_input(BenchmarkId::new("walk_10_hops", n), &n, |b, _| {
+            b.iter(|| {
+                let mut reached = 0u32;
+                snap.walk(
+                    key,
+                    graph_r::Direction::Out,
+                    10,
+                    |_| true,
+                    &mut walk,
+                    |_| {
+                        reached += 1;
+                        reached < 64
+                    },
+                );
+                black_box(reached)
             });
         });
         group.bench_with_input(BenchmarkId::new("due_scan", n), &n, |b, _| {

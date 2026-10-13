@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! The committed-op overlay: an append-only, lock-free arena of WAL ops that
 //! have been fsynced but not yet folded into a base snapshot, plus the merged
@@ -76,6 +76,16 @@ impl Arena {
         true
     }
 
+    /// Sequence number of the last published op (0 when none): readers
+    /// publish what follows it, so a log is diffed by sequence, never by
+    /// count.
+    pub(crate) fn last_seq(&self) -> u64 {
+        match self.len() {
+            0 => 0,
+            n => self.cell(n - 1).and_then(OnceLock::get).map_or(0, |e| e.0),
+        }
+    }
+
     /// Iterate entries `[0, upto)`; `upto` must be a frontier value captured
     /// from `len()`, so every cell below it is initialized.
     pub(crate) fn committed(&self, upto: usize) -> impl Iterator<Item = &(u64, Op)> + '_ {
@@ -91,12 +101,12 @@ pub(crate) struct OverlayNode {
     pub(crate) core: Option<CoreFields>,
     pub(crate) segs: Option<Vec<OwnedSeg>>,
     pub(crate) edges: Option<Vec<OwnedEdge>>,
+    pub(crate) attrs: Option<Vec<(u8, CompactString)>>,
     pub(crate) touch: Option<TouchFields>,
     /// Freshness counters carried across an upsert (checks, changes,
     /// `last_change_ms`): history survives re-ingest; only `Remove` clears it.
     pub(crate) carried: Option<(u16, u16, u64)>,
     pub(crate) pinned: Option<bool>,
-    pub(crate) importance: Vec<(u8, u16)>,
     pub(crate) removed: bool,
     /// A `Remove` happened in this overlay: a later resurrecting upsert must
     /// not inherit the (not yet compacted) base record's history or pin.
@@ -188,6 +198,7 @@ impl OverlayView {
                 }
                 Op::SetSegments { segs, .. } => entry.segs = Some(segs.clone()),
                 Op::SetEdges { edges, .. } => entry.edges = Some(edges.clone()),
+                Op::SetAttrs { attrs, .. } => entry.attrs = Some(attrs.clone()),
                 Op::Touch {
                     checked_at_ms,
                     content_hash,
@@ -214,14 +225,6 @@ impl OverlayView {
                     *entry = OverlayNode { removed: true, severed: true, ..OverlayNode::default() };
                 }
                 Op::SetPinned { pinned, .. } => entry.pinned = Some(*pinned),
-                Op::SetImportance { scores, .. } => {
-                    for &(ordinal, imp) in scores {
-                        match entry.importance.iter_mut().find(|(o, _)| *o == ordinal) {
-                            Some(slot) => slot.1 = imp,
-                            None => entry.importance.push((ordinal, imp)),
-                        }
-                    }
-                }
             }
         }
         Self { map }

@@ -15,15 +15,16 @@ re-searching, or shipping page bodies to a model on every question.
 
 |            | **link-r** (acquire & rank)              | **graph-r** (remember & serve)                          |
 |------------|------------------------------------------|---------------------------------------------------------|
-| Creates    | Fetches pages, extracts, builds the searchable index | Graph nodes (docs + segments), typed edges, ranks, communities, freshness records |
+| Creates    | Fetches pages, extracts, builds the searchable index | Graph nodes (docs + segments), typed edges, ranks, freshness records |
 | Updates    | Executes crawls & conditional refreshes (network) | Decides *what/when* to refresh (adaptive TTL due-lists); absorbs deltas tier-scoped |
 | Deletes    | Evicts documents from its index          | Tombstones history; prunes at compaction                |
-| Lookup     | Hybrid dense+BM25 search over full text  | Query → URL + anchor refs, related, path, communities — zero network |
+| Lookup     | Hybrid dense+BM25 search over full text  | Query → URL + anchor refs, related, lineage walks — zero network |
 
-## Quick start (feature `bridge`)
+## Quick start (with link-r)
 
 ```toml
-graph-r = { path = "../graph-r", features = ["bridge"] }
+uu-graph-r = "0.4"
+uu-link-r = { version = "0.4", features = ["graph"] }   # the crawl → graph bridge
 ```
 
 ```rust,no_run
@@ -35,7 +36,7 @@ let mut index = link_r::LinkIndex::in_memory()?;   // link-r stays in memory
 
 // 1. Crawl once, absorb into the durable graph.
 let report = index.update("https://docs.example.com/").run().await?;
-graph_r::bridge::ingest_update(&store, &index, &report)?;
+link_r::bridge::ingest_update(&store, &index, &report)?;
 
 // 2. Look things up locally — URLs + anchors, never bodies.
 let snap = store.snapshot();
@@ -44,28 +45,28 @@ for hit in snap.query("install on linux", &QueryOpts::default()) {
 }
 
 // 3. Later: revalidate exactly what the graph says is due (304s are free).
-let due = graph_r::bridge::due_urls(&store, graph_r::bridge::now_ms(), 64);
+let due = link_r::bridge::due_urls(&store, graph_r::fsio::now_ms(), 64);
 if !due.is_empty() {
     let report = index.refresh().urls(due.iter()).ttl(std::time::Duration::ZERO).run().await?;
-    graph_r::bridge::ingest_refresh(&store, &index, &report)?;
+    link_r::bridge::ingest_refresh(&store, &index, &report)?;
 }
 # Ok(()) }
 ```
 
-Without `bridge`, graph-r is a standalone embedded graph store: feed it
+Without link-r, graph-r is a standalone embedded graph store: feed it
 `DocRecord`/`SegmentRecord`s from any source through `Store::writer()`.
 
-## One knowledge base: graph-r + link-r on object storage (`graph-r-kb`)
+## One knowledge base: graph-r + link-r on object storage (link-r feature `kb`)
 
 ```rust,ignore
-use graph_r_kb::{KnowledgeBase, LookupOpts, WriterOptions};
+use link_r::kb::{KnowledgeBase, LookupOpts, WriterOptions};
 
 let gcs = objstore_r::Gcs::new("my-bucket", objstore_r::token::Adc::discover()?, Default::default())?;
 
 // Writer (one instance, lease-fenced): conditional crawl -> bridge -> publish.
 let mut kb = KnowledgeBase::writer(&gcs, "kb/docs", tmpfs_dir, embedder, WriterOptions::new("instance-7")).await?;
 kb.sync_crawl(link_r::HttpFetcher::new(link_r::AnonymousAuth)?, "https://docs.example.com/", |c| c.depth(3)).await?;
-kb.refresh_due(&fetcher, graph_r::store::now_ms(), 256).await?;   // adaptive freshness
+kb.refresh_due(&fetcher, graph_r::fsio::now_ms(), 256).await?;   // adaptive freshness
 
 // Replicas (any number, no disk): hydrate in place, refresh cheaply, look up locally.
 let mut replica = KnowledgeBase::replica(&gcs, "kb/docs", embedder).await?.expect("published");
@@ -79,16 +80,16 @@ Measured on a live bucket: replica hydration ~80 ms, unchanged refresh ~27 ms
 (two concurrent metadata requests), fused lookup ~0.2 ms. At 1 000 pages in
 memory: hydration 1 ms, fused lookup 0.6 ms, graph query 0.09 ms.
 
-## Durable on object storage (`graph-r-mirror`)
+## Durable on object storage (objstore-r feature `mirror`)
 
-The `mirror/` crate keeps a store directory in sync with Google Cloud
-Storage (or a local directory, or memory) through
-[objstore-r](../objstore-r). graph-r itself is untouched: the mirror moves
+[objstore-r](https://github.com/lituus-io/objstore-r)'s `mirror` module keeps
+a store directory in sync with Google Cloud Storage (or a local directory, or
+memory). graph-r itself is untouched: the mirror moves
 its files byte for byte, so a stateless instance can keep the store on tmpfs
 and still lose nothing.
 
 ```rust,ignore
-use graph_r_mirror::Mirror;
+use objstore_r::mirror::Mirror;
 
 let objects = objstore_r::Gcs::new("my-bucket", objstore_r::token::Adc::discover()?, Default::default())?;
 let mirror = Mirror::new(&objects, "kb/runbooks")?;
@@ -123,37 +124,38 @@ move compaction off the commit path.
   grown 1.5× per unchanged check, cut 4× on change, clamped, biased by
   importance — and `due()` emits the work list, with stored ETags for
   conditional revalidation.
-- **Structure**: deterministic PageRank + label-propagation communities
-  (hub-muted, stable ids), computed at compaction and persisted.
+- **Structure**: deterministic PageRank at compaction, fused into lookups.
 - **Lookups**: IDF-weighted tiered lexical scoring (exact/prefix/substring),
   per-term seed guarantees, hub-refusing bounded BFS, importance fusion, and
   seeds-first rendering that stops inside a token budget. Results are URLs +
   segment anchors (`byte_range` when known) — never content.
 - **Segments**: sub-document anchors (heading path, depth, byte range,
-  importance) keyed stably by heading, so enrichment scores survive re-crawls.
-- **Tiers**: crawl-tier writes never destroy enrichment-tier edges/scores and
-  vice versa.
-- **LLM seam** (feature `llm`): a vendor-free `Enricher` trait — propose
-  segment importance and related edges from any model; confidence < 0.5 is
-  dropped, everything is stamped inferred + enrichment-tier. The default path
-  never needs a model or a network.
+  importance) keyed stably by heading, so a re-crawl keeps their identity.
+- **Lineage**: containment, value derivation (exact copies flagged) and row
+  conditions as typed edges with reverse adjacency; one allocation-free
+  `walk` up or down; large per-node attributes (SQL text, types, provenance).
 
 ## Features
 
-| Feature  | Adds                                            | Default |
-|----------|-------------------------------------------------|---------|
-| *(none)* | The embedded graph store, lookups, TTL engine   | ✓       |
-| `bridge` | link-r ingestion + due-list refresh loop        |         |
-| `llm`    | The `Enricher` trait seam (zero deps)           |         |
+| Feature  | Adds                                                       | Default |
+|----------|------------------------------------------------------------|---------|
+| *(none)* | The shared core: xxh3, keys, byte codecs, container, files, text rules | |
+| `mmap`   | Zero-copy images: memory-mapped files or bytes in place    |         |
+| `store`  | The embedded graph store, lookups, lineage walks, TTL engine | ✓     |
+
+The link-r ingest path is link-r's `graph` feature, object-store publishing
+is objstore-r's `mirror` feature, and both together are link-r's `kb`
+feature: graph-r's core depends on neither, so the four crates form no
+cycle.
 
 Future document types (pdf, xml, …) arrive as feature-gated link-r extractors
-and flow through the bridge unchanged — the `DocRecord`/`SegmentRecord` seam
+and flow through link-r's bridge unchanged — the `DocRecord`/`SegmentRecord` seam
 is the stable extension point. No harness coupling anywhere: this is a plain
 Rust library, embeddable in any runtime.
 
 ## Testing
 
-`cargo test` (unit + hermetic lifecycle + bridge e2e), `cargo test --test
+`cargo test` (unit + hermetic lifecycle), `cargo test --test
 proptest_model` (model-based agreement through compaction/reopen,
 byte-reproducibility, torn-WAL recovery), `cargo test --test concurrency`
 (8 readers under a compacting writer), `cargo bench` (criterion, including

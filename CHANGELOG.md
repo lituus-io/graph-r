@@ -4,7 +4,79 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.4.0
+
+Breaking: base format v2 and WAL format v2 (stores from 0.3 must be rebuilt
+or re-ingested); several unused APIs removed. Every capability a consumer
+(kb, mirror, the Python binding) uses is kept.
+
+**One foundation for the stack**
+- The core (no features: xxh3 alone) is now what link-r, objstore-r and
+  crab-r build on: `text` (tokenizer, case folding, char n-grams, stopwords,
+  `estimate_tokens` / `bytes_for_tokens`) moved here from link-r and is the
+  rule graph-r's lexicon and link-r's BM25 both use; `hash::fmix64` and
+  `hash::trigram`; `fsio::{lock, sync_dir, write_atomic_with}`;
+  `bytesio::{put_f32, put_len_prefixed}` and `Reader::{f32, len_prefixed}`;
+  `mmap::cast_f32`; per-section flags in `container`
+  (`Writer::section_flagged`, `Dir::{section_flags, has}`).
+- Published as **uu-graph-r** on crates.io (the library is still
+  `graph_r`), one self-contained crate. Its satellites moved to the crates
+  they compose with, so the four libraries form no dependency cycle: the
+  link-r bridge is `link_r::bridge` (uu-link-r feature `graph`; the `bridge`
+  feature here is gone), the knowledge base is `link_r::kb` (feature `kb`),
+  and store mirroring is `objstore_r::mirror` (uu-objstore-r feature
+  `mirror`), built on the shared `objstore_r::fenced` protocol.
+  `graph_r::store::now_ms` is `graph_r::fsio::now_ms`.
+
+**Fixed (independent review)**
+- A read-only reader that caught a compaction between its two renames
+  reported `Corrupt`; it now re-reads and, if the window persists, returns
+  `Busy`. Only a writable open still treats a newer log as damage.
+- A compaction refused in memory (every ring slot pinned) left a durable
+  base whose generation number the next compaction reused; readers then kept
+  the first base and skipped ops by count. Generations are now never reused,
+  and readers diff the log by sequence.
+- An empty log on a writable open (external truncation) made the next
+  commit write a headerless file; the header is now restored.
+- `reload_image` had no guard around the single-producer overlay; reloads
+  are now one at a time per handle, and both reloads are no-ops on writable
+  handles.
+- The bridge never grew the interval of a known, unchanged page re-fetched
+  without a validator (no ETag), so it was re-crawled at the base interval
+  forever.
+
+**Faster, cheaper**
+- `reload_if_stale` reads only the log bytes appended since the last reload.
+- Queries look tokens up through the hash order, a string-order index and a
+  trigram index instead of scanning the vocabulary, and score into reused
+  dense buffers: 9× faster at 10k documents, 2.2 ms at 100k with every
+  document matching. `due` selects instead of sorting everything.
+- The bridge compacts after an ingest only when it added or changed
+  documents.
+- Opening validates each byte once (header, directory, section checksums; no
+  whole-file trailer) and finds sections in O(1). Mirror no longer validates
+  a base twice.
+- Community detection, computed at every compaction and read by nothing,
+  is gone; rank records shrink from 8 to 2 bytes.
+
+**New**
+- Lineage model: `EdgeType::{Contains, Derives, Conditions}`, the
+  `eflags::EXACT` copy flag (`Writer::set_edges_with_flags`), inbound edges
+  (`Snapshot::in_edges`, written as a reverse CSR at compaction), node
+  attributes for large values (`Writer::set_attrs`, `Snapshot::attr(s)`),
+  and one reusable, allocation-free walk (`Snapshot::walk` with `Walk`,
+  `Direction::{Out, In}`). Up to 4096 edges per node.
+- A core build (`default-features = false`) of hashing, keys, byte codecs,
+  `container` (the checksummed sectioned file framing) and `fsio` (atomic
+  writes, the cross-process lock, the clock), with xxhash-rust as the only
+  dependency; `mmap` exposes `MappedFile`; `store` (default) is the store.
+
+**Removed** (no consumer used them): the `llm` feature and `enrich`, segment
+importance overrides, edge tiers, `community_summary`, `surprises`, `path`
+(use `walk`), `pending_ops`, `Writer::staged`, `Snapshot::check`, the
+`*_with` bridge variants (the plain ones are generic over the embedder), and
+the `libc` and `thiserror` dependencies (std's `File::try_lock` now holds the
+writer lock on every platform, released by the OS on crash).
 
 - `hash`: the crate's xxh3 family (`xxh3_64`, `xxh3_64_seeded`, `xxh3_128`,
   streaming `Hasher`) as thin public wrappers, so dependants fingerprint with

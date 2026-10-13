@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Compaction: fold the base + overlay into a fresh base generation.
 //!
@@ -19,9 +19,10 @@ use crate::format::base::{
     BaseWriter, Header, SectionKind, NO_LABEL,
 };
 use crate::format::wal;
+use crate::fsio::now_ms;
 use crate::key::{SegKey, UrlKey};
 use crate::rank;
-use crate::store::{atomic_write, base_path, now_ms, wal_path, Store};
+use crate::store::{atomic_write, base_path, wal_path, Store};
 use crate::traverse::LendingIterator;
 use crate::writer::WriteState;
 use compact_str::CompactString;
@@ -57,20 +58,19 @@ struct Model {
     flags: u16,
     segs: Vec<(u64, u32, u32, CompactString, u16, u8, u8)>,
     edges: Vec<(u64, u8, u8, u16)>,
+    attrs: Vec<(u8, CompactString)>,
 }
 
 /// Render an empty base for `generation` (store creation).
 pub(crate) fn render_empty_base(generation: u64) -> Vec<u8> {
     BaseWriter::new(Header {
         flags: 0,
-        section_count: 0,
         node_count: 0,
         seg_count: 0,
         edge_count: 0,
         token_count: 0,
         generation,
         wal_applied_seq: 0,
-        total_len: 0,
         created_at_ms: 0,
     })
     .finish()
@@ -83,7 +83,7 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     debug_assert!(state.staged_is_empty(), "compact with staged ops");
     let snap = store.snapshot();
     let old_generation = snap.generation();
-    let new_generation = old_generation + 1;
+    let new_generation = old_generation.max(state.disk_generation) + 1;
 
     // ---- 1. collect models through the snapshot merge path ------------------
     let mut keys: Vec<u64> = Vec::with_capacity(snap.base_len() + 64);
@@ -138,6 +138,11 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
                 flags: n.flags,
                 segs,
                 edges,
+                attrs: {
+                    let mut a = Vec::new();
+                    snap.attrs(key, |k, v| a.push((k, CompactString::from(v))));
+                    a
+                },
             },
         );
     }
@@ -171,6 +176,7 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
                 flags: nflags::STUB,
                 segs: Vec::new(),
                 edges: Vec::new(),
+                attrs: Vec::new(),
             },
         );
     }
@@ -209,8 +215,8 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     let mut lexicon: BTreeMap<u64, (CompactString, Vec<u32>)> = BTreeMap::new();
     let push_tokens =
         |text: &str, id: u32, lexicon: &mut BTreeMap<u64, (CompactString, Vec<u32>)>| {
-            crate::query::for_each_token(text, |tok| {
-                let hash = xxhash_rust::xxh3::xxh3_64(tok.as_bytes());
+            crate::text::for_each_term(text, |tok| {
+                let hash = crate::hash::xxh3_64(tok.as_bytes());
                 let entry =
                     lexicon.entry(hash).or_insert_with(|| (CompactString::from(tok), Vec::new()));
                 if entry.1.last() != Some(&id) {
@@ -285,6 +291,44 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     }
     edge_index.extend_from_slice(&edge_total.to_le_bytes());
 
+    // Reverse CSR (sources ascending per destination: rows are visited in
+    // source order) and per-node attribute runs over one blob heap.
+    let mut inbound: Vec<Vec<(u32, u8, u8, u16)>> = vec![Vec::new(); n];
+    for (src, rows) in edge_rows.iter().enumerate() {
+        for &(dst, etype, flags, weight) in rows {
+            inbound[dst as usize].push((src as u32, etype, flags, weight));
+        }
+    }
+    let mut in_index = Vec::with_capacity((n + 1) * 4);
+    let mut in_bytes = Vec::with_capacity(edge_total as usize * base::EDGE_LEN);
+    let mut in_total = 0u32;
+    for rows in &inbound {
+        in_index.extend_from_slice(&in_total.to_le_bytes());
+        for &(src, etype, flags, weight) in rows {
+            in_bytes.extend_from_slice(&src.to_le_bytes());
+            in_bytes.push(etype);
+            in_bytes.push(flags);
+            in_bytes.extend_from_slice(&weight.to_le_bytes());
+            in_total += 1;
+        }
+    }
+    in_index.extend_from_slice(&in_total.to_le_bytes());
+    let mut attr_index = Vec::with_capacity((n + 1) * 4);
+    let mut attr_bytes = Vec::new();
+    let mut blobs = Vec::new();
+    let mut attr_total = 0u32;
+    for m in models.values() {
+        attr_index.extend_from_slice(&attr_total.to_le_bytes());
+        for (k, v) in &m.attrs {
+            attr_bytes.extend_from_slice(&[*k, 0, 0, 0]);
+            attr_bytes.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+            attr_bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            blobs.extend_from_slice(v.as_bytes());
+            attr_total += 1;
+        }
+    }
+    attr_index.extend_from_slice(&attr_total.to_le_bytes());
+
     // Segment identity sanity: seg keys must match their heading path.
     debug_assert!(models.iter().all(|(&k, m)| m
         .segs
@@ -300,26 +344,41 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
         let label_off = push_label(&mut labels, label);
         write_lex_rec(&mut lex_bytes, hash, ids.len() as u32, off, len, label_off);
     }
-
-    let (rank_permille, community) = rank::compute(n, &edge_rows);
-    let mut ranks_bytes = Vec::with_capacity(n * base::RANK_LEN);
-    for i in 0..n {
-        ranks_bytes.extend_from_slice(&rank_permille[i].to_le_bytes());
-        ranks_bytes.extend_from_slice(&0u16.to_le_bytes());
-        ranks_bytes.extend_from_slice(&community[i].to_le_bytes());
+    // Search indices over the lexicon (index = position in hash order):
+    // string order for prefixes, byte trigrams for substrings.
+    let tokens: Vec<&str> = lexicon.values().map(|(t, _)| t.as_str()).collect();
+    let mut order: Vec<u32> = (0..tokens.len() as u32).collect();
+    order.sort_unstable_by(|&a, &b| tokens[a as usize].cmp(tokens[b as usize]));
+    let lex_order: Vec<u8> = order.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let mut trigrams: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (i, t) in tokens.iter().enumerate() {
+        for w in t.as_bytes().windows(3) {
+            let ids = trigrams.entry(crate::hash::trigram(w)).or_default();
+            if ids.last() != Some(&(i as u32)) {
+                ids.push(i as u32);
+            }
+        }
     }
+    let (mut tri_bytes, mut tri_post) = (Vec::new(), Vec::new());
+    for (g, ids) in &trigrams {
+        tri_bytes.extend_from_slice(&g.to_le_bytes());
+        tri_bytes.extend_from_slice(&((tri_post.len() / 4) as u32).to_le_bytes());
+        tri_bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        tri_post.extend(ids.iter().flat_map(|i| i.to_le_bytes()));
+    }
+
+    let rank_permille = rank::compute(n, &edge_rows);
+    let ranks_bytes: Vec<u8> = rank_permille.iter().flat_map(|r| r.to_le_bytes()).collect();
 
     let wal_applied_seq = state.last_committed_seq();
     let mut w = BaseWriter::new(Header {
         flags: 0,
-        section_count: 0,
         node_count: n as u32,
         seg_count: seg_total,
         edge_count: edge_total,
         token_count: lexicon.len() as u32,
         generation: new_generation,
         wal_applied_seq,
-        total_len: 0,
         created_at_ms: max_fetched, // deterministic, informative enough
     });
     if n > 0 {
@@ -336,19 +395,30 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
             w.add_section(SectionKind::Lexicon, lex_bytes);
             w.add_section(SectionKind::Postings, postings_bytes);
         }
+        w.add_section(SectionKind::InEdgeIndex, in_index);
+        w.add_section(SectionKind::InEdges, in_bytes);
+        if attr_total > 0 {
+            w.add_section(SectionKind::AttrIndex, attr_index);
+            w.add_section(SectionKind::Attrs, attr_bytes);
+            w.add_section(SectionKind::Blobs, blobs);
+        }
         w.add_section(SectionKind::Ranks, ranks_bytes);
+        w.add_section(SectionKind::LexOrder, lex_order);
+        w.add_section(SectionKind::Trigrams, tri_bytes);
+        w.add_section(SectionKind::TriPostings, tri_post);
     }
     let bytes = w.finish();
     drop(snap); // release the read pin before touching the ring
 
     // ---- 4. swap files (base first — see module docs), then the WAL ---------
     atomic_write(&base_path(&store.dir), &bytes)?;
+    state.disk_generation = new_generation;
     atomic_write(&wal_path(&store.dir), &wal::encode_header(new_generation, now_ms()))?;
     state.reset_after_compact(wal_applied_seq + 1);
     store.due.store(false, Ordering::Release);
 
     // ---- 5. install into a free ring slot -----------------------------------
-    let map = crate::os::MappedFile::open(&base_path(&store.dir))?;
+    let map = crate::mmap::MappedFile::open(&base_path(&store.dir))?;
     let dir = base::BaseDir::parse(map.bytes())?;
     let mut pending = Some(crate::store::GenInner::from_parts(map, dir));
     let cur = store.current.load(Ordering::Acquire);

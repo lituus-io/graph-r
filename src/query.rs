@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Local lookups that answer with **references** — URL + anchor + snippet —
 //! inside a token budget, never with document bodies. The recipe:
@@ -16,8 +16,10 @@
 //!    rendering that stops before the token budget is exceeded.
 
 use crate::format::base::{self, LexRec};
+use crate::hash::trigram;
 use crate::key::{EdgeType, NodeId, UrlKey};
 use crate::snapshot::Snapshot;
+use crate::text::for_each_term;
 use crate::traverse::LendingIterator;
 use compact_str::CompactString;
 use std::collections::HashMap;
@@ -90,33 +92,25 @@ const CONF_INFERRED: f32 = 0.6;
 const FUSE_TRAVERSAL: f32 = 0.8;
 const FUSE_RANK: f32 = 0.2;
 
-/// Run `f` for every lowercase token (Unicode-alphanumeric runs) of `text`.
-/// One tokenizer for indexing (compaction) and querying, so they always
-/// agree — the same rule link-r applies to its BM25 terms.
-pub(crate) fn for_each_token(text: &str, mut f: impl FnMut(&str)) {
-    let mut buf = String::new();
-    for run in text.split(|c: char| !c.is_alphanumeric()) {
-        if run.is_empty() {
-            continue;
-        }
-        if run.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
-            f(run);
-        } else {
-            buf.clear();
-            buf.extend(run.chars().flat_map(char::to_lowercase));
-            f(&buf);
-        }
-    }
-}
-
 fn dedup_terms(query: &str) -> Vec<CompactString> {
     let mut terms: Vec<CompactString> = Vec::new();
-    for_each_token(query, |t| {
+    for_each_term(query, |t| {
         if t.len() >= 2 && !terms.iter().any(|x| x == t) {
             terms.push(CompactString::from(t));
         }
     });
     terms
+}
+
+/// Per-thread dense scoring buffers, indexed by base node id.
+#[derive(Default)]
+struct Scratch {
+    scores: Vec<NodeScore>,
+    tier_of: Vec<f32>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
 }
 
 #[derive(Default, Clone, Copy)]
@@ -128,6 +122,98 @@ struct NodeScore {
 }
 
 impl<'s> Snapshot<'s> {
+    /// Lexicon tokens matching `term`, each once at its best tier: exact by
+    /// hash (binary search), prefix by string order (binary search, then the
+    /// run), substring through the term's trigrams (terms of 3+ bytes) —
+    /// O(log V + matches), never a scan of the vocabulary.
+    fn lex_matches(&self, term: &str, hash: u64, mut emit: impl FnMut(LexRec<'_>, f32)) {
+        let (lex, labels) = (self.lexicon(), self.labels());
+        let n = lex.len() / base::LEX_LEN;
+        let rec = |i: usize| LexRec(&lex[i * base::LEX_LEN..(i + 1) * base::LEX_LEN]);
+        let tok = |i: usize| base::label_at(labels, rec(i).label_off()).unwrap_or("");
+        let exact = {
+            let (mut lo, mut hi) = (0, n);
+            while lo < hi {
+                let mid = lo.midpoint(hi);
+                if rec(mid).token_hash() < hash {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            (lo < n && rec(lo).token_hash() == hash).then_some(lo)
+        };
+        if let Some(i) = exact {
+            emit(rec(i), TIER_EXACT);
+        }
+        let order = self.section_bytes(base::SectionKind::LexOrder);
+        let at = |k: usize| crate::bytesio::get_u32(order, k * 4) as usize;
+        let (mut lo, mut hi) = (0, order.len() / 4);
+        while lo < hi {
+            let mid = lo.midpoint(hi);
+            if tok(at(mid)) < term {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for k in lo..order.len() / 4 {
+            let i = at(k);
+            if !tok(i).starts_with(term) {
+                break;
+            }
+            if Some(i) != exact {
+                emit(rec(i), TIER_PREFIX);
+            }
+        }
+        if term.len() < 3 {
+            return;
+        }
+        // The rarest trigram's tokens are the candidates; `contains` decides.
+        let (tri, post) = (
+            self.section_bytes(base::SectionKind::Trigrams),
+            self.section_bytes(base::SectionKind::TriPostings),
+        );
+        let lookup = |g: u32| -> &[u8] {
+            let (mut lo, mut hi) = (0, tri.len() / base::TRI_LEN);
+            while lo < hi {
+                let mid = lo.midpoint(hi);
+                if crate::bytesio::get_u32(tri, mid * base::TRI_LEN) < g {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let r = lo * base::TRI_LEN;
+            if r < tri.len() && crate::bytesio::get_u32(tri, r) == g {
+                let (o, l) = (
+                    crate::bytesio::get_u32(tri, r + 4) as usize,
+                    crate::bytesio::get_u32(tri, r + 8) as usize,
+                );
+                &post[o * 4..(o + l) * 4]
+            } else {
+                &[]
+            }
+        };
+        let mut rarest: Option<&[u8]> = None;
+        for w in term.as_bytes().windows(3) {
+            let ids = lookup(trigram(w));
+            if ids.is_empty() {
+                return; // some trigram never occurs: no token contains the term
+            }
+            if rarest.is_none_or(|r| ids.len() < r.len()) {
+                rarest = Some(ids);
+            }
+        }
+        for c in rarest.unwrap_or(&[]).chunks_exact(4) {
+            let i = crate::bytesio::get_u32(c, 0) as usize;
+            let t = tok(i);
+            if t.contains(term) && !t.starts_with(term) {
+                emit(rec(i), TIER_SUBSTR);
+            }
+        }
+    }
+
     /// Answer a plain-language `query` with ranked URL + anchor references.
     #[must_use]
     #[allow(clippy::too_many_lines)] // the scoring pipeline reads best as one pass
@@ -138,30 +224,25 @@ impl<'s> Snapshot<'s> {
         }
         let n_base = self.base_len();
         let n_docs = n_base.max(1) as f32;
-        let lex = self.lexicon();
-        let labels = self.labels();
-        let lex_count = lex.len() / base::LEX_LEN;
 
         // ---- lexical scoring over the base lexicon --------------------------
-        let mut scores: HashMap<u32, NodeScore> = HashMap::new();
+        // Dense per-node buffers (reset through touched lists): a common term
+        // matching every document costs array writes, not hash-map traffic.
+        // The buffers live per thread and are left all-zero after each use,
+        // so a query never allocates or clears O(documents) memory.
+        let mut scratch = SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if scratch.scores.len() < n_base {
+            scratch.scores.resize(n_base, NodeScore::default());
+            scratch.tier_of.resize(n_base, 0.0);
+        }
+        let Scratch { scores, tier_of, .. } = &mut scratch;
+        let mut scored: Vec<u32> = Vec::new();
+        let mut touched: Vec<u32> = Vec::new();
         let mut per_term_best: Vec<Option<(f32, u32)>> = vec![None; terms.len()];
         for (ti, term) in terms.iter().enumerate() {
-            let hash = xxhash_rust::xxh3::xxh3_64(term.as_bytes());
+            let hash = crate::hash::xxh3_64(term.as_bytes());
             let mut df_for_idf: u32 = 0;
-            // (node id → best tier weight) for this term.
-            let mut tiers: HashMap<u32, f32> = HashMap::new();
-            for i in 0..lex_count {
-                let rec = LexRec(&lex[i * base::LEX_LEN..(i + 1) * base::LEX_LEN]);
-                let token = base::label_at(labels, rec.label_off()).unwrap_or("");
-                let tier = if rec.token_hash() == hash || token == term.as_str() {
-                    TIER_EXACT
-                } else if token.starts_with(term.as_str()) {
-                    TIER_PREFIX
-                } else if token.contains(term.as_str()) {
-                    TIER_SUBSTR
-                } else {
-                    continue;
-                };
+            self.lex_matches(term, hash, |rec, tier| {
                 if tier >= TIER_EXACT {
                     df_for_idf = df_for_idf.max(rec.df());
                 }
@@ -169,17 +250,24 @@ impl<'s> Snapshot<'s> {
                     rec.postings_off() as usize..(rec.postings_off() + rec.postings_len()) as usize;
                 if let Ok(ids) = base::decode_postings(&self.postings()[range]) {
                     for id in ids {
-                        let e = tiers.entry(id).or_insert(0.0);
+                        let Some(e) = tier_of.get_mut(id as usize) else { continue };
+                        if *e == 0.0 {
+                            touched.push(id);
+                        }
                         if tier > *e {
                             *e = tier;
                         }
                     }
                 }
-            }
+            });
             let idf = (1.0 + n_docs / (1.0 + df_for_idf as f32)).ln().max(0.1);
-            for (id, tier) in tiers {
+            for id in touched.drain(..) {
+                let tier = std::mem::take(&mut tier_of[id as usize]);
                 let contribution = tier * idf;
-                let s = scores.entry(id).or_default();
+                let s = &mut scores[id as usize];
+                if s.matched == 0 {
+                    scored.push(id);
+                }
                 if s.last_term != ti as u32 + 1 {
                     s.matched += 1;
                     s.last_term = ti as u32 + 1;
@@ -195,17 +283,24 @@ impl<'s> Snapshot<'s> {
             }
         }
 
-        // Coverage² scaling.
-        let mut base_scores: Vec<(u32, f32)> = scores
-            .iter()
-            .map(|(&id, s)| {
-                let coverage = s.matched as f32 / terms.len() as f32;
-                (id, s.tiered * coverage * coverage)
-            })
-            .collect();
-        base_scores.sort_by(|a, b| {
+        // Coverage² scaling; only the leaders are ever read, so select them
+        // rather than sort every match.
+        let coverage_score = |id: u32| {
+            let s = &scores[id as usize];
+            let coverage = s.matched as f32 / terms.len() as f32;
+            s.tiered * coverage * coverage
+        };
+        let mut base_scores: Vec<(u32, f32)> =
+            scored.iter().map(|&id| (id, coverage_score(id))).collect();
+        let by_score = |a: &(u32, f32), b: &(u32, f32)| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-        });
+        };
+        let lead = opts.max_seeds.min(base_scores.len());
+        if lead < base_scores.len() {
+            base_scores.select_nth_unstable_by(lead, by_score);
+            base_scores.truncate(lead);
+        }
+        base_scores.sort_by(by_score);
 
         // ---- overlay-fresh nodes (not yet compacted): direct matches --------
         let mut fresh_hits: Vec<(u64, f32)> = Vec::new();
@@ -220,7 +315,7 @@ impl<'s> Snapshot<'s> {
             let mut hay: Vec<CompactString> = Vec::new();
             let searchable = node.url.split_once("://").map_or(node.url, |(_, r)| r);
             for text in [Some(searchable), node.title, node.snippet].into_iter().flatten() {
-                for_each_token(text, |t| hay.push(CompactString::from(t)));
+                for_each_term(text, |t| hay.push(CompactString::from(t)));
             }
             let mut tiered = 0.0f32;
             let mut matched = 0u32;
@@ -273,14 +368,22 @@ impl<'s> Snapshot<'s> {
 
         // ---- bounded, hub-refusing BFS --------------------------------------
         let hub = self.hub_threshold();
-        let score_of: HashMap<u32, f32> = base_scores.iter().copied().collect();
+
         let mut arrival: HashMap<u32, f32> = HashMap::new();
         let mut frontier: Vec<(u32, f32)> = Vec::new();
         for &s in &seeds {
-            let sc = score_of.get(&s).copied().unwrap_or(0.0);
+            let sc = if scores.get(s as usize).is_some_and(|x| x.matched > 0) {
+                coverage_score(s)
+            } else {
+                0.0
+            };
             arrival.insert(s, sc);
             frontier.push((s, sc));
         }
+        for &id in &scored {
+            scores[id as usize] = NodeScore::default();
+        }
+        SCRATCH.with(|c| *c.borrow_mut() = scratch);
         for _hop in 0..opts.depth {
             let mut next: Vec<(u32, f32)> = Vec::new();
             for &(u, u_score) in &frontier {
@@ -381,7 +484,7 @@ impl<'s> Snapshot<'s> {
         let mut best: Option<(u32, u16, Anchor<'s>)> = None;
         for s in segs {
             let mut matches = 0u32;
-            for_each_token(s.label, |tok| {
+            for_each_term(s.label, |tok| {
                 if terms.iter().any(|t| tok == t.as_str() || tok.starts_with(t.as_str())) {
                     matches += 1;
                 }
@@ -437,91 +540,6 @@ impl<'s> Snapshot<'s> {
         }
         out
     }
-
-    /// The community around `key`: its stable id, a hub-derived name, and the
-    /// top members by rank.
-    #[must_use]
-    pub fn community_summary(&'s self, key: UrlKey, top: usize) -> Option<CommunitySummary<'s>> {
-        let id = self.base_node_id(key)?;
-        let community = self.community_of(id)?;
-        let mut members: Vec<(u16, u32)> = (0..self.base_len() as u32)
-            .filter(|&i| self.community_of(NodeId(i)) == Some(community))
-            .map(|i| (self.rank_permille_of(NodeId(i)), i))
-            .collect();
-        members.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let size = members.len();
-        let name = members
-            .first()
-            .and_then(|&(_, i)| self.node_by_id(NodeId(i)))
-            .and_then(|n| n.title.or(Some(n.url)))
-            .unwrap_or("");
-        let top_urls = members
-            .iter()
-            .take(top)
-            .filter_map(|&(_, i)| self.node_by_id(NodeId(i)).map(|n| n.url))
-            .collect();
-        Some(CommunitySummary { id: community, name, size, top_urls })
-    }
-
-    /// Cross-community edges, strongest first — the connections most likely
-    /// to be surprising, one representative per community pair.
-    #[must_use]
-    pub fn surprises(&'s self, k: usize) -> Vec<(Hit<'s>, Hit<'s>)> {
-        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-        let mut ranked: Vec<(f32, u64, u64)> = Vec::new();
-        for i in 0..self.base_len() as u32 {
-            let src = NodeId(i);
-            let Some(ca) = self.community_of(src) else { continue };
-            let src_key = self.rec(src).url_key();
-            let mut it = self.neighbors(src_key);
-            while let Some(e) = it.next() {
-                let Some(dst) = e.dst else { continue };
-                let Some(cb) = self.community_of(dst) else { continue };
-                if ca == cb {
-                    continue;
-                }
-                let pair = (ca.min(cb), ca.max(cb));
-                if !seen.insert(pair) {
-                    continue;
-                }
-                let conf = if e.is_inferred() { CONF_INFERRED } else { 1.0 };
-                ranked.push((f32::from(e.weight) / 65_535.0 * conf, src_key.0, e.dst_key.0));
-            }
-        }
-        ranked.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
-        });
-        let mut out = Vec::new();
-        for (score, a, b) in ranked.into_iter().take(k) {
-            let (Some(na), Some(nb)) = (self.node(UrlKey(a)), self.node(UrlKey(b))) else {
-                continue;
-            };
-            let hit = |n: crate::snapshot::NodeRef<'s>| Hit {
-                key: n.key,
-                url: n.url,
-                title: n.title,
-                snippet: n.snippet,
-                anchor: None,
-                score,
-                seed: false,
-            };
-            out.push((hit(na), hit(nb)));
-        }
-        out
-    }
-}
-
-/// A community overview.
-#[derive(Clone, Debug)]
-pub struct CommunitySummary<'s> {
-    /// Stable community id (smallest member node id).
-    pub id: u32,
-    /// Hub-derived display name (title of the highest-ranked member).
-    pub name: &'s str,
-    /// Member count.
-    pub size: usize,
-    /// Top member URLs by rank.
-    pub top_urls: Vec<&'s str>,
 }
 
 fn estimate_tokens(
@@ -535,19 +553,12 @@ fn estimate_tokens(
         + snippet.map_or(0, str::len)
         + anchor.map_or(0, |a| a.label.len() + 12)
         + 16; // structural overhead per rendered entry
-    (bytes as u32).div_ceil(4)
+    crate::text::estimate_tokens(bytes) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tokenizer_lowercases_and_splits() {
-        let mut toks = Vec::new();
-        for_each_token("Install FooBar v2.1 (Löwe)", |t| toks.push(t.to_owned()));
-        assert_eq!(toks, ["install", "foobar", "v2", "1", "löwe"]);
-    }
 
     #[test]
     fn dedup_terms_keeps_order_and_drops_singles() {

@@ -1,9 +1,9 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 
 [package]
 name = "graph-r-python"
-version = "0.2.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
@@ -21,10 +21,10 @@ pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
 # and blocks on it, detached from the interpreter.
 tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "net", "time"] }
 # Aliased to `graphr` because this crate's own lib is named `graph_r` (the
-# Python module). `bridge` pulls the exact matching link-r in statically —
-# the binding reaches it through `graphr::bridge::link_r`, so there is no
-# second path dependency to keep in sync.
-graphr = { path = "../..", package = "graph-r", features = ["bridge"] }
+# Python module).
+graphr = { path = "../..", package = "uu-graph-r" }
+# link-r with its graph-r bridge: the crawl inside `Store.sync`.
+linkr = { path = "../../../link-r", package = "uu-link-r", default-features = false, features = ["graph", "hash", "html", "markdown"] }
 
 # Detach from the parent crate's build so the main `cargo test` never needs Python.
 [workspace]

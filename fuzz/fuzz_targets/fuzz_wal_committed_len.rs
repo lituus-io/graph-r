@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Arbitrary bytes as a WAL image: `committed_len` must never panic and must
 //! agree exactly with `replay`, which is what makes it safe to ship a prefix.

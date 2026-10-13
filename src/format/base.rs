@@ -1,10 +1,10 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! `graph.base` — the immutable snapshot. Layout:
 //!
 //! ```text
-//! [Header 128 B][DirEntry × N, 32 B each][section bytes, 64-aligned]...[trailer 8 B]
+//! [container header 128 B][directory, 32 B per section][sections, 64-aligned]
 //! ```
 //!
 //! Fixed-width, sorted record tables make every lookup a zero-copy binary
@@ -13,20 +13,16 @@
 //! new section kinds (unknown kinds are skipped on read) and header flags,
 //! never by reinterpreting existing bytes.
 
-use crate::bytesio::{
-    self, align_up, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, Reader,
-};
+use crate::bytesio::{self, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, Reader};
+use crate::container;
 use crate::error::{Error, Result};
-use crate::format::{ALIGN, DIR_ENTRY_LEN, TRAILER_LEN};
 use crate::key::UrlKey;
-use xxhash_rust::xxh3::xxh3_64;
 
 /// Magic: `"GRPR"` little-endian.
 pub const MAGIC: u32 = 0x5250_5247;
-/// Format version; strict-equal on read.
-pub const VERSION: u16 = 1;
-/// Header width.
-pub const HEADER_LEN: usize = 128;
+/// Format version; strict-equal on read. 2: the shared container framing
+/// (header, directory and section checksums; no whole-file trailer).
+pub const VERSION: u16 = 2;
 
 /// Node record width.
 pub const NODE_LEN: usize = 72;
@@ -36,8 +32,13 @@ pub const SEG_LEN: usize = 24;
 pub const EDGE_LEN: usize = 8;
 /// Lexicon record width.
 pub const LEX_LEN: usize = 24;
-/// Rank record width.
-pub const RANK_LEN: usize = 8;
+/// Rank record width (rank percentile, permille).
+pub const RANK_LEN: usize = 2;
+/// Attribute record width: key u8, 3 zero bytes, blob offset u32, length u32.
+pub const ATTR_LEN: usize = 12;
+/// Trigram record width: trigram (3 bytes, big-endian in a u32), postings
+/// offset and length (in u32 lexicon indices).
+pub const TRI_LEN: usize = 12;
 
 /// Sentinel for "no label" in a label-offset field.
 pub const NO_LABEL: u32 = u32::MAX;
@@ -55,19 +56,16 @@ pub mod nflags {
 
 /// Edge flags.
 pub mod eflags {
-    /// Set = enrichment tier (survives crawl-tier replacement); clear = crawl tier.
-    pub const TIER_ENRICH: u8 = 1;
-    /// Set = inferred (heuristic/enrichment); clear = extracted from source.
+    /// Set = inferred (a `Related` similarity edge); clear = extracted.
     pub const INFERRED: u8 = 2;
+    /// Set on a `Derives` edge = an unchanged copy (pass-through or rename).
+    pub const EXACT: u8 = 4;
 }
 
 /// Segment flags.
 pub mod sflags {
     /// The byte range is unknown (heading-path anchor only).
     pub const NO_RANGE: u8 = 1;
-    /// Importance was set by an enricher; preserved across re-ingest while
-    /// the owning document's content hash is unchanged.
-    pub const LLM_SCORED: u8 = 2;
 }
 
 /// Section kinds (discriminants are burned; do not renumber).
@@ -88,17 +86,37 @@ pub enum SectionKind {
     Lexicon = 6,
     /// LEB128 delta-encoded ascending node-id postings.
     Postings = 7,
-    /// Fixed 8-B per-node rank/community records (parallel to `Nodes`).
+    /// Fixed 2-B per-node rank percentiles (parallel to `Nodes`).
     Ranks = 8,
+    /// CSR offsets: `(node_count + 1) × u32` into `InEdges`.
+    InEdgeIndex = 9,
+    /// Fixed 8-B inbound records (source id, type, flags, weight), per-node
+    /// runs sorted by source id: the reverse of `Edges`.
+    InEdges = 10,
+    /// CSR offsets: `(node_count + 1) × u32` into `Attrs`.
+    AttrIndex = 11,
+    /// Fixed 12-B attribute records, per-node runs sorted by key.
+    Attrs = 12,
+    /// UTF-8 attribute values, addressed by (offset, length).
+    Blobs = 13,
+    /// `token_count × u32` lexicon indices in token string order: prefix
+    /// lookups are a binary search.
+    LexOrder = 14,
+    /// Fixed 12-B trigram records sorted by trigram: substring lookups
+    /// intersect the postings of a term's trigrams.
+    Trigrams = 15,
+    /// Ascending u32 lexicon indices per trigram.
+    TriPostings = 16,
 }
 
-/// Parsed header of a base file.
+/// The base file's container identity (see [`crate::container`]).
+pub const FORMAT: container::Format = container::Format { magic: MAGIC, version: VERSION };
+
+/// Parsed header of a base file: the container's owner area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
-    /// Feature flags (none defined in v1; must round-trip).
+    /// Feature flags (none defined; must round-trip).
     pub flags: u16,
-    /// Number of directory entries.
-    pub section_count: u32,
     /// Node record count.
     pub node_count: u32,
     /// Segment record count.
@@ -107,129 +125,79 @@ pub struct Header {
     pub edge_count: u32,
     /// Lexicon record count.
     pub token_count: u32,
-    /// Monotonic snapshot generation (bumped each compaction).
+    /// Monotonic snapshot generation (bumped each compaction, never reused).
     pub generation: u64,
     /// Highest WAL op sequence folded into this base.
     pub wal_applied_seq: u64,
-    /// Total file length including trailer.
-    pub total_len: u64,
     /// Wall-clock creation stamp (informational).
     pub created_at_ms: u64,
 }
 
 impl Header {
-    fn write_into(&self, out: &mut Vec<u8>) {
-        debug_assert!(out.is_empty());
-        put_u32(out, MAGIC);
-        put_u16(out, VERSION);
-        put_u16(out, self.flags);
-        put_u32(out, HEADER_LEN as u32);
-        put_u32(out, self.section_count);
-        put_u32(out, self.node_count);
-        put_u32(out, self.seg_count);
-        put_u32(out, self.edge_count);
-        put_u32(out, self.token_count);
-        put_u64(out, self.generation);
-        put_u64(out, self.wal_applied_seq);
-        put_u64(out, self.total_len);
-        put_u64(out, self.created_at_ms);
-        // Reserved: pad to the checksum slot; must be zero for v1 readers.
-        out.resize(HEADER_LEN - 8, 0);
-        let sum = xxh3_64(&out[..HEADER_LEN - 8]);
-        put_u64(out, sum);
+    fn owner(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(40);
+        put_u32(&mut o, self.node_count);
+        put_u32(&mut o, self.seg_count);
+        put_u32(&mut o, self.edge_count);
+        put_u32(&mut o, self.token_count);
+        put_u64(&mut o, self.generation);
+        put_u64(&mut o, self.wal_applied_seq);
+        put_u64(&mut o, self.created_at_ms);
+        o
     }
 
+    fn from_owner(flags: u16, o: &[u8]) -> Self {
+        Self {
+            flags,
+            node_count: get_u32(o, 0),
+            seg_count: get_u32(o, 4),
+            edge_count: get_u32(o, 8),
+            token_count: get_u32(o, 12),
+            generation: get_u64(o, 16),
+            wal_applied_seq: get_u64(o, 24),
+            created_at_ms: get_u64(o, 32),
+        }
+    }
+
+    /// The header alone (its own checksum verified, nothing else): enough to
+    /// learn a base's generation without validating the whole file.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(Error::format("file shorter than header"));
-        }
-        if get_u32(bytes, 0) != MAGIC {
-            return Err(Error::format("bad magic"));
-        }
-        let version = get_u16(bytes, 4);
-        if version != VERSION {
-            return Err(Error::format(format!("unsupported version {version}")));
-        }
-        let stored = get_u64(bytes, HEADER_LEN - 8);
-        if xxh3_64(&bytes[..HEADER_LEN - 8]) != stored {
-            return Err(Error::format("header checksum mismatch"));
-        }
-        if get_u32(bytes, 8) as usize != HEADER_LEN {
-            return Err(Error::format("unexpected header length"));
-        }
-        // Reserved region must be zero so future writers can claim it.
-        if bytes[64..HEADER_LEN - 8].iter().any(|&b| b != 0) {
-            return Err(Error::format("reserved header bytes not zero"));
-        }
-        Ok(Self {
-            flags: get_u16(bytes, 6),
-            section_count: get_u32(bytes, 12),
-            node_count: get_u32(bytes, 16),
-            seg_count: get_u32(bytes, 20),
-            edge_count: get_u32(bytes, 24),
-            token_count: get_u32(bytes, 28),
-            generation: get_u64(bytes, 32),
-            wal_applied_seq: get_u64(bytes, 40),
-            total_len: get_u64(bytes, 48),
-            created_at_ms: get_u64(bytes, 56),
-        })
+        let (flags, owner) = container::peek(bytes, FORMAT)?;
+        Ok(Self::from_owner(flags, &owner))
     }
 }
 
-/// Serializes a base file: sections are appended, then `finish` lays out the
-/// directory, aligns, and appends the whole-file trailer.
+/// The generation of a base image from its header alone (header checksum
+/// verified, nothing else): for callers that verify the bytes otherwise and
+/// only need to know which generation they hold.
+pub fn generation_of(bytes: &[u8]) -> Result<u64> {
+    Header::parse(bytes).map(|h| h.generation)
+}
+
+/// Serializes a base file.
 #[derive(Debug)]
 pub struct BaseWriter {
-    header: Header,
-    sections: Vec<(SectionKind, Vec<u8>)>,
+    inner: container::Writer,
 }
 
 impl BaseWriter {
-    /// Start a writer for the given header (counts must be filled by caller;
-    /// `section_count` and `total_len` are computed at `finish`).
+    /// Start a writer for the given header.
     #[must_use]
     pub fn new(header: Header) -> Self {
-        Self { header, sections: Vec::new() }
+        let mut inner = container::Writer::new(FORMAT);
+        inner.flags(header.flags).owner(&header.owner());
+        Self { inner }
     }
 
-    /// Append one section.
+    /// Append one section (an empty one is omitted; absent reads as empty).
     pub fn add_section(&mut self, kind: SectionKind, bytes: Vec<u8>) {
-        self.sections.push((kind, bytes));
+        self.inner.section(kind as u16, bytes);
     }
 
     /// Produce the final file bytes.
     #[must_use]
-    pub fn finish(mut self) -> Vec<u8> {
-        let dir_end = HEADER_LEN + self.sections.len() * DIR_ENTRY_LEN;
-        let mut offset = align_up(dir_end, ALIGN);
-        let mut dir = Vec::with_capacity(self.sections.len() * DIR_ENTRY_LEN);
-        for (kind, bytes) in &self.sections {
-            put_u16(&mut dir, *kind as u16);
-            put_u16(&mut dir, 0);
-            put_u32(&mut dir, 0);
-            put_u64(&mut dir, offset as u64);
-            put_u64(&mut dir, bytes.len() as u64);
-            put_u64(&mut dir, xxh3_64(bytes));
-            offset = align_up(offset + bytes.len(), ALIGN);
-        }
-        let total_len = offset + TRAILER_LEN;
-        self.header.section_count = self.sections.len() as u32;
-        self.header.total_len = total_len as u64;
-
-        let mut out = Vec::with_capacity(total_len);
-        self.header.write_into(&mut out);
-        out.extend_from_slice(&dir);
-        for (_, bytes) in &self.sections {
-            out.resize(align_up(out.len(), ALIGN), 0);
-            out.extend_from_slice(bytes);
-        }
-        out.resize(align_up(out.len(), ALIGN), 0);
-        let trailer = xxh3_64(&out);
-        let mut t = Vec::with_capacity(8);
-        put_u64(&mut t, trailer);
-        out.extend_from_slice(&t);
-        debug_assert_eq!(out.len(), total_len);
-        out
+    pub fn finish(self) -> Vec<u8> {
+        self.inner.finish()
     }
 }
 
@@ -240,70 +208,32 @@ impl BaseWriter {
 pub struct BaseDir {
     /// The validated header.
     pub header: Header,
-    sections: Vec<(u16, usize, usize)>,
+    dir: container::Dir,
 }
 
 impl BaseDir {
-    /// Validate `bytes` end to end (magic, version, checksums, directory
-    /// bounds and alignment, per-section checksums, trailer) and return the
-    /// directory. This is the fuzz entry point: any byte string must produce
-    /// `Ok` or `Error::Format`, never a panic.
+    /// Validate `bytes` end to end (container checksums, then every record
+    /// invariant the zero-copy accessors rely on) and return the directory.
+    /// This is the fuzz entry point: any byte string must produce `Ok` or
+    /// `Error::Format`, never a panic.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let header = Header::parse(bytes)?;
-        if header.total_len != bytes.len() as u64 {
-            return Err(Error::format("total_len does not match file size"));
-        }
-        if bytes.len() < HEADER_LEN + TRAILER_LEN {
-            return Err(Error::format("file too short for trailer"));
-        }
-        let trailer_off = bytes.len() - TRAILER_LEN;
-        if xxh3_64(&bytes[..trailer_off]) != get_u64(bytes, trailer_off) {
-            return Err(Error::format("file trailer checksum mismatch"));
-        }
-        let count = header.section_count as usize;
-        let dir_end = HEADER_LEN
-            .checked_add(
-                count.checked_mul(DIR_ENTRY_LEN).ok_or_else(|| Error::format("dir overflow"))?,
-            )
-            .ok_or_else(|| Error::format("dir overflow"))?;
-        if dir_end > trailer_off {
-            return Err(Error::format("directory exceeds file"));
-        }
-        let mut sections = Vec::with_capacity(count.min(bytes.len() / DIR_ENTRY_LEN + 1));
-        for i in 0..count {
-            let e = HEADER_LEN + i * DIR_ENTRY_LEN;
-            let kind = get_u16(bytes, e);
-            let offset = get_u64(bytes, e + 8) as usize;
-            let length = get_u64(bytes, e + 16) as usize;
-            let sum = get_u64(bytes, e + 24);
-            let end =
-                offset.checked_add(length).ok_or_else(|| Error::format("section overflow"))?;
-            if offset < dir_end || end > trailer_off {
-                return Err(Error::format("section out of bounds"));
-            }
-            if !offset.is_multiple_of(ALIGN) {
-                return Err(Error::format("section misaligned"));
-            }
-            if xxh3_64(&bytes[offset..end]) != sum {
-                return Err(Error::format("section checksum mismatch"));
-            }
-            sections.push((kind, offset, length));
-        }
-        let dir = Self { header, sections };
+        let dir = container::Dir::parse(bytes, FORMAT)?;
+        let header = Header::from_owner(dir.flags, dir.owner());
+        let dir = Self { header, dir };
         dir.check_counts(bytes)?;
         Ok(dir)
     }
 
     /// Cross-check declared counts against actual section byte lengths so
     /// record accessors can index without per-access bounds errors.
+    #[allow(clippy::too_many_lines)] // one pass over every record invariant
     fn check_counts(&self, bytes: &[u8]) -> Result<()> {
         let n = self.header.node_count as usize;
         let expect = |kind, want: usize, name: &str| -> Result<()> {
-            match self.section(bytes, kind) {
-                Some(s) if s.len() == want => Ok(()),
-                None if want == 0 => Ok(()),
-                Some(_) => Err(Error::format(format!("{name} section length mismatch"))),
-                None => Err(Error::format(format!("missing {name} section"))),
+            if self.section(bytes, kind).len() == want {
+                Ok(())
+            } else {
+                Err(Error::format(format!("{name} section length mismatch")))
             }
         };
         expect(SectionKind::Nodes, n * NODE_LEN, "nodes")?;
@@ -316,7 +246,7 @@ impl BaseDir {
         }
         // Every label offset must resolve inside the labels heap; walking all
         // records here keeps NodeRec/SegRec accessors infallible.
-        let labels = self.section(bytes, SectionKind::Labels).unwrap_or(&[]);
+        let labels = self.section(bytes, SectionKind::Labels);
         let check_label = |off: u32| -> Result<()> {
             if off == NO_LABEL {
                 return Ok(());
@@ -333,7 +263,7 @@ impl BaseDir {
                 .map_err(|_| Error::format("label not utf-8"))?;
             Ok(())
         };
-        let nodes = self.section(bytes, SectionKind::Nodes).unwrap_or(&[]);
+        let nodes = self.section(bytes, SectionKind::Nodes);
         for i in 0..n {
             let r = NodeRec(&nodes[i * NODE_LEN..(i + 1) * NODE_LEN]);
             for off in [r.url_off(), r.title_off(), r.snippet_off(), r.etag_off()] {
@@ -344,13 +274,13 @@ impl BaseDir {
                 return Err(Error::format("segment run out of bounds"));
             }
         }
-        let segs = self.section(bytes, SectionKind::Segs).unwrap_or(&[]);
+        let segs = self.section(bytes, SectionKind::Segs);
         for i in 0..self.header.seg_count as usize {
             check_label(SegRec(&segs[i * SEG_LEN..(i + 1) * SEG_LEN]).label_off())?;
         }
         // Edge destinations and CSR monotonicity.
         if n > 0 {
-            let idx = self.section(bytes, SectionKind::EdgeIndex).unwrap_or(&[]);
+            let idx = self.section(bytes, SectionKind::EdgeIndex);
             let mut prev = 0u32;
             for i in 0..=n {
                 let v = get_u32(idx, i * 4);
@@ -362,16 +292,87 @@ impl BaseDir {
             if prev != self.header.edge_count {
                 return Err(Error::format("edge index does not cover edges"));
             }
-            let edges = self.section(bytes, SectionKind::Edges).unwrap_or(&[]);
+            let edges = self.section(bytes, SectionKind::Edges);
             for i in 0..self.header.edge_count as usize {
                 if get_u32(edges, i * EDGE_LEN) >= self.header.node_count {
                     return Err(Error::format("edge destination out of range"));
                 }
             }
         }
+        // Inbound edges: the exact reverse of the forward CSR (same count),
+        // and attribute runs resolving inside the blob heap.
+        if n > 0 {
+            let check_csr = |kind, total: usize, name: &str| -> Result<()> {
+                let idx = self.section(bytes, kind);
+                if idx.is_empty() && total == 0 {
+                    return Ok(());
+                }
+                if idx.len() != (n + 1) * 4 {
+                    return Err(Error::format(format!("{name} index length mismatch")));
+                }
+                let mut prev = 0u32;
+                for i in 0..=n {
+                    let v = get_u32(idx, i * 4);
+                    if v < prev || v as usize > total {
+                        return Err(Error::format(format!("{name} index not monotone")));
+                    }
+                    prev = v;
+                }
+                if prev as usize == total {
+                    Ok(())
+                } else {
+                    Err(Error::format(format!("{name} index does not cover its records")))
+                }
+            };
+            let in_edges = self.section(bytes, SectionKind::InEdges);
+            if in_edges.len() != self.header.edge_count as usize * EDGE_LEN {
+                return Err(Error::format("inbound edges length mismatch"));
+            }
+            check_csr(SectionKind::InEdgeIndex, self.header.edge_count as usize, "inbound edge")?;
+            for i in 0..self.header.edge_count as usize {
+                if get_u32(in_edges, i * EDGE_LEN) >= self.header.node_count {
+                    return Err(Error::format("inbound edge source out of range"));
+                }
+            }
+            let attrs = self.section(bytes, SectionKind::Attrs);
+            if !attrs.len().is_multiple_of(ATTR_LEN) {
+                return Err(Error::format("attribute section length mismatch"));
+            }
+            check_csr(SectionKind::AttrIndex, attrs.len() / ATTR_LEN, "attribute")?;
+            let blobs = self.section(bytes, SectionKind::Blobs);
+            for rec in attrs.chunks_exact(ATTR_LEN) {
+                let (o, l) = (get_u32(rec, 4) as usize, get_u32(rec, 8) as usize);
+                let v = o.checked_add(l).and_then(|e| blobs.get(o..e));
+                if v.is_none_or(|v| std::str::from_utf8(v).is_err()) || rec[1..4] != [0; 3] {
+                    return Err(Error::format("attribute value out of bounds or not utf-8"));
+                }
+            }
+        }
+        // Lexicon search indices: every id names a lexicon record.
+        let vocab = self.header.token_count;
+        let order = self.section(bytes, SectionKind::LexOrder);
+        if order.len() != vocab as usize * 4
+            || order.chunks_exact(4).any(|c| get_u32(c, 0) >= vocab)
+        {
+            return Err(Error::format("lexicon order out of range"));
+        }
+        let (tri, tri_post) = (
+            self.section(bytes, SectionKind::Trigrams),
+            self.section(bytes, SectionKind::TriPostings),
+        );
+        if !tri.len().is_multiple_of(TRI_LEN) || !tri_post.len().is_multiple_of(4) {
+            return Err(Error::format("trigram section length mismatch"));
+        }
+        for rec in tri.chunks_exact(TRI_LEN) {
+            let (o, l) = (get_u32(rec, 4) as usize, get_u32(rec, 8) as usize);
+            let ids = o.checked_add(l).and_then(|e| tri_post.get(o * 4..e * 4));
+            if ids.is_none_or(|ids| ids.chunks_exact(4).any(|c| get_u32(c, 0) >= vocab)) {
+                return Err(Error::format("trigram postings out of range"));
+            }
+        }
         // Lexicon postings ranges + sortedness by token hash.
-        let postings = self.section(bytes, SectionKind::Postings).unwrap_or(&[]);
-        let lex = self.section(bytes, SectionKind::Lexicon).unwrap_or(&[]);
+        let postings = self.section(bytes, SectionKind::Postings);
+        let lex = self.section(bytes, SectionKind::Lexicon);
         let mut prev_hash = None;
         for i in 0..self.header.token_count as usize {
             let r = LexRec(&lex[i * LEX_LEN..(i + 1) * LEX_LEN]);
@@ -401,13 +402,10 @@ impl BaseDir {
         Ok(())
     }
 
-    /// The byte range of `kind`, if present.
+    /// The bytes of section `kind` (empty when absent), O(1).
     #[must_use]
-    pub fn section<'a>(&self, bytes: &'a [u8], kind: SectionKind) -> Option<&'a [u8]> {
-        self.sections
-            .iter()
-            .find(|(k, _, _)| *k == kind as u16)
-            .map(|&(_, off, len)| &bytes[off..off + len])
+    pub fn section<'a>(&self, bytes: &'a [u8], kind: SectionKind) -> &'a [u8] {
+        self.dir.section(bytes, kind as u16)
     }
 }
 
@@ -696,14 +694,12 @@ mod tests {
     fn empty_header() -> Header {
         Header {
             flags: 0,
-            section_count: 0,
             node_count: 0,
             seg_count: 0,
             edge_count: 0,
             token_count: 0,
             generation: 1,
             wal_applied_seq: 0,
-            total_len: 0,
             created_at_ms: 0,
         }
     }
@@ -712,8 +708,7 @@ mod tests {
     fn empty_file_round_trips() {
         let bytes = BaseWriter::new(empty_header()).finish();
         let dir = BaseDir::parse(&bytes).unwrap();
-        assert_eq!(dir.header.generation, 1);
-        assert_eq!(dir.header.section_count, 0);
+        assert_eq!(dir.header, empty_header());
     }
 
     #[test]

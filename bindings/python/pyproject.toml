@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 
 [build-system]
 requires = ["maturin>=1.5,<2.0"]
@@ -11,7 +11,7 @@ build-backend = "maturin"
 # `pip install` name carries the prefix; the module this wheel ships is still
 # `graph_r`.
 name = "uu-graph-r"
-version = "0.2.1"
+version = "0.4.0"
 description = "Embedded persistent knowledge graph: absorb a crawl, keep it fresh on an adaptive TTL, answer with URLs and anchors inside a token budget."
 # abi3-py312 is the floor the Rust side builds against; a lower declaration
 # here would promise interpreters the wheel cannot actually load.
@@ -23,7 +23,7 @@ readme = "README.md"
 # permits, and names the commercial option — terms and contact are in the
 # README and LICENSE.
 license = "AGPL-3.0-or-later OR LicenseRef-Proprietary"
-authors = [{ name = "lituus-io", email = "spicyzhug@gmail.com" }]
+authors = [{ name = "lituus-io", email = "support@lituus.io" }]
 keywords = ["knowledge-graph", "embedded", "crawler", "index", "ttl"]
 classifiers = [
     "Programming Language :: Rust",

@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! `graph.wal` — the append-only op log that extends a base generation.
 //!
@@ -15,14 +15,15 @@
 
 use crate::bytesio::{put_u16, put_u32, put_u64, Reader};
 use crate::error::{Error, Result};
+use crate::hash::xxh3_64;
 use crate::key::UrlKey;
 use compact_str::CompactString;
-use xxhash_rust::xxh3::xxh3_64;
 
 /// Magic: `"GRPW"` little-endian.
 pub const MAGIC: u32 = 0x5750_5247;
-/// WAL format version; strict-equal on read.
-pub const VERSION: u16 = 1;
+/// WAL format version; strict-equal on read. 2: `u16` edge counts and
+/// node attributes.
+pub const VERSION: u16 = 2;
 /// Header width.
 pub const HEADER_LEN: usize = 64;
 /// Maximum frame payload; bounds replay preallocation against hostile files.
@@ -91,9 +92,16 @@ pub enum Op {
     Remove { key: UrlKey },
     /// Pin or unpin the node.
     SetPinned { key: UrlKey, pinned: bool },
-    /// Enrichment writeback: per-segment-ordinal importance overrides.
-    SetImportance { key: UrlKey, scores: Vec<(u8, u16)> },
+    /// Whole-set replacement of the node's attributes.
+    SetAttrs { key: UrlKey, attrs: Vec<(u8, CompactString)> },
 }
+
+/// Most outbound edges per node.
+pub const MAX_EDGES: usize = 4096;
+/// Most attributes per node.
+pub const MAX_ATTRS: usize = 64;
+/// Longest attribute value (bytes of UTF-8); a frame stays under [`MAX_FRAME`].
+pub const MAX_ATTR_LEN: usize = 256 << 10;
 
 const OP_UPSERT: u8 = 1;
 const OP_SEGS: u8 = 2;
@@ -101,7 +109,8 @@ const OP_EDGES: u8 = 3;
 const OP_TOUCH: u8 = 4;
 const OP_REMOVE: u8 = 5;
 const OP_PIN: u8 = 6;
-const OP_IMPORTANCE: u8 = 7;
+// 7 was segment importance (enrichment), retired.
+const OP_ATTRS: u8 = 8;
 
 fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
     match s {
@@ -132,11 +141,12 @@ impl Op {
             | Self::Touch { key, .. }
             | Self::Remove { key }
             | Self::SetPinned { key, .. }
-            | Self::SetImportance { key, .. } => *key,
+            | Self::SetAttrs { key, .. } => *key,
         }
     }
 
     /// Serialize into `out`.
+    #[allow(clippy::too_many_lines)] // one arm per op, mirroring decode
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::UpsertNode {
@@ -175,7 +185,7 @@ impl Op {
             Self::SetEdges { key, edges } => {
                 out.push(OP_EDGES);
                 put_u64(out, key.0);
-                out.push(edges.len() as u8);
+                put_u16(out, edges.len() as u16);
                 let mut prev: Option<u64> = None;
                 for (dst, etype, eflags, weight) in edges {
                     let delta = match prev {
@@ -228,13 +238,13 @@ impl Op {
                 put_u64(out, key.0);
                 out.push(u8::from(*pinned));
             }
-            Self::SetImportance { key, scores } => {
-                out.push(OP_IMPORTANCE);
+            Self::SetAttrs { key, attrs } => {
+                out.push(OP_ATTRS);
                 put_u64(out, key.0);
-                out.push(scores.len() as u8);
-                for (ordinal, importance) in scores {
-                    out.push(*ordinal);
-                    put_u16(out, *importance);
+                out.push(attrs.len() as u8);
+                for (k, v) in attrs {
+                    out.push(*k);
+                    crate::bytesio::put_blob(out, v);
                 }
             }
         }
@@ -277,8 +287,8 @@ impl Op {
                 Self::SetSegments { key, segs }
             }
             OP_EDGES => {
-                let n = usize::from(r.u8()?);
-                if n > 64 {
+                let n = usize::from(r.u16()?);
+                if n > MAX_EDGES {
                     return Err(Error::format("too many edges"));
                 }
                 let mut edges = Vec::with_capacity(n.min(r.remaining()));
@@ -318,14 +328,21 @@ impl Op {
             },
             OP_REMOVE => Self::Remove { key },
             OP_PIN => Self::SetPinned { key, pinned: r.u8()? != 0 },
-            OP_IMPORTANCE => {
+            OP_ATTRS => {
                 let n = usize::from(r.u8()?);
-                let mut scores = Vec::with_capacity(n.min(r.remaining()));
-                for _ in 0..n {
-                    let ordinal = r.u8()?;
-                    scores.push((ordinal, r.u16()?));
+                if n > MAX_ATTRS {
+                    return Err(Error::format("too many attributes"));
                 }
-                Self::SetImportance { key, scores }
+                let mut attrs = Vec::with_capacity(n.min(r.remaining()));
+                for _ in 0..n {
+                    let k = r.u8()?;
+                    let v = r.blob()?;
+                    if v.len() > MAX_ATTR_LEN {
+                        return Err(Error::format("attribute too long"));
+                    }
+                    attrs.push((k, CompactString::from(v)));
+                }
+                Self::SetAttrs { key, attrs }
             }
             other => return Err(Error::format(format!("unknown opcode {other}"))),
         })
@@ -372,10 +389,10 @@ pub fn parse_header(bytes: &[u8]) -> Result<u64> {
 /// The frame checksum: xxh3 over `seq‖payload`, streamed so neither side
 /// needs a concatenated copy (the value is identical to the one-shot hash).
 fn frame_sum(seq: u64, payload: &[u8]) -> u64 {
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut h = crate::hash::Hasher::new();
     h.update(&seq.to_le_bytes());
     h.update(payload);
-    h.digest()
+    h.digest64()
 }
 
 /// Serialize one frame.
@@ -462,20 +479,26 @@ pub struct Replay {
 /// the crash model, not an error); a corrupt *header* is an error.
 pub fn replay(bytes: &[u8]) -> Result<Replay> {
     let base_generation = parse_header(bytes)?;
-    let mut ops = Vec::new();
-    let mut pos = HEADER_LEN;
-    while let Some((seq, op, next)) = next_frame(bytes, pos) {
+    let (ops, used) = replay_frames(&bytes[HEADER_LEN..])?;
+    Ok(Replay { ops, good_len: HEADER_LEN + used, base_generation })
+}
+
+/// Replay a run of frames with no header (for example the bytes appended
+/// since a previously consumed frame boundary): the ops up to the first tear
+/// and the byte length they occupy.
+pub fn replay_frames(frames: &[u8]) -> Result<(Vec<(u64, Op)>, usize)> {
+    let mut ops: Vec<(u64, Op)> = Vec::new();
+    let mut pos = 0;
+    while let Some((seq, op, next)) = next_frame(frames, pos) {
         // Sequences must be strictly increasing; a regression means foreign
         // tampering, not a torn tail.
-        if let Some(&(last, _)) = ops.last() {
-            if seq <= last {
-                return Err(Error::corrupt("wal sequence regression"));
-            }
+        if ops.last().is_some_and(|&(last, _)| seq <= last) {
+            return Err(Error::corrupt("wal sequence regression"));
         }
         ops.push((seq, op));
         pos = next;
     }
-    Ok(Replay { ops, good_len: pos, base_generation })
+    Ok((ops, pos))
 }
 
 #[cfg(test)]
@@ -523,7 +546,10 @@ mod tests {
             },
             Op::Remove { key: UrlKey(11) },
             Op::SetPinned { key: UrlKey(9), pinned: true },
-            Op::SetImportance { key: UrlKey(9), scores: vec![(0, 1000), (3, 65_535)] },
+            Op::SetAttrs {
+                key: UrlKey(9),
+                attrs: vec![(1, "INT64".into()), (2, "SELECT 1".repeat(10_000).into())],
+            },
         ]
     }
 

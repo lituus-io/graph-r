@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # Cross-thread access to a Store. The link-r binding shipped (pre-release)
 # with `#[pyclass(unsendable)]`, which raises the moment the object is touched

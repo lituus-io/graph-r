@@ -1,47 +1,47 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 
 [package]
-name = "graph-r"
-version = "0.3.0"
+name = "uu-graph-r"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 license = "AGPL-3.0-or-later"
-description = "Embedded, persistent knowledge-graph backend for link-r: TTL-driven freshness, zero-copy mmap snapshots, token-budgeted local lookups"
+description = "Embedded, persistent knowledge graph and the shared core of the lituus-io stack: TTL-driven freshness, lineage walks, zero-copy mmap snapshots, token-budgeted local lookups"
 repository = "https://github.com/lituus-io/graph-r"
-authors = ["lituus-io <spicyzhug@gmail.com>"]
-publish = false
+authors = ["lituus-io <support@lituus.io>"]
+homepage = "https://github.com/lituus-io/graph-r"
+documentation = "https://docs.rs/uu-graph-r"
+readme = "README.md"
+exclude = ["/.github", "/scripts", "/bindings", "/fuzz"]
 keywords = ["knowledge-graph", "embedded", "mmap", "ttl", "index"]
 categories = ["database-implementations", "caching", "data-structures"]
 
 [features]
-# Install-by-requirement: the default build is the pure embedded graph store
-# (persistence, snapshots, lookups, TTL, ranking) with zero optional deps.
-default = []
-# The URI-link ingest path: absorb documents/edges from a link-r index and
-# drive its refresh loop from graph-r due-lists.
-bridge = ["dep:link-r"]
-# The LLM enrichment seam: a vendor-free trait for proposing segment
-# importance and related-edges. Zero deps — just the trait and plumbing.
-llm = []
+# The default is the embedded graph store. Dependants that need only the core
+# (xxh3 hashing, keys, byte codecs, the checksummed container, file
+# primitives) set `default-features = false` and build xxhash-rust alone.
+default = ["store"]
+# Zero-copy read-only images: memory-mapped files, or bytes served in place.
+mmap = ["dep:memmap2", "dep:bytes"]
+# The embedded graph store: persistence, snapshots, lookups, TTL, ranking.
+store = ["mmap", "dep:smallvec", "dep:compact_str"]
+
+[lib]
+name = "graph_r"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-# The base snapshot is always mmapped; reads are zero-copy against the file.
-memmap2 = "0.9"
-# xxh3 is the single hash family: keys, section checksums, file trailers.
+# xxh3 is the single hash family: keys and container checksums.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-thiserror = "1.0"
-# Shared, reference-counted byte buffers: a base image fetched from object
-# storage is served in place (Store::open_image), never copied.
-bytes = "1.7"
-smallvec = { version = "1.13", features = ["union", "const_generics"] }
-compact_str = "0.8"
-link-r = { path = "../link-r", optional = true, default-features = false, features = ["crawl", "hash", "html", "markdown", "fs", "github"] }
-
-# flock() for the cross-process single-writer lock lives in the os unsafe
-# island; libc is already in the tree transitively via memmap2.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+memmap2 = { version = "0.9", optional = true }
+# Shared, reference-counted byte buffers: an image fetched from object
+# storage is served in place, never copied.
+bytes = { version = "1.7", optional = true }
+smallvec = { version = "1.13", features = ["union", "const_generics"], optional = true }
+compact_str = { version = "0.8", optional = true }
 
 [dev-dependencies]
 proptest = "1.5"

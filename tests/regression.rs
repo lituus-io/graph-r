@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! The permanent index of fixed defects.
 //!
@@ -100,7 +100,12 @@ fn pinning_an_unknown_key_stages_nothing() {
     let store = Store::create(dir.path(), Config::default()).unwrap();
     let mut w = store.writer().unwrap();
     assert!(!w.set_pinned(UrlKey::of("https://x.dev/ghost"), true).unwrap());
-    assert_eq!(w.staged(), 0, "nothing may be staged for a key that does not exist");
+    w.commit().unwrap();
+    drop(w);
+    assert!(
+        store.snapshot().node(UrlKey::of("https://x.dev/ghost")).is_none(),
+        "nothing was written"
+    );
 }
 
 /// Found by the model proptest during development.
@@ -428,4 +433,170 @@ fn repeated_compaction_preserves_the_live_set() {
         store.compact().unwrap();
         assert_eq!(store.snapshot().len(), expected);
     }
+}
+
+// ---- independent review, 2026-10 -------------------------------------------
+
+fn put(store: &Store, url: &str) {
+    let mut w = store.writer().unwrap();
+    w.upsert_node(&doc(url, 1, false)).unwrap();
+    w.commit().unwrap();
+}
+
+/// Review finding 1. Compaction renames the base, then the log. A reader that
+/// mapped the old base and read the new log reported a healthy store as
+/// `Corrupt`. Readers now re-read across the window and, if the state
+/// persists, say `Busy` — never `Corrupt`. A writer (which holds the lock, so
+/// nothing can compact under it) still treats it as damage.
+#[test]
+fn a_reader_caught_mid_compaction_is_busy_never_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    put(&store, "https://x.dev/a");
+    let reader = Store::open_read_only(dir.path()).unwrap();
+    let old_base = std::fs::read(dir.path().join(graph_r::store::BASE_FILE)).unwrap();
+    store.compact().unwrap();
+    let new_base = std::fs::read(dir.path().join(graph_r::store::BASE_FILE)).unwrap();
+    // Freeze the window: the new log beside the old base.
+    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &old_base).unwrap();
+    let busy = |e: Error| assert!(matches!(e, Error::Busy { .. }), "{e:?}");
+    busy(Store::open_read_only(dir.path()).unwrap_err());
+    busy(reader.reload_if_stale().unwrap_err());
+    // The rename lands: the same handles carry on.
+    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &new_base).unwrap();
+    assert!(reader.reload_if_stale().unwrap());
+    assert_eq!(reader.generation(), store.generation());
+    assert!(Store::open_read_only(dir.path()).is_ok());
+    drop(store);
+    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &old_base).unwrap();
+    assert!(matches!(Store::open(dir.path()).unwrap_err(), Error::Corrupt { .. }));
+}
+
+/// Review finding 2. With every ring slot pinned, a compaction writes its base
+/// and returns `Busy` without installing it; the retry numbered its base from
+/// the served (older) generation and reused the number. A reader that loaded
+/// the first base kept it ("same generation") and skipped ops by count.
+#[test]
+fn a_generation_number_is_never_reused_and_readers_miss_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    put(&store, "https://x.dev/0");
+    // Pin every slot: a snapshot per generation.
+    let s1 = store.snapshot();
+    store.compact().unwrap();
+    let s2 = store.snapshot();
+    store.compact().unwrap();
+    let s3 = store.snapshot();
+    store.compact().unwrap();
+    let s4 = store.snapshot();
+    let served = store.generation();
+    put(&store, "https://x.dev/1");
+    assert!(matches!(store.compact().unwrap_err(), Error::Busy { .. }), "ring is full");
+    let reader = Store::open_read_only(dir.path()).unwrap();
+    let first = reader.generation();
+    assert!(first > served, "the durable base is newer than the served one");
+    put(&store, "https://x.dev/2");
+    assert!(matches!(store.compact().unwrap_err(), Error::Busy { .. }));
+    put(&store, "https://x.dev/3");
+    assert!(reader.reload_if_stale().unwrap());
+    assert!(reader.generation() > first, "a second base gets a new number");
+    drop((s1, s2, s3, s4));
+    for i in 0..4 {
+        let url = format!("https://x.dev/{i}");
+        assert!(reader.snapshot().node(UrlKey::of(&url)).is_some(), "reader misses {url}");
+        assert!(store.snapshot().node(UrlKey::of(&url)).is_some(), "writer misses {url}");
+    }
+    store.compact().unwrap();
+    assert!(reader.reload_if_stale().unwrap());
+    assert_eq!(reader.len(), 4);
+}
+
+/// Review finding 3. A growing log was re-read and re-replayed whole on every
+/// reload; now only the appended frames are read. Many small appends must
+/// still converge to exactly what a fresh open sees.
+#[test]
+fn reloads_follow_a_growing_log_incrementally() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    store.set_compact_inline(false);
+    let reader = Store::open_read_only(dir.path()).unwrap();
+    for i in 0..50 {
+        put(&store, &format!("https://x.dev/{i}"));
+        if i % 7 == 0 {
+            assert!(reader.reload_if_stale().unwrap());
+            assert!(!reader.reload_if_stale().unwrap(), "unchanged: nothing new");
+        }
+    }
+    reader.reload_if_stale().unwrap();
+    assert_eq!(reader.len(), 50);
+    assert_eq!(reader.len(), Store::open_read_only(dir.path()).unwrap().len());
+}
+
+/// Review finding 4. `reload_image` published into the single-producer
+/// overlay without a guard, so two threads could race it; a writable handle
+/// could race its own writer. Reloads are now one at a time per handle, and a
+/// no-op on writable handles.
+#[test]
+fn reloads_are_one_at_a_time_and_writers_ignore_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    store.set_compact_inline(false);
+    let base = std::fs::read(dir.path().join(graph_r::store::BASE_FILE)).unwrap();
+    let image = Store::open_image(base.into(), &[]).unwrap();
+    for i in 0..20 {
+        put(&store, &format!("https://x.dev/{i}"));
+    }
+    let wal = std::fs::read(dir.path().join(graph_r::store::WAL_FILE)).unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| image.reload_image(None, &wal).unwrap());
+        }
+    });
+    assert_eq!(image.len(), 20, "each op published exactly once");
+    assert!(!store.reload_if_stale().unwrap());
+    assert!(!store.reload_image(None, &wal).unwrap());
+}
+
+/// Review finding 5. An empty log (external truncation) was accepted by a
+/// writable open; the next commit appended frames to a headerless file and
+/// the store could never be opened again.
+#[test]
+fn an_empty_log_is_repaired_on_writable_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    put(&store, "https://x.dev/a");
+    store.compact().unwrap();
+    drop(store);
+    std::fs::write(dir.path().join(graph_r::store::WAL_FILE), b"").unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    put(&store, "https://x.dev/b");
+    drop(store);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.len(), 2);
+}
+
+/// Found live (crab-describe on a real warehouse). A touch staged after an
+/// upsert of the same node in one batch computed its full state from the
+/// last commit, so the overlay's last-wins fold restored the *old* content
+/// hash over the new upsert: the node silently kept stale content identity.
+#[test]
+fn a_touch_after_an_upsert_in_one_batch_keeps_the_new_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    {
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/a", 1, false)).unwrap();
+        w.commit().unwrap();
+    }
+    let mut w = store.writer().unwrap();
+    w.upsert_node(&doc("https://x.dev/a", 2, false)).unwrap();
+    let touch =
+        Touch { checked_at_ms: 9_000, outcome: Outcome::Changed, content_hash: None, etag: None };
+    assert!(w.touch(UrlKey::of("https://x.dev/a"), touch).unwrap());
+    w.commit().unwrap();
+    drop(w);
+    let n = store.snapshot().node(UrlKey::of("https://x.dev/a")).unwrap().content_hash;
+    assert_eq!(n, 2);
+    store.compact().unwrap();
+    assert_eq!(store.snapshot().node(UrlKey::of("https://x.dev/a")).unwrap().content_hash, 2);
 }

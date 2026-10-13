@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Arbitrary bytes as a (base image, log image) pair for `Store::open_image`:
 //! a typed error or a fully usable read-only store — never a panic — and an
@@ -14,7 +14,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         let snap = store.snapshot();
         let _ = snap.len();
         let _ = snap.query("a b", &graph_r::QueryOpts::default());
-        let _ = snap.check();
+
         let _ = store.reload_image(None, wal);
     }
 });

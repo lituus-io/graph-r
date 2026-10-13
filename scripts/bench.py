@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 """Record and check criterion benchmark baselines.
 
 Criterion already measures well; what it does not do is fail a build. This turns

@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # The GitHub tree-API sync path, end to end from Python against a loopback
 # fake GitHub. The counts are the contract: an unchanged repository costs

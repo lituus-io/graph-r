@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Hermetic end-to-end lifecycle tests: create → write → commit → query →
 //! compact → reopen → refresh cycle, all against a temp directory, no
@@ -93,7 +93,6 @@ fn full_lifecycle_write_query_compact_reopen() {
         let snap = store.snapshot();
         assert_eq!(snap.len(), 3, "stub not counted live");
         assert_eq!(snap.generation(), 2);
-        assert_eq!(snap.pending_ops(), 0);
 
         let hits = snap.query("install linux", &QueryOpts::default());
         assert_eq!(hits[0].url, "https://docs.x.dev/guide");
@@ -107,10 +106,21 @@ fn full_lifecycle_write_query_compact_reopen() {
             dsts.push(e.dst_url.unwrap_or("").to_owned());
         }
         assert_eq!(dsts.len(), 2);
-        let p = snap
-            .path(key("https://docs.x.dev/api"), key("https://docs.x.dev/faq"), 4)
-            .expect("api -> guide -> faq");
-        assert_eq!(p.len(), 3);
+        // api -> guide -> faq, two hops along links.
+        let mut reach = Vec::new();
+        let mut walk = graph_r::Walk::new();
+        snap.walk(
+            key("https://docs.x.dev/api"),
+            graph_r::Direction::Out,
+            4,
+            |t| t == EdgeType::Link,
+            &mut walk,
+            |h| {
+                reach.push((h.key, h.depth));
+                true
+            },
+        );
+        assert!(reach.contains(&(key("https://docs.x.dev/faq"), 2)), "{reach:?}");
 
         // The stub exists, is not live, and resolves by key.
         let stub = snap.node(key("https://elsewhere.example.com/spec")).unwrap();
@@ -364,116 +374,4 @@ fn second_writer_process_is_locked_out_and_read_only_reloads() {
     // foreign process by opening rw again — the same process's flock is
     // re-entrant per-file-open on some platforms, so exercise via API:
     // writer() on the read-only handle already errored above.
-}
-
-#[test]
-fn enrichment_tier_survives_crawl_replacement() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), Config::default()).unwrap();
-    seed_store(&store);
-    store.compact().unwrap();
-
-    let guide = key("https://docs.x.dev/guide");
-    // Enrichment: score segment 0 up.
-    {
-        let mut w = store.writer().unwrap();
-        w.set_importance(guide, &[(0, 65_000)]).unwrap();
-        w.commit().unwrap();
-    }
-    // Crawl-tier re-ingest of the same segments (unchanged headings).
-    {
-        let mut w = store.writer().unwrap();
-        w.set_segments(
-            guide,
-            &[
-                SegmentRecord {
-                    label: "Install > Linux",
-                    byte_range: Some((0, 100)),
-                    depth: 1,
-                    importance: 60_000,
-                },
-                SegmentRecord {
-                    label: "Install > Windows",
-                    byte_range: Some((0, 100)),
-                    depth: 2,
-                    importance: 40_000,
-                },
-            ],
-        )
-        .unwrap();
-        w.commit().unwrap();
-    }
-    let snap = store.snapshot();
-    let segs = snap.segments(guide);
-    assert_eq!(segs[0].importance, 65_000, "LLM score carried across re-ingest");
-    store.compact().unwrap();
-    let snap = store.snapshot();
-    let segs = snap.segments(guide);
-    assert_eq!(segs[0].importance, 65_000, "and across compaction");
-}
-
-/// The community and discovery surface had no coverage at all — it was public
-/// API whose behaviour nothing pinned. Two link clusters joined by one weak
-/// bridge: each cluster is one community, the summary names and sizes it, and
-/// the bridge edge is the top surprise.
-#[test]
-fn communities_and_surprises_reflect_cluster_structure() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), Config::default()).unwrap();
-    {
-        let mut w = store.writer().unwrap();
-        // Cluster A: three docs fully interlinked. Cluster B: likewise.
-        let cluster = |prefix: &str| -> Vec<String> {
-            (0..3).map(|i| format!("https://{prefix}.x.dev/p{i}")).collect()
-        };
-        let (a, b) = (cluster("a"), cluster("b"));
-        for (urls, title) in [(&a, "Alpha"), (&b, "Beta")] {
-            for (i, url) in urls.iter().enumerate() {
-                w.upsert_node(&DocRecord {
-                    url,
-                    url_key: key(url),
-                    content_hash: i as u64 + 1,
-                    fetched_at_ms: 1_000,
-                    title: Some(title),
-                    snippet: None,
-                    etag: None,
-                    pinned: false,
-                })
-                .unwrap();
-                let edges: Vec<(UrlKey, EdgeType, u16)> = urls
-                    .iter()
-                    .filter(|u| *u != url)
-                    .map(|u| (key(u), EdgeType::Link, 65_535))
-                    .collect();
-                w.set_edges(key(url), &edges);
-            }
-        }
-        // One weak bridge from A to B — the cross-community edge.
-        let mut bridge_edges: Vec<(UrlKey, EdgeType, u16)> =
-            a.iter().skip(1).map(|u| (key(u), EdgeType::Link, 65_535)).collect();
-        bridge_edges.push((key(&b[0]), EdgeType::Related, 200));
-        w.set_edges(key(&a[0]), &bridge_edges);
-        w.commit().unwrap();
-    }
-    store.compact().unwrap(); // ranks + communities are computed here
-
-    let snap = store.snapshot();
-    let a0 = key("https://a.x.dev/p0");
-    let b0 = key("https://b.x.dev/p0");
-
-    // Each cluster resolves to one community of three; the two differ.
-    let ca = snap.community_summary(a0, 5).expect("a0 is ranked");
-    let cb = snap.community_summary(b0, 5).expect("b0 is ranked");
-    assert_eq!(ca.size, 3, "cluster A is one community");
-    assert_eq!(cb.size, 3, "cluster B is one community");
-    assert_ne!(ca.id, cb.id, "the weak bridge must not merge the clusters");
-    assert_eq!(ca.top_urls.len(), 3);
-    assert!(!ca.name.is_empty(), "the summary names its top member");
-
-    // The bridge edge is the surprise: exactly one cross-community pair.
-    let surprises = snap.surprises(10);
-    assert_eq!(surprises.len(), 1, "one community pair, one representative edge");
-    let (from, to) = &surprises[0];
-    assert_eq!(from.key, a0);
-    assert_eq!(to.key, b0);
 }

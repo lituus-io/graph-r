@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! The additive 0.3 surface: accessors, off-path compaction, cheap staleness
 //! checks, WAL measurement helpers, and temp-file hygiene.

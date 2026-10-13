@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! The crate's single hash family (xxh3), exposed so dependants key and
 //! fingerprint with exactly the function behind [`crate::UrlKey`], section
@@ -26,6 +26,26 @@ pub fn xxh3_64_seeded(bytes: &[u8], seed: u64) -> u64 {
 #[inline]
 pub fn xxh3_128(bytes: &[u8]) -> u128 {
     xxhash_rust::xxh3::xxh3_128(bytes)
+}
+
+/// `MurmurHash3`'s 64-bit finaliser: full avalanche of an already-mixed
+/// word, for combining digests.
+#[must_use]
+#[inline]
+pub fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    k ^ (k >> 33)
+}
+
+/// The 24-bit key of the byte trigram `w[..3]` (exact, collision-free).
+/// Panics if `w` is shorter than three bytes.
+#[must_use]
+#[inline]
+pub fn trigram(w: &[u8]) -> u32 {
+    u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2])
 }
 
 /// Streaming xxh3: feed pieces with [`Hasher::update`]; the digests equal
@@ -62,6 +82,14 @@ impl Hasher {
     #[inline]
     pub fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
+    }
+
+    /// Feed one length-delimited field (its length, then its bytes), so
+    /// adjacent fields can never run into each other (`"ab","c"` ≠ `"a","bc"`).
+    #[inline]
+    pub fn field(&mut self, bytes: &[u8]) {
+        self.update(&(bytes.len() as u64).to_le_bytes());
+        self.update(bytes);
     }
 
     /// 64-bit digest of everything fed so far (the hasher stays usable).

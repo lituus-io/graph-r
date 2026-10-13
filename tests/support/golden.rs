@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Shared by the golden-fixture generator (run once against the released
 //! 0.2.1 code) and `tests/golden_v021.rs` (run against every later version):
@@ -169,10 +169,23 @@ pub fn dump(store: &Store) -> String {
             .unwrap();
         }
     }
-    writeln!(o, "path {:?}", snap.path(key(URLS[3]), key(URLS[2]), 4).map(|p| p.len())).unwrap();
+    let mut depth = None;
+    snap.walk(
+        key(URLS[3]),
+        graph_r::Direction::Out,
+        4,
+        |_| true,
+        &mut graph_r::Walk::new(),
+        |h| {
+            if h.key == key(URLS[2]) {
+                depth = Some(h.depth);
+            }
+            depth.is_none()
+        },
+    );
+    writeln!(o, "reach {depth:?}").unwrap();
     for d in snap.due(NOW, 16) {
         writeln!(o, "due {} {:?}", d.url, d.etag).unwrap();
     }
-    snap.check().unwrap();
     o
 }
