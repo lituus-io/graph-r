@@ -30,6 +30,9 @@ ignore = [
 version = 2
 confidence-threshold = 0.9
 allow = [
+    # The stack\'s own license: the crates are published, so cargo-deny
+    # checks them (and their uu-* siblings) like any dependency.
+    "AGPL-3.0-or-later",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
