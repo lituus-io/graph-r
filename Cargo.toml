@@ -52,6 +52,7 @@ futures = "0.3"
 [[bench]]
 name = "store_bench"
 harness = false
+required-features = ["store"]
 
 [profile.release]
 opt-level = 3

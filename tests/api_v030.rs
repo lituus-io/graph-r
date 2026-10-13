@@ -4,6 +4,7 @@
 //! The additive 0.3 surface: accessors, off-path compaction, cheap staleness
 //! checks, WAL measurement helpers, and temp-file hygiene.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::format::wal;
 use graph_r::prelude::*;
 use graph_r::store::{BASE_FILE, LOCK_FILE, WAL_FILE};

@@ -5,6 +5,7 @@
 //! The invariants: reads never fail, never observe torn state (a snapshot's
 //! view is frozen at creation), and the writer is never blocked by readers.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

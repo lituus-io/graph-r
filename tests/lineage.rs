@@ -6,6 +6,7 @@
 //! the overlay (before compaction) and from the base (after), which are
 //! separate code paths that must agree.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::format::base::eflags::EXACT;
 use graph_r::prelude::*;
 use graph_r::{Direction, Walk};

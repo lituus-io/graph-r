@@ -5,6 +5,7 @@
 //! compact → reopen → refresh cycle, all against a temp directory, no
 //! network, no external services.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
 use graph_r::traverse::LendingIterator;
 

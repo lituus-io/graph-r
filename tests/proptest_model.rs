@@ -5,6 +5,7 @@
 //! arbitrary op sequences, compaction is byte-reproducible, and a WAL torn at
 //! any byte recovers exactly the committed prefix.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;

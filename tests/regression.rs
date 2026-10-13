@@ -13,6 +13,7 @@
 //! owns them (noted per test). That is deliberate: the unit test guards the
 //! function, this suite guards the behaviour a caller depends on.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
 
 fn doc<'a>(url: &'a str, hash: u64, pinned: bool) -> DocRecord<'a> {
@@ -458,17 +459,21 @@ fn a_reader_caught_mid_compaction_is_busy_never_corrupt() {
     store.compact().unwrap();
     let new_base = std::fs::read(dir.path().join(graph_r::store::BASE_FILE)).unwrap();
     // Freeze the window: the new log beside the old base.
-    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &old_base).unwrap();
+    // Replaced the way compaction replaces it (rename): Windows refuses to
+    // truncate a file another handle has mapped.
+    graph_r::fsio::write_atomic(&dir.path().join(graph_r::store::BASE_FILE), &[&old_base]).unwrap();
     let busy = |e: Error| assert!(matches!(e, Error::Busy { .. }), "{e:?}");
     busy(Store::open_read_only(dir.path()).unwrap_err());
     busy(reader.reload_if_stale().unwrap_err());
     // The rename lands: the same handles carry on.
-    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &new_base).unwrap();
+    graph_r::fsio::write_atomic(&dir.path().join(graph_r::store::BASE_FILE), &[&new_base]).unwrap();
     assert!(reader.reload_if_stale().unwrap());
     assert_eq!(reader.generation(), store.generation());
     assert!(Store::open_read_only(dir.path()).is_ok());
     drop(store);
-    std::fs::write(dir.path().join(graph_r::store::BASE_FILE), &old_base).unwrap();
+    // Replaced the way compaction replaces it (rename): Windows refuses to
+    // truncate a file another handle has mapped.
+    graph_r::fsio::write_atomic(&dir.path().join(graph_r::store::BASE_FILE), &[&old_base]).unwrap();
     assert!(matches!(Store::open(dir.path()).unwrap_err(), Error::Corrupt { .. }));
 }
 
