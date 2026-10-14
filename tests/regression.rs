@@ -605,3 +605,38 @@ fn a_touch_after_an_upsert_in_one_batch_keeps_the_new_hash() {
     store.compact().unwrap();
     assert_eq!(store.snapshot().node(UrlKey::of("https://x.dev/a")).unwrap().content_hash, 2);
 }
+
+/// Found while exposing attributes to Python. Each attribute value is capped
+/// at `MAX_ATTR_LEN` (256 KiB) but a whole `SetAttrs` op was not, so four
+/// large values encoded a WAL frame over `MAX_FRAME` (1 MiB). The commit
+/// succeeded and the attributes read back, but replay treats an oversized
+/// frame as a torn tail: the next writable open truncated the log there,
+/// silently discarding that commit and every later one. The op as a whole
+/// must fit one frame, and is refused before staging when it would not.
+#[test]
+fn attributes_that_cannot_fit_one_log_frame_are_refused_not_lost_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://x.dev/a";
+    let big = "x".repeat(graph_r::writer::MAX_ATTR_LEN);
+    {
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc(url, 1, false)).unwrap();
+        w.commit().unwrap();
+        let four: Vec<(u8, &str)> = (0..4).map(|k| (k, big.as_str())).collect();
+        assert!(
+            matches!(w.set_attrs(UrlKey::of(url), &four), Err(Error::Format { .. })),
+            "an op over one frame must be refused"
+        );
+        // Three maximal values still fit, and a later commit follows them.
+        let three: Vec<(u8, &str)> = (0..3).map(|k| (k, big.as_str())).collect();
+        w.set_attrs(UrlKey::of(url), &three).unwrap();
+        w.commit().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2, false)).unwrap();
+        w.commit().unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.len(), 2, "no commit after the attributes was lost");
+    let snap = store.snapshot();
+    assert_eq!(snap.attr(UrlKey::of(url), 2).map(str::len), Some(graph_r::writer::MAX_ATTR_LEN));
+}

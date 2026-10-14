@@ -26,6 +26,11 @@ pub const MAX_SEGS: usize = 128;
 pub use crate::format::wal::MAX_EDGES;
 /// Maximum attributes per node, and the longest attribute value.
 pub use crate::format::wal::{MAX_ATTRS, MAX_ATTR_LEN};
+/// Most value bytes one node's attribute set may hold in total: what fits a
+/// single log frame (the op's fixed fields and per-value headers included).
+pub const MAX_ATTR_BYTES: usize = crate::format::wal::MAX_FRAME - (1 + 8 + 1) - MAX_ATTRS * (1 + 4);
+/// Longest attribute name accepted by [`Writer::set_named_attrs`].
+pub const MAX_ATTR_NAME: usize = 255;
 
 /// A document to upsert — borrowed, produced by the caller or the link-r
 /// bridge. Everything here is compact lookup metadata; bodies and vectors
@@ -266,8 +271,9 @@ impl<'s> Writer<'s> {
     /// Stage a whole-set replacement of `key`'s attributes: small keyed
     /// values beside the node (a column's type, a table's producing SQL, a
     /// description's provenance). Keys are the caller's; a later key wins
-    /// over an earlier duplicate. Values longer than [`MAX_ATTR_LEN`] or
-    /// more than [`MAX_ATTRS`] keys are refused.
+    /// over an earlier duplicate. Values longer than [`MAX_ATTR_LEN`], more
+    /// than [`MAX_ATTRS`] keys, or a set whose encoding would not fit one log
+    /// frame ([`MAX_ATTR_BYTES`] in total) are refused.
     pub fn set_attrs(&mut self, key: UrlKey, attrs: &[(u8, &str)]) -> Result<()> {
         if attrs.len() > MAX_ATTRS {
             return Err(Error::format("too many attributes"));
@@ -281,7 +287,63 @@ impl<'s> Writer<'s> {
                 owned.push((k, CompactString::from(v)));
             }
         }
+        // Replay reads an oversized frame as a torn tail and a writable open
+        // truncates there, so an op that does not fit one frame would lose
+        // itself and every later commit on reopen. Bound the whole op.
+        if owned.iter().map(|(_, v)| v.len()).sum::<usize>() > MAX_ATTR_BYTES {
+            return Err(Error::format(format!(
+                "attributes exceed {MAX_ATTR_BYTES} bytes in total"
+            )));
+        }
         owned.sort_unstable_by_key(|(k, _)| *k);
+        self.state.staged.push(Op::SetAttrs { key, attrs: owned });
+        Ok(())
+    }
+
+    /// [`Writer::set_attrs`] with string names: a whole-set replacement of
+    /// `key`'s attributes as `name → value`. Each record is stored as
+    /// `name NUL value` under keys `0..n` in name order, so
+    /// [`crate::Snapshot::named_attrs`] reads names and values back as
+    /// borrowed slices and any producer (Rust or a binding) agrees on the
+    /// encoding. A later duplicate name wins. Names must be non-empty, at
+    /// most [`MAX_ATTR_NAME`] bytes and free of NUL; each `name NUL value`
+    /// must fit [`MAX_ATTR_LEN`], and the whole set [`MAX_ATTR_BYTES`].
+    pub fn set_named_attrs(&mut self, key: UrlKey, attrs: &[(&str, &str)]) -> Result<()> {
+        if attrs.len() > MAX_ATTRS {
+            return Err(Error::format(format!("more than {MAX_ATTRS} attributes")));
+        }
+        let mut named: Vec<(&str, &str)> = Vec::with_capacity(attrs.len());
+        for &(name, value) in attrs.iter().rev() {
+            if name.is_empty() || name.len() > MAX_ATTR_NAME || name.contains('\0') {
+                return Err(Error::format(format!(
+                    "attribute name must be 1..={MAX_ATTR_NAME} bytes without NUL"
+                )));
+            }
+            if name.len() + 1 + value.len() > MAX_ATTR_LEN {
+                return Err(Error::format(format!(
+                    "attribute {name:?} exceeds {MAX_ATTR_LEN} bytes"
+                )));
+            }
+            if !named.iter().any(|(n, _)| *n == name) {
+                named.push((name, value));
+            }
+        }
+        named.sort_unstable_by_key(|(n, _)| *n);
+        let mut owned: Vec<(u8, CompactString)> = Vec::with_capacity(named.len());
+        let mut total = 0usize;
+        for (k, (name, value)) in named.into_iter().enumerate() {
+            let mut rec = CompactString::with_capacity(name.len() + 1 + value.len());
+            rec.push_str(name);
+            rec.push('\0');
+            rec.push_str(value);
+            total += rec.len();
+            owned.push((k as u8, rec));
+        }
+        if total > MAX_ATTR_BYTES {
+            return Err(Error::format(format!(
+                "attributes exceed {MAX_ATTR_BYTES} bytes in total"
+            )));
+        }
         self.state.staged.push(Op::SetAttrs { key, attrs: owned });
         Ok(())
     }

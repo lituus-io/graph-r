@@ -201,3 +201,124 @@ fn wide_nodes_and_limits() {
     snap.in_edges(UrlKey::of("sql://bq/p/raw/t#c4095"), |_, _, _, _| ins += 1);
     assert_eq!(ins, 1, "stub targets have inbound edges too");
 }
+
+/// `walk_both` reaches each node once, at its shortest distance over either
+/// direction, and agrees between the overlay and the base.
+#[test]
+fn walk_both_is_the_union_at_shortest_distance() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    store.set_compact_inline(false);
+    let f = build(&store);
+    let run = |store: &Store, from: UrlKey, depth: u32| {
+        let snap = store.snapshot();
+        let mut w = Walk::new();
+        let mut got = Vec::new();
+        snap.walk_both(
+            from,
+            depth,
+            |_| true,
+            &mut w,
+            |h| {
+                got.push((h.key, h.depth));
+                true
+            },
+        );
+        got.sort_by_key(|&(k, d)| (d, k.0));
+        got
+    };
+    for phase in 0..2 {
+        // stg.status: out to raw.status (derives); in from stg (contains).
+        let one = run(&store, f.stg_status, 1);
+        let mut want = vec![(f.raw_status, 1), (f.stg, 1)];
+        want.sort_by_key(|&(k, d)| (d, k.0));
+        assert_eq!(one, want, "phase {phase}");
+        // Two hops: raw (contains raw.status) and stg.total (contained in
+        // stg); raw.amount is three away whichever way round.
+        let two = run(&store, f.stg_status, 2);
+        let mut want_two = [(f.raw, 2), (f.stg_total, 2)];
+        want_two.sort_by_key(|&(k, d)| (d, k.0));
+        assert_eq!(two[2..], want_two[..], "phase {phase}: {two:?}");
+        let three = run(&store, f.stg_status, 3);
+        assert_eq!(three.last(), Some(&(f.raw_amount, 3)), "phase {phase}");
+        let keys: std::collections::HashSet<u64> = three.iter().map(|h| h.0 .0).collect();
+        assert_eq!((keys.len(), three.len()), (5, 5), "each node once");
+        assert!(!keys.contains(&f.stg_status.0), "the start is never reported");
+        // A single-direction walk is a subset of the two-way walk.
+        let snap = store.snapshot();
+        let mut w = Walk::new();
+        let mut out_only = Vec::new();
+        snap.walk(
+            f.stg_status,
+            Direction::Out,
+            3,
+            |_| true,
+            &mut w,
+            |h| {
+                out_only.push(h.key);
+                true
+            },
+        );
+        assert!(out_only.iter().all(|k| keys.contains(&k.0)));
+        drop(snap);
+        store.compact().unwrap();
+    }
+}
+
+/// Named attributes: one encoding for every producer, read back borrowed and
+/// in name order, from the overlay and the base alike.
+#[test]
+fn named_attributes_round_trip_and_refuse_what_cannot_be_read_back() {
+    use graph_r::writer::{MAX_ATTRS, MAX_ATTR_LEN, MAX_ATTR_NAME};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), Config::default()).unwrap();
+    store.set_compact_inline(false);
+    let mut w = store.writer().unwrap();
+    let t = node(&mut w, "sql://bq/p/d/t");
+    let sql = "SELECT 1".repeat(10_000);
+    w.set_named_attrs(t, &[("type", "VIEW"), ("sql", &sql), ("type", "TABLE"), ("empty", "")])
+        .unwrap();
+    // Refusals stage nothing.
+    assert!(w.set_named_attrs(t, &[("", "v")]).is_err(), "empty name");
+    assert!(w.set_named_attrs(t, &[("a\0b", "v")]).is_err(), "NUL in a name");
+    let long_name = "n".repeat(MAX_ATTR_NAME + 1);
+    assert!(w.set_named_attrs(t, &[(long_name.as_str(), "v")]).is_err(), "name too long");
+    let too_long = "v".repeat(MAX_ATTR_LEN - 1); // + "k" + NUL exceeds the record cap
+    assert!(w.set_named_attrs(t, &[("k", too_long.as_str())]).is_err());
+    let fits = "v".repeat(MAX_ATTR_LEN - 2);
+    assert!(w.set_named_attrs(t, &[("k", fits.as_str())]).is_ok(), "exactly at the cap");
+    let names: Vec<String> = (0..=MAX_ATTRS).map(|i| format!("k{i}")).collect();
+    let many: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "v")).collect();
+    assert!(w.set_named_attrs(t, &many).is_err(), "more than MAX_ATTRS");
+    let big = "v".repeat(MAX_ATTR_LEN - 8);
+    let four: Vec<(&str, &str)> = ["a", "b", "c", "d"].iter().map(|n| (*n, big.as_str())).collect();
+    assert!(w.set_named_attrs(t, &four).is_err(), "over one log frame in total");
+    // Last staged wins: put the intended set back.
+    w.set_named_attrs(t, &[("type", "VIEW"), ("sql", &sql), ("type", "TABLE"), ("empty", "")])
+        .unwrap();
+    w.commit().unwrap();
+    drop(w);
+    for phase in ["overlay", "base"] {
+        let snap = store.snapshot();
+        let mut got = Vec::new();
+        snap.named_attrs(t, |n, v| got.push((n, v.len())));
+        assert_eq!(got, vec![("empty", 0), ("sql", sql.len()), ("type", 5)], "{phase}");
+        let mut ty = None;
+        snap.named_attrs(t, |n, v| {
+            if n == "type" {
+                ty = Some(v);
+            }
+        });
+        assert_eq!(ty, Some("TABLE"), "{phase}: a later duplicate wins");
+        drop(snap);
+        store.compact().unwrap();
+    }
+    // Numbered records (no NUL) are not named attributes.
+    let mut w = store.writer().unwrap();
+    w.set_attrs(t, &[(TYPE, "TABLE")]).unwrap();
+    w.commit().unwrap();
+    drop(w);
+    let mut n = 0;
+    store.snapshot().named_attrs(t, |_, _| n += 1);
+    assert_eq!(n, 0);
+}

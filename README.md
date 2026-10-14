@@ -133,7 +133,8 @@ move compaction off the commit path.
   importance) keyed stably by heading, so a re-crawl keeps their identity.
 - **Lineage**: containment, value derivation (exact copies flagged) and row
   conditions as typed edges with reverse adjacency; one allocation-free
-  `walk` up or down; large per-node attributes (SQL text, types, provenance).
+  `walk` up, down or both ways; large per-node attributes (SQL text, types,
+  provenance), numbered or named.
 
 ## Features
 

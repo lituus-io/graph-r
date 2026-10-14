@@ -167,6 +167,37 @@ impl crate::Snapshot<'_> {
         max_depth: u32,
         follow: impl Fn(EdgeType) -> bool,
         w: &mut Walk,
+        visit: impl FnMut(Hop) -> bool,
+    ) {
+        let out = dir == Direction::Out;
+        self.walk_along(from, out, !out, max_depth, follow, w, visit);
+    }
+
+    /// [`crate::Snapshot::walk`] along outbound **and** inbound edges at once: the
+    /// lineage neighbourhood of a node (what it derives from and what derives
+    /// from it, and so on outwards). Each node is reached once, at its
+    /// shortest distance over either direction; a node's outbound edges are
+    /// offered before its inbound ones.
+    pub fn walk_both(
+        &self,
+        from: UrlKey,
+        max_depth: u32,
+        follow: impl Fn(EdgeType) -> bool,
+        w: &mut Walk,
+        visit: impl FnMut(Hop) -> bool,
+    ) {
+        self.walk_along(from, true, true, max_depth, follow, w, visit);
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // private seam of the two walks
+    fn walk_along(
+        &self,
+        from: UrlKey,
+        out: bool,
+        inbound: bool,
+        max_depth: u32,
+        follow: impl Fn(EdgeType) -> bool,
+        w: &mut Walk,
         mut visit: impl FnMut(Hop) -> bool,
     ) {
         w.seen.clear();
@@ -193,16 +224,14 @@ impl crate::Snapshot<'_> {
                         w.next.push((key, hop.exact_chain));
                     }
                 };
-                match dir {
-                    Direction::Out => {
-                        let mut it = self.neighbors(node);
-                        while let Some(e) = it.next() {
-                            step(e.dst_key, e.etype, e.flags, w);
-                        }
+                if out {
+                    let mut it = self.neighbors(node);
+                    while let Some(e) = it.next() {
+                        step(e.dst_key, e.etype, e.flags, w);
                     }
-                    Direction::In => {
-                        self.in_edges(node, |src, etype, flags, _| step(src, etype, flags, w));
-                    }
+                }
+                if inbound {
+                    self.in_edges(node, |src, etype, flags, _| step(src, etype, flags, w));
                 }
             }
             if w.next.is_empty() {

@@ -564,6 +564,20 @@ impl<'s> Snapshot<'s> {
         }
     }
 
+    /// Every named attribute of `key` (see [`crate::Writer::set_named_attrs`])
+    /// in name order, as `(name, value)` borrowed from the mmap or overlay.
+    /// Records written without a name ([`crate::Writer::set_attrs`]) carry
+    /// no NUL and are skipped.
+    pub fn named_attrs<'a>(&'a self, key: UrlKey, mut f: impl FnMut(&'a str, &'a str)) {
+        self.attrs(key, |_, rec| {
+            if let Some((name, value)) = rec.split_once('\0') {
+                if !name.is_empty() {
+                    f(name, value);
+                }
+            }
+        });
+    }
+
     /// The node's segments (anchors). Overlay whole-set replacement wins.
     #[must_use]
     pub fn segments(&self, key: UrlKey) -> Vec<SegRef<'_>> {
