@@ -144,7 +144,7 @@ fn check_header(bytes: &[u8], format: Format) -> Result<()> {
     }
     let version = get_u16(bytes, 4);
     if version != format.version {
-        return Err(Error::format(format!("unsupported version {version}")));
+        return Err(Error::Version { found: version, supported: format.version });
     }
     if xxh3_64(&bytes[..SUM_AT]) != get_u64(bytes, SUM_AT) {
         return Err(Error::format("header checksum mismatch"));
@@ -168,7 +168,8 @@ pub struct Dir {
 impl Dir {
     /// Validate `bytes` as a container of `format`: header, directory and
     /// every section checksummed once, bounds and alignment checked. Any
-    /// input yields `Ok` or [`Error::Format`], never a panic.
+    /// input yields `Ok`, [`Error::Format`] or [`Error::Version`], never a
+    /// panic.
     pub fn parse(bytes: &[u8], format: Format) -> Result<Self> {
         check_header(bytes, format)?;
         if get_u64(bytes, 16) != bytes.len() as u64 {

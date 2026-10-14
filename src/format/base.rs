@@ -214,8 +214,8 @@ pub struct BaseDir {
 impl BaseDir {
     /// Validate `bytes` end to end (container checksums, then every record
     /// invariant the zero-copy accessors rely on) and return the directory.
-    /// This is the fuzz entry point: any byte string must produce `Ok` or
-    /// `Error::Format`, never a panic.
+    /// This is the fuzz entry point: any byte string must produce `Ok`,
+    /// `Error::Format` or `Error::Version`, never a panic.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let dir = container::Dir::parse(bytes, FORMAT)?;
         let header = Header::from_owner(dir.flags, dir.owner());

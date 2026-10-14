@@ -9,7 +9,8 @@
 //! - [`wal`] — `graph.wal`, the append-only op log: checksummed frames whose
 //!   replay stops at the first torn frame.
 //!
-//! Every decoder returns [`crate::Error::Format`] on malformed input and caps
+//! Every decoder returns [`crate::Error::Format`] on malformed input (and
+//! [`crate::Error::Version`] on a well-formed header of another version) and caps
 //! preallocation by the bytes actually remaining — never trust a length field.
 
 pub mod base;
