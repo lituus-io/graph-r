@@ -33,7 +33,18 @@ jobs:
       # stable toolchain rather than the crate's pinned nightly.
       - name: Install cargo-audit
         run: RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
-      - run: cargo audit
+      # Every lockfile ships something: the root one the crate's tests and
+      # benches, bindings/python the PyPI wheels, fuzz the fuzz targets.
+      - name: Audit every lockfile
+        shell: bash
+        run: |
+          rc=0
+          for lock in Cargo.lock bindings/python/Cargo.lock fuzz/Cargo.lock; do
+            echo "::group::$lock"
+            cargo audit -f "$lock" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
 
   deny:
     name: Cargo deny

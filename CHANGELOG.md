@@ -4,6 +4,16 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.1
+
+- Security: every lockfile (crate, Python binding, fuzz) refreshed to
+  patched releases, among them rustls 0.23.46 (RUSTSEC-2026-0346, -0347,
+  -0348, -0349) and the earlier rustls and quinn-proto fixes
+  (RUSTSEC-2026-0285, -0338 to -0342). The PyPI wheels are built from these.
+- The Security workflow audits all three lockfiles, not only the crate's.
+- CI: store tests and benches gated on the `store` feature; a regression
+  test replaces the base file by rename, as the store does (Windows).
+
 ## 0.4.0
 
 Breaking: base format v2 and WAL format v2 (stores from 0.3 must be rebuilt
