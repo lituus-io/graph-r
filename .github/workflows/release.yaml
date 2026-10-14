@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 name: Release
 
 on:
@@ -24,6 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - name: Tag must match every manifest
         run: |
           set -euo pipefail
@@ -58,12 +63,11 @@ jobs:
           - { name: windows-x86_64, runner: windows-latest, target: x86_64-pc-windows-msvc, args: "" }
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
+      - name: Fetch the pinned sibling repositories
         shell: bash
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       # rustup show installs the toolchain rust-toolchain.toml pins; the
       # target is then added to that same toolchain.
       - name: Install the pinned toolchain
@@ -102,9 +106,34 @@ jobs:
           name: wheel-${{ matrix.name }}
           path: bindings/python/dist/*.whl
 
+  # One source distribution: maturin bundles the binding with the sibling
+  # crates it path-depends on, so `pip install` can build where no wheel fits.
+  build-sdist:
+    name: Source distribution
+    needs: version-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install maturin
+      - name: Build sdist
+        working-directory: bindings/python
+        run: maturin sdist --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-sdist
+          path: bindings/python/dist/*.tar.gz
+
   release:
     name: GitHub Release
-    needs: build-wheel
+    needs: [build-wheel, build-sdist]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the Release and upload assets
@@ -125,26 +154,65 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
+  # crates.io, with this crate's own scoped token. docs.rs builds the
+  # documentation from the published crate ([package.metadata.docs.rs]).
+  # A dependency released minutes earlier from a sibling repository may not
+  # be in the index yet, so publishing retries for up to 20 minutes.
+  publish-crate:
+    name: Publish to crates.io
+    needs: version-gate
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
+      - run: rustup show
+      - name: Publish uu-graph-r
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN_UU_GRAPH_R }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if curl -sf -A "lituus-io-release" "https://crates.io/api/v1/crates/uu-graph-r/$version" >/dev/null; then
+            echo "uu-graph-r $version is already on crates.io"
+            exit 0
+          fi
+          for attempt in $(seq 1 20); do
+            cargo publish && exit 0
+            echo "attempt $attempt failed; retrying in 60 s"
+            sleep 60
+          done
+          exit 1
+
+  # PyPI Trusted Publishing: PyPI trusts this workflow file (release.yaml)
+  # in this repository, running in the `pypi` environment, and exchanges the
+  # job's OIDC token for a short-lived upload token. No secret is stored.
   publish-pypi:
     name: Publish to PyPI
-    needs: build-wheel
+    needs: [build-wheel, build-sdist]
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/uu-graph-r/
+    permissions:
+      id-token: write # OIDC token for trusted publishing; nothing else
     # Tag-gated for real releases; also runnable by hand so a publish-side
     # failure can be retried without minting a new tag (the wheels are rebuilt
     # from the same commit either way).
     if: (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')) || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Download wheels
+      - name: Download wheels and the sdist
         uses: actions/download-artifact@v4
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - name: Publish via twine
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_PACKAGE }}
-        run: |
-          pip install twine
-          twine check dist/*
-          twine upload --verbose --skip-existing dist/*
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          print-hash: true

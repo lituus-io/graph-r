@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Security tests: the untrusted-input boundary and the access-control
 //! boundary, asserted deliberately rather than incidentally.
@@ -12,6 +12,7 @@
 //! matter, so a regression is a named failure rather than a fuzz run that
 //! happens to get unlucky.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::format::{base, wal};
 use graph_r::prelude::*;
 use graph_r::writer::{MAX_EDGES, MAX_LABEL, MAX_SEGS};

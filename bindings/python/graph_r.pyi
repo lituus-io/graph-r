@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # Type stubs for the graph_r native extension module.
 
@@ -170,7 +170,9 @@ class Store:
     def reload_if_stale(self) -> bool:
         """Pick up commits made by a writing process (read-only handles).
 
-        Cheap when nothing changed — a header comparison, no remap.
+        Cheap when nothing changed: two file stats, no remap, no read. When
+        only the log grew, only the appended bytes are read. A no-op on a
+        writable handle.
         Returns True when anything new became visible.
         """
         ...

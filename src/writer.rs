@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! The single writer. Mutations are staged as WAL ops, made durable on
 //! [`Writer::commit`] (encode → append → fsync per policy), then published
@@ -10,9 +10,10 @@
 use crate::error::{Error, Result};
 use crate::format::base::{nflags, sflags};
 use crate::format::wal::{encode_frame, Op, OwnedSeg};
-use crate::key::{EdgeType, SegKey, UrlKey};
+use crate::key::{EdgeType, UrlKey};
 use crate::store::{wal_path, Durability, Store};
 use crate::ttl::Outcome;
+use compact_str::CompactString;
 use std::io::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::MutexGuard;
@@ -21,8 +22,10 @@ use std::sync::MutexGuard;
 pub const MAX_LABEL: usize = 2048;
 /// Maximum segments per document.
 pub const MAX_SEGS: usize = 128;
-/// Maximum outbound edges per document (mirrors link-r).
-pub const MAX_EDGES: usize = 64;
+/// Maximum outbound edges per node (wide joins and conditions included).
+pub use crate::format::wal::MAX_EDGES;
+/// Maximum attributes per node, and the longest attribute value.
+pub use crate::format::wal::{MAX_ATTRS, MAX_ATTR_LEN};
 
 /// A document to upsert — borrowed, produced by the caller or the link-r
 /// bridge. Everything here is compact lookup metadata; bodies and vectors
@@ -80,6 +83,11 @@ pub(crate) struct WriteState {
     pub(crate) wal_bytes: u64,
     commits_since_sync: u32,
     wal: Option<std::fs::File>,
+    /// Generation of the newest base written to disk. A compaction whose
+    /// in-memory install was refused (every ring slot pinned) still leaves a
+    /// durable base behind; numbering from this, not from the served
+    /// snapshot, means a generation number is never reused.
+    pub(crate) disk_generation: u64,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // file handle and op buffer are noise
@@ -93,7 +101,12 @@ impl std::fmt::Debug for WriteState {
 }
 
 impl WriteState {
-    pub(crate) fn new(next_seq: u64, replayed_ops: usize, wal_bytes: u64) -> Self {
+    pub(crate) fn new(
+        next_seq: u64,
+        replayed_ops: usize,
+        wal_bytes: u64,
+        disk_generation: u64,
+    ) -> Self {
         Self {
             next_seq,
             staged: Vec::new(),
@@ -101,6 +114,7 @@ impl WriteState {
             wal_bytes,
             commits_since_sync: 0,
             wal: None,
+            disk_generation,
         }
     }
 
@@ -186,30 +200,15 @@ impl<'s> Writer<'s> {
         Ok(())
     }
 
-    /// Stage a whole-set segment replacement for `key`. Enrichment-scored
-    /// importance survives for segments whose heading path (and therefore
-    /// [`SegKey`]) is unchanged.
+    /// Stage a whole-set segment replacement for `key`.
     pub fn set_segments(&mut self, key: UrlKey, segs: &[SegmentRecord<'_>]) -> Result<()> {
         if segs.len() > MAX_SEGS {
             return Err(Error::format(format!("more than {MAX_SEGS} segments")));
         }
-        // Carry forward LLM-scored importance by segment identity.
-        let carried: Vec<(u64, u16)> = {
-            let snap = self.view();
-            snap.segments(key)
-                .iter()
-                .filter(|s| s.flags & sflags::LLM_SCORED != 0)
-                .map(|s| (s.key.0, s.importance))
-                .collect()
-        };
         let mut owned = Vec::with_capacity(segs.len());
         for s in segs {
             check_label("segment", s.label)?;
-            let seg_key = SegKey::derive(key, s.label);
-            let (importance, extra_flags) = match carried.iter().find(|(k, _)| *k == seg_key.0) {
-                Some(&(_, imp)) => (imp, sflags::LLM_SCORED),
-                None => (s.importance, 0),
-            };
+            let (importance, extra_flags) = (s.importance, 0);
             let (byte_start, byte_len, range_flag) = match s.byte_range {
                 Some((start, len)) => (start, len, 0),
                 None => (0, 0, sflags::NO_RANGE),
@@ -231,37 +230,27 @@ impl<'s> Writer<'s> {
     /// deduplicated by destination (first occurrence wins — document order is
     /// salience order) and stored sorted by destination key.
     pub fn set_edges(&mut self, key: UrlKey, edges: &[(UrlKey, EdgeType, u16)]) {
-        self.set_edges_flagged(key, edges, 0);
+        self.stage_edges(key, edges.iter().map(|&(d, t, w)| (d, t, w, 0)));
     }
 
-    pub(crate) fn set_edges_flagged(
+    /// [`Writer::set_edges`] with per-edge flags; only caller-settable ones
+    /// are kept (`eflags::EXACT`: an unchanged copy along `Derives`).
+    pub fn set_edges_with_flags(&mut self, key: UrlKey, edges: &[(UrlKey, EdgeType, u16, u8)]) {
+        let mask = crate::format::base::eflags::EXACT;
+        self.stage_edges(key, edges.iter().map(|&(d, t, w, f)| (d, t, w, f & mask)));
+    }
+
+    fn stage_edges(
         &mut self,
         key: UrlKey,
-        edges: &[(UrlKey, EdgeType, u16)],
-        extra_flags: u8,
+        edges: impl Iterator<Item = (UrlKey, EdgeType, u16, u8)>,
     ) {
-        // Tier-scoped replacement over a whole-set op: edges belonging to the
-        // *other* tier are preserved, so a crawl re-ingest can never destroy
-        // enrichment edges and vice versa. New edges win a destination tie.
-        let writing_enrich = extra_flags & crate::format::base::eflags::TIER_ENRICH != 0;
-        let preserved: Vec<(UrlKey, u8, u8, u16)> = {
-            let snap = self.view();
-            let mut kept = Vec::new();
-            let mut it = snap.neighbors(key);
-            while let Some(e) = crate::traverse::LendingIterator::next(&mut it) {
-                if e.is_enrichment() != writing_enrich {
-                    kept.push((e.dst_key, e.etype.as_tag(), e.flags, e.weight));
-                }
-            }
-            kept
-        };
-        let mut seen = std::collections::HashSet::with_capacity(edges.len().min(MAX_EDGES));
-        let mut owned: Vec<(UrlKey, u8, u8, u16)> = Vec::with_capacity(edges.len().min(MAX_EDGES));
-        for &(dst, etype, weight) in edges {
+        let mut seen = std::collections::HashSet::new();
+        let mut owned: Vec<(UrlKey, u8, u8, u16)> = Vec::new();
+        for (dst, etype, weight, mut flags) in edges {
             if dst == key || !seen.insert(dst.0) {
                 continue;
             }
-            let mut flags = extra_flags;
             if matches!(etype, EdgeType::Related) {
                 flags |= crate::format::base::eflags::INFERRED;
             }
@@ -270,16 +259,31 @@ impl<'s> Writer<'s> {
                 break;
             }
         }
-        for (dst, etype, flags, weight) in preserved {
-            if owned.len() == MAX_EDGES {
-                break;
-            }
-            if seen.insert(dst.0) {
-                owned.push((dst, etype, flags, weight));
-            }
-        }
         owned.sort_unstable_by_key(|(dst, _, _, _)| dst.0);
         self.state.staged.push(Op::SetEdges { key, edges: owned });
+    }
+
+    /// Stage a whole-set replacement of `key`'s attributes: small keyed
+    /// values beside the node (a column's type, a table's producing SQL, a
+    /// description's provenance). Keys are the caller's; a later key wins
+    /// over an earlier duplicate. Values longer than [`MAX_ATTR_LEN`] or
+    /// more than [`MAX_ATTRS`] keys are refused.
+    pub fn set_attrs(&mut self, key: UrlKey, attrs: &[(u8, &str)]) -> Result<()> {
+        if attrs.len() > MAX_ATTRS {
+            return Err(Error::format("too many attributes"));
+        }
+        let mut owned: Vec<(u8, CompactString)> = Vec::with_capacity(attrs.len());
+        for &(k, v) in attrs.iter().rev() {
+            if v.len() > MAX_ATTR_LEN {
+                return Err(Error::format("attribute too long"));
+            }
+            if !owned.iter().any(|(o, _)| *o == k) {
+                owned.push((k, CompactString::from(v)));
+            }
+        }
+        owned.sort_unstable_by_key(|(k, _)| *k);
+        self.state.staged.push(Op::SetAttrs { key, attrs: owned });
+        Ok(())
     }
 
     /// Record a revalidation outcome. Freshness policy (interval growth/cut,
@@ -302,6 +306,12 @@ impl<'s> Writer<'s> {
         if let Some(e) = t.etag {
             check_label("etag", e)?;
         }
+        let staged = self.state.staged.iter().rev().find_map(|op| match op {
+            Op::UpsertNode { key: k, content_hash, etag, .. } if *k == key => {
+                Some((*content_hash, etag.clone()))
+            }
+            _ => None,
+        });
         let (interval_s, checks, changes, last_change_ms, content_hash, etag) = {
             let snap = self.view();
             let Some(node) = snap.node(key) else { return Ok(false) };
@@ -317,10 +327,14 @@ impl<'s> Writer<'s> {
                 if t.outcome == Outcome::Changed { t.checked_at_ms } else { node.last_change_ms };
             // The op carries the node's *full* effective state, not a delta:
             // touches fold last-wins in the overlay, so an unchanged check
-            // must not erase the hash/etag a prior change observed.
-            let hash = t.content_hash.unwrap_or(node.content_hash);
-            let etag: Option<compact_str::CompactString> =
-                t.etag.map(Into::into).or_else(|| node.etag.map(Into::into));
+            // must not erase the hash/etag a prior change observed — nor the
+            // ones an upsert staged earlier in this same batch.
+            let (base_hash, base_etag) = match staged {
+                Some((h, e)) => (h, e),
+                None => (node.content_hash, node.etag.map(Into::into)),
+            };
+            let hash = t.content_hash.unwrap_or(base_hash);
+            let etag: Option<compact_str::CompactString> = t.etag.map(Into::into).or(base_etag);
             (next, checks, changes, last_change, hash, etag)
         };
         self.state.staged.push(Op::Touch {
@@ -336,15 +350,6 @@ impl<'s> Writer<'s> {
             tombstone: t.outcome == Outcome::Gone,
         });
         Ok(true)
-    }
-
-    /// Stage enrichment importance overrides `(segment ordinal, importance)`.
-    pub fn set_importance(&mut self, key: UrlKey, scores: &[(u8, u16)]) -> Result<()> {
-        if scores.len() > MAX_SEGS {
-            return Err(Error::format("too many importance overrides"));
-        }
-        self.state.staged.push(Op::SetImportance { key, scores: scores.to_vec() });
-        Ok(())
     }
 
     /// Stage a pin/unpin. Returns `false` (staging nothing) when `key` is
@@ -368,12 +373,6 @@ impl<'s> Writer<'s> {
     pub fn remove(&mut self, key: UrlKey) -> Result<()> {
         self.state.staged.push(Op::Remove { key });
         Ok(())
-    }
-
-    /// Number of staged (uncommitted) ops.
-    #[must_use]
-    pub fn staged(&self) -> usize {
-        self.state.staged.len()
     }
 
     /// Make staged ops durable and visible: encode frames, append to the
@@ -439,7 +438,12 @@ impl<'s> Writer<'s> {
         if self.state.ops_since_compact >= self.store.cfg.compact_after_ops
             || self.state.wal_bytes >= self.store.cfg.compact_after_wal_bytes
         {
-            crate::compact::compact_locked(self.store, &mut self.state)?;
+            if self.store.compact_inline.load(Ordering::Relaxed) {
+                crate::compact::compact_locked(self.store, &mut self.state)?;
+            } else {
+                // Off the hot path: the owner compacts when it chooses.
+                self.store.due.store(true, Ordering::Release);
+            }
         }
         Ok(last)
     }

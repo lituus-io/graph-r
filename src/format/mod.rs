@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! On-disk formats. Two files, one discipline:
 //!
@@ -14,11 +14,3 @@
 
 pub mod base;
 pub mod wal;
-
-/// Section alignment inside `graph.base`.
-pub const ALIGN: usize = 64;
-/// Directory entry width (kind u16, flags u16, reserved u32, offset u64,
-/// length u64, xxh3 u64).
-pub const DIR_ENTRY_LEN: usize = 32;
-/// Whole-file trailer width (xxh3 of everything before it).
-pub const TRAILER_LEN: usize = 8;

@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Adaptive freshness. Every document node carries a revalidation interval
 //! that grows geometrically while the source is observed unchanged and is cut

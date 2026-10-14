@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 name: CI
 
 on:
@@ -23,15 +23,10 @@ env:
 #    test a different compiler than developers run -- the exact failure the dated
 #    pin exists to prevent. `rustup show` installs the toolchain the file names.
 #
-# 2. `bridge` is an optional feature backed by a relative path dependency
-#    (link-r = { path = "../link-r" }). Cargo reads a path dependency's manifest
-#    while resolving metadata **whether or not the feature is enabled**, so
-#    without the sibling present *every* cargo invocation fails -- including
-#    `cargo fmt` and `--no-default-features`. The sibling is therefore fetched in
-#    every job, not just the ones that exercise the bridge.
-#
-#    actions/checkout cannot write outside $GITHUB_WORKSPACE, and `../link-r`
-#    resolves above it, so the sibling is cloned with git directly.
+# 2. The sub-crates (link/, mirror/, kb/, bindings/) path-depend on link-r and
+#    objstore-r beside this checkout. actions/checkout cannot write outside
+#    $GITHUB_WORKSPACE, so scripts/fetch-siblings.sh clones them there at the
+#    refs .github/siblings pins.
 
 jobs:
   fmt:
@@ -39,11 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - name: Install the pinned toolchain
         run: rustup show
       - run: cargo fmt --check
@@ -54,11 +49,11 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-features --all-targets
@@ -79,12 +74,11 @@ jobs:
           - { name: windows-x86_64, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
+      - name: Fetch the pinned sibling repositories
         shell: bash
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
@@ -99,11 +93,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # `default = []` is the product promise: the pure embedded store pulls in
@@ -112,10 +106,10 @@ jobs:
       - name: Each feature combination
         run: |
           set -euo pipefail
-          for f in "" "bridge" "llm" "bridge,llm"; do
+          for f in "" "mmap" "store"; do
             echo "::group::features=${f:-none}"
             if [ -z "$f" ]; then
-              cargo check --no-default-features --all-targets
+              cargo check --no-default-features --lib
             else
               cargo check --no-default-features --features "$f" --all-targets
             fi
@@ -128,11 +122,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # The crate is #![deny(missing_docs)]; this additionally catches broken
@@ -154,12 +148,11 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
+      - name: Fetch the pinned sibling repositories
         shell: bash
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
@@ -191,11 +184,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
       - run: rustup show
       - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -215,3 +208,37 @@ jobs:
             cat coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  semver:
+    name: Semver (additive only)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver
+      # The baseline is checked out as a sibling worktree so its own
+      # `../link-r` path dependency resolves too.
+      - name: API compatibility against the previous release tag
+        run: |
+          prev=$(git tag --sort=-v:refname --merged HEAD | grep -v "^v$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')$" | head -1)
+          echo "baseline: $prev"
+          git worktree add "$GITHUB_WORKSPACE/../graph-r-baseline" "$prev"
+          # A baseline published under another package name (the uu- rename)
+          # has no API to compare against.
+          name=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["name"])')
+          if ! grep -q "^name = \"$name\"" "$GITHUB_WORKSPACE/../graph-r-baseline/Cargo.toml"; then
+            echo "baseline $prev is not $name: skipped"
+            exit 0
+          fi
+          RUSTUP_TOOLCHAIN=stable cargo install cargo-semver-checks --locked
+          cargo semver-checks --baseline-root "$GITHUB_WORKSPACE/../graph-r-baseline" --all-features

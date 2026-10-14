@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # Hermetic smoke tests for the graph_r Python bindings: the writer seam,
 # lookups, freshness, retention, and persistence — no network anywhere.

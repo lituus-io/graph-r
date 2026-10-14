@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # The file-level persistence contract, on whatever OS runs this suite (CI runs
 # it on Linux, macOS, and Windows): a persisted store must be readable AND

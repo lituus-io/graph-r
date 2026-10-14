@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Python bindings for `graph-r` (PyO3 + maturin).
 //!
@@ -18,10 +18,10 @@
 //! The wheel is built against the stable ABI (`abi3-py312`), so one artifact
 //! per platform serves every Python from 3.12 up.
 
-use graphr::bridge::{self, link_r};
 use graphr::{
     Config, DocRecord, Outcome, QueryOpts, SegmentRecord, Store, TokenBudget, Touch, UrlKey,
 };
+use linkr::{self as link_r, bridge};
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -420,7 +420,7 @@ impl PyStore {
     fn related(&self, py: Python<'_>, url: String, k: usize) -> Vec<PyHit> {
         py.detach(|| {
             let snap = self.inner.snapshot();
-            snap.related(UrlKey::of(&url), k).into_iter().map(PyHit::from).collect()
+            snap.related(bridge::key_of(&url), k).into_iter().map(PyHit::from).collect()
         })
     }
 
@@ -466,6 +466,7 @@ impl PyStore {
         links: Option<Vec<String>>,
     ) -> PyResult<()> {
         py.detach(|| {
+            let url = bridge::canonical(&url);
             let key = UrlKey::of(&url);
             let mut w = self.inner.writer().map_err(map_err)?;
             w.upsert_node(&DocRecord {
@@ -492,8 +493,10 @@ impl PyStore {
                 w.set_segments(key, &records).map_err(map_err)?;
             }
             if let Some(links) = &links {
-                let edges: Vec<(UrlKey, graphr::EdgeType, u16)> =
-                    links.iter().map(|l| (UrlKey::of(l), graphr::EdgeType::Link, 65_535)).collect();
+                let edges: Vec<(UrlKey, graphr::EdgeType, u16)> = links
+                    .iter()
+                    .map(|l| (bridge::key_of(l), graphr::EdgeType::Link, 65_535))
+                    .collect();
                 w.set_edges(key, &edges);
             }
             w.commit().map_err(map_err)?;
@@ -520,7 +523,7 @@ impl PyStore {
             let mut w = self.inner.writer().map_err(map_err)?;
             let recorded = w
                 .touch(
-                    UrlKey::of(&url),
+                    bridge::key_of(&url),
                     Touch {
                         checked_at_ms: checked_at_ms.unwrap_or_else(bridge::now_ms),
                         outcome,
@@ -550,7 +553,7 @@ impl PyStore {
     fn remove(&self, py: Python<'_>, url: String) -> PyResult<()> {
         py.detach(|| {
             let mut w = self.inner.writer().map_err(map_err)?;
-            w.remove(UrlKey::of(&url)).map_err(map_err)?;
+            w.remove(bridge::key_of(&url)).map_err(map_err)?;
             w.commit().map_err(map_err)?;
             Ok(())
         })
@@ -565,8 +568,9 @@ impl PyStore {
 
     /// For read-only stores: pick up commits/compactions made by a writing
     /// process since this handle (or its last reload) opened. Cheap when
-    /// nothing changed — a header comparison, no remap. Returns True when
-    /// anything new became visible.
+    /// nothing changed: two file stats, no remap, no read; when only the log
+    /// grew, only the appended bytes are read. Returns True when anything new
+    /// became visible; a no-op on a writable handle.
     fn reload_if_stale(&self, py: Python<'_>) -> PyResult<bool> {
         py.detach(|| self.inner.reload_if_stale().map_err(map_err))
     }
@@ -587,7 +591,7 @@ impl PyStore {
     fn set_pin(&self, py: Python<'_>, url: &str, pinned: bool) -> PyResult<bool> {
         py.detach(|| {
             let mut w = self.inner.writer().map_err(map_err)?;
-            let changed = w.set_pinned(UrlKey::of(url), pinned).map_err(map_err)?;
+            let changed = w.set_pinned(bridge::key_of(url), pinned).map_err(map_err)?;
             w.commit().map_err(map_err)?;
             Ok(changed)
         })

@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Error taxonomy. Decoders return [`Error::Format`] rather than panicking on
 //! any malformed input — the property the fuzz targets enforce — and every
@@ -10,46 +10,67 @@
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// All failure modes surfaced by graph-r.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// A file or byte stream failed structural validation.
-    #[error("format error: {message}")]
     Format {
         /// What was malformed and where.
         message: String,
     },
 
     /// Another process holds the writer lock for this store directory.
-    #[error("store is locked by another writer")]
     Locked,
 
     /// A bounded wait for internal capacity expired (e.g. every generation
     /// slot is pinned by long-lived snapshots during compaction).
-    #[error("store is busy: {message}")]
     Busy {
         /// Which capacity was exhausted.
         message: String,
     },
 
     /// The on-disk state is inconsistent in a way replay cannot repair.
-    #[error("store is corrupt: {message}")]
     Corrupt {
         /// What invariant was violated.
         message: String,
     },
 
     /// A mutating operation was attempted on a read-only store handle.
-    #[error("store was opened read-only")]
     ReadOnly,
 
     /// An underlying I/O failure.
-    #[error("io error: {source}")]
     Io {
         /// The originating I/O error.
-        #[from]
         source: std::io::Error,
     },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Format { message } => write!(f, "format error: {message}"),
+            Self::Locked => f.write_str("store is locked by another writer"),
+            Self::Busy { message } => write!(f, "store is busy: {message}"),
+            Self::Corrupt { message } => write!(f, "store is corrupt: {message}"),
+            Self::ReadOnly => f.write_str("store was opened read-only"),
+            Self::Io { source } => write!(f, "io error: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io { source }
+    }
 }
 
 impl Error {

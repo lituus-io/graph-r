@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Read views. A [`Snapshot`] pins one base generation plus the overlay ops
 //! committed before it was taken; everything it returns — node refs, edge
@@ -17,7 +17,6 @@
 //! reads per snapshot rather than one snapshot per read when a writer is
 //! active.
 
-use crate::error::Result;
 use crate::format::base::{self, nflags, NodeRec, SegRec};
 use crate::key::{NodeId, SegKey, UrlKey};
 use crate::overlay::{OverlayNode, OverlayView};
@@ -33,6 +32,8 @@ pub struct Snapshot<'s> {
     guard: RwLockReadGuard<'s, Option<GenInner>>,
     frontier: usize,
     view: OnceCell<OverlayView>,
+    /// Overlay edges reversed (destination → sources), built on first use.
+    inbound: OnceCell<std::collections::HashMap<u64, Vec<crate::format::wal::OwnedEdge>>>,
     hub_threshold: OnceCell<u32>,
     live: OnceCell<usize>,
 }
@@ -138,6 +139,7 @@ impl<'s> Snapshot<'s> {
             guard,
             frontier,
             view: OnceCell::new(),
+            inbound: OnceCell::new(),
             hub_threshold: OnceCell::new(),
             live: OnceCell::new(),
         }
@@ -161,40 +163,40 @@ impl<'s> Snapshot<'s> {
         self.inner().dir.header.generation
     }
 
-    /// Committed-but-uncompacted op count visible to this snapshot.
-    #[must_use]
-    pub fn pending_ops(&self) -> usize {
-        self.frontier
-    }
-
     // ---- raw section access -------------------------------------------------
 
     pub(crate) fn bytes(&self) -> &[u8] {
         self.inner().bytes()
     }
     pub(crate) fn nodes_bytes(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Nodes).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Nodes)
     }
     pub(crate) fn labels(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Labels).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Labels)
     }
     pub(crate) fn segs_bytes(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Segs).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Segs)
     }
     pub(crate) fn edges_bytes(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Edges).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Edges)
     }
     pub(crate) fn edge_index(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::EdgeIndex).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::EdgeIndex)
+    }
+    pub(crate) fn section_bytes(&self, kind: base::SectionKind) -> &[u8] {
+        self.section(kind)
+    }
+    fn section(&self, kind: base::SectionKind) -> &[u8] {
+        self.inner().dir.section(self.bytes(), kind)
     }
     pub(crate) fn ranks_bytes(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Ranks).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Ranks)
     }
     pub(crate) fn lexicon(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Lexicon).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Lexicon)
     }
     pub(crate) fn postings(&self) -> &[u8] {
-        self.inner().dir.section(self.bytes(), base::SectionKind::Postings).unwrap_or(&[])
+        self.inner().dir.section(self.bytes(), base::SectionKind::Postings)
     }
 
     /// Node count in the base (including stubs/tombstones).
@@ -226,14 +228,6 @@ impl<'s> Snapshot<'s> {
         } else {
             0
         }
-    }
-
-    /// Community id of a base node (smallest member node id), if ranked.
-    #[must_use]
-    pub fn community_of(&self, id: NodeId) -> Option<u32> {
-        let ranks = self.ranks_bytes();
-        let off = id.0 as usize * base::RANK_LEN;
-        (off + base::RANK_LEN <= ranks.len()).then(|| crate::bytesio::get_u32(ranks, off + 4))
     }
 
     // ---- merged lookups -----------------------------------------------------
@@ -390,16 +384,6 @@ impl<'s> Snapshot<'s> {
         }
     }
 
-    /// Node by dense id in this generation.
-    #[must_use]
-    pub fn node_by_id(&self, id: NodeId) -> Option<NodeRef<'_>> {
-        if id.0 as usize >= self.base_len() {
-            return None;
-        }
-        let key = self.rec(id).url_key();
-        self.node(key)
-    }
-
     /// Live (non-stub, non-tombstone, non-removed) document count.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -418,7 +402,7 @@ impl<'s> Snapshot<'s> {
 
     /// Visit every live node (base then overlay-fresh, both in key order for
     /// determinism where it matters to callers).
-    pub(crate) fn for_each_live<'a>(&'a self, mut f: impl FnMut(NodeRef<'a>)) {
+    pub fn for_each_live<'a>(&'a self, mut f: impl FnMut(NodeRef<'a>)) {
         let view = self.overlay();
         for i in 0..self.base_len() {
             let id = NodeId(i as u32);
@@ -486,6 +470,100 @@ impl<'s> Snapshot<'s> {
         }
     }
 
+    /// Inbound edges of `key`, as `(source, type, flags, weight)`: the
+    /// sources whose edge sets point at it. Base runs come from the reverse
+    /// index written at compaction; sources whose edges the overlay replaced
+    /// or removed are skipped there and reported from the overlay instead.
+    pub fn in_edges(&self, key: UrlKey, mut f: impl FnMut(UrlKey, crate::EdgeType, u8, u16)) {
+        let overlay = &self.overlay().map;
+        if let Some(id) = self.base_node_id(key) {
+            let idx = self.section(base::SectionKind::InEdgeIndex);
+            if !idx.is_empty() {
+                let at = |i: usize| crate::bytesio::get_u32(idx, i * 4) as usize;
+                let recs = self.section(base::SectionKind::InEdges);
+                for i in at(id.0 as usize)..at(id.0 as usize + 1) {
+                    let rec = &recs[i * base::EDGE_LEN..(i + 1) * base::EDGE_LEN];
+                    let (src, _) = self.node_identity(NodeId(crate::bytesio::get_u32(rec, 0)));
+                    let replaced = overlay
+                        .get(&src.0)
+                        .is_some_and(|p| p.edges.is_some() || p.removed || p.severed);
+                    if !replaced {
+                        f(
+                            src,
+                            crate::EdgeType::from_tag(rec[4]),
+                            rec[5],
+                            crate::bytesio::get_u16(rec, 6),
+                        );
+                    }
+                }
+            }
+        }
+        let inbound = self.inbound.get_or_init(|| {
+            let mut m: std::collections::HashMap<u64, Vec<crate::format::wal::OwnedEdge>> =
+                std::collections::HashMap::new();
+            for (&src, p) in overlay {
+                if p.removed {
+                    continue;
+                }
+                for &(dst, etype, flags, weight) in p.edges.iter().flatten() {
+                    m.entry(dst.0).or_default().push((UrlKey(src), etype, flags, weight));
+                }
+            }
+            for v in m.values_mut() {
+                v.sort_unstable_by_key(|e| e.0);
+            }
+            m
+        });
+        for &(src, etype, flags, weight) in inbound.get(&key.0).into_iter().flatten() {
+            f(src, crate::EdgeType::from_tag(etype), flags, weight);
+        }
+    }
+
+    /// Value of attribute `k` of `key` (see [`crate::Writer::set_attrs`]).
+    #[must_use]
+    pub fn attr(&self, key: UrlKey, k: u8) -> Option<&str> {
+        let mut out = None;
+        self.attrs(key, |ak, v| {
+            if ak == k {
+                out = Some(v);
+            }
+        });
+        out
+    }
+
+    /// Every attribute of `key`, in key order. An overlay whole-set
+    /// replacement wins over the base.
+    pub fn attrs<'a>(&'a self, key: UrlKey, mut f: impl FnMut(u8, &'a str)) {
+        if let Some(p) = self.overlay().map.get(&key.0) {
+            if p.removed || (p.attrs.is_none() && p.severed) {
+                return;
+            }
+            if let Some(attrs) = &p.attrs {
+                for (k, v) in attrs {
+                    f(*k, v.as_str());
+                }
+                return;
+            }
+        }
+        let Some(id) = self.base_node_id(key) else { return };
+        let idx = self.section(base::SectionKind::AttrIndex);
+        if idx.is_empty() {
+            return;
+        }
+        let at = |i: usize| crate::bytesio::get_u32(idx, i * 4) as usize;
+        let (recs, blobs) =
+            (self.section(base::SectionKind::Attrs), self.section(base::SectionKind::Blobs));
+        for i in at(id.0 as usize)..at(id.0 as usize + 1) {
+            let rec = &recs[i * base::ATTR_LEN..(i + 1) * base::ATTR_LEN];
+            let (o, l) = (
+                crate::bytesio::get_u32(rec, 4) as usize,
+                crate::bytesio::get_u32(rec, 8) as usize,
+            );
+            // Validated at open: in bounds and UTF-8.
+            f(rec[0], std::str::from_utf8(&blobs[o..o + l]).unwrap_or(""));
+        }
+    }
+
     /// The node's segments (anchors). Overlay whole-set replacement wins.
     #[must_use]
     pub fn segments(&self, key: UrlKey) -> Vec<SegRef<'_>> {
@@ -497,7 +575,7 @@ impl<'s> Snapshot<'s> {
                 return Vec::new();
             }
             if let Some(segs) = &p.segs {
-                let mut out: Vec<SegRef<'_>> = segs
+                let out: Vec<SegRef<'_>> = segs
                     .iter()
                     .map(|s| SegRef {
                         key: SegKey::derive(key, &s.label),
@@ -509,7 +587,6 @@ impl<'s> Snapshot<'s> {
                         flags: s.flags,
                     })
                     .collect();
-                self.apply_importance_overrides(key, &mut out);
                 return out;
             }
         }
@@ -531,68 +608,13 @@ impl<'s> Snapshot<'s> {
                 flags: s.flags(),
             });
         }
-        self.apply_importance_overrides(key, &mut out);
         out
-    }
-
-    fn apply_importance_overrides(&self, key: UrlKey, segs: &mut [SegRef<'_>]) {
-        if let Some(p) = self.overlay().map.get(&key.0) {
-            for &(ordinal, imp) in &p.importance {
-                if let Some(s) = segs.get_mut(usize::from(ordinal)) {
-                    s.importance = imp;
-                    s.flags |= base::sflags::LLM_SCORED;
-                }
-            }
-        }
-    }
-
-    /// Shortest forward path (over outbound edges) from `from` to `to`,
-    /// bounded by `max_depth` hops. Deterministic: neighbors expand in
-    /// storage order, ties broken by first arrival.
-    #[must_use]
-    pub fn path(&self, from: UrlKey, to: UrlKey, max_depth: u8) -> Option<Vec<UrlKey>> {
-        if from == to {
-            return Some(vec![from]);
-        }
-        let mut prev: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        let mut frontier = vec![from];
-        prev.insert(from.0, from.0);
-        for _ in 0..max_depth {
-            let mut next = Vec::new();
-            for &u in &frontier {
-                let mut it = self.neighbors(u);
-                while let Some(e) = crate::traverse::LendingIterator::next(&mut it) {
-                    let v = e.dst_key;
-                    if prev.contains_key(&v.0) {
-                        continue;
-                    }
-                    prev.insert(v.0, u.0);
-                    if v == to {
-                        let mut path = vec![v.0];
-                        let mut cur = u.0;
-                        while cur != from.0 {
-                            path.push(cur);
-                            cur = prev[&cur];
-                        }
-                        path.push(from.0);
-                        path.reverse();
-                        return Some(path.into_iter().map(UrlKey).collect());
-                    }
-                    next.push(v);
-                }
-            }
-            if next.is_empty() {
-                return None;
-            }
-            frontier = next;
-        }
-        None
     }
 
     /// The p99 total-degree hub threshold for this generation (BFS refuses to
     /// expand *through* nodes at or above it).
     #[must_use]
-    pub fn hub_threshold(&self) -> u32 {
+    pub(crate) fn hub_threshold(&self) -> u32 {
         *self.hub_threshold.get_or_init(|| {
             let n = self.base_len();
             if n == 0 {
@@ -634,28 +656,23 @@ impl<'s> Snapshot<'s> {
                 });
             }
         });
-        out.sort_by(|a, b| {
+        let order = |a: &DueItem<'_>, b: &DueItem<'_>| {
             b.rank_permille
                 .cmp(&a.rank_permille)
                 .then(b.overdue_ms.cmp(&a.overdue_ms))
                 .then(a.key.0.cmp(&b.key.0))
-        });
-        out.truncate(max);
+        };
+        // Select the first `max`, then order only those.
+        if max < out.len() {
+            out.select_nth_unstable_by(max, order);
+            out.truncate(max);
+        }
+        out.sort_by(order);
         out
     }
 
     /// Keys touched by the overlay visible to this snapshot (unsorted).
     pub(crate) fn overlay_keys(&self) -> Vec<u64> {
         self.overlay().map.keys().copied().collect()
-    }
-
-    /// Validate internal invariants cheaply (used by tests).
-    pub fn check(&self) -> Result<()> {
-        // Force the overlay view and lexicon parse; any panic here would be a
-        // bug, any error a corrupt file that BaseDir::parse should have
-        // rejected already.
-        let _ = self.overlay();
-        let _ = self.hub_threshold();
-        Ok(())
     }
 }

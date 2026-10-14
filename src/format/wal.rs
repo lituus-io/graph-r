@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! `graph.wal` — the append-only op log that extends a base generation.
 //!
@@ -15,14 +15,15 @@
 
 use crate::bytesio::{put_u16, put_u32, put_u64, Reader};
 use crate::error::{Error, Result};
+use crate::hash::xxh3_64;
 use crate::key::UrlKey;
 use compact_str::CompactString;
-use xxhash_rust::xxh3::xxh3_64;
 
 /// Magic: `"GRPW"` little-endian.
 pub const MAGIC: u32 = 0x5750_5247;
-/// WAL format version; strict-equal on read.
-pub const VERSION: u16 = 1;
+/// WAL format version; strict-equal on read. 2: `u16` edge counts and
+/// node attributes.
+pub const VERSION: u16 = 2;
 /// Header width.
 pub const HEADER_LEN: usize = 64;
 /// Maximum frame payload; bounds replay preallocation against hostile files.
@@ -91,9 +92,16 @@ pub enum Op {
     Remove { key: UrlKey },
     /// Pin or unpin the node.
     SetPinned { key: UrlKey, pinned: bool },
-    /// Enrichment writeback: per-segment-ordinal importance overrides.
-    SetImportance { key: UrlKey, scores: Vec<(u8, u16)> },
+    /// Whole-set replacement of the node's attributes.
+    SetAttrs { key: UrlKey, attrs: Vec<(u8, CompactString)> },
 }
+
+/// Most outbound edges per node.
+pub const MAX_EDGES: usize = 4096;
+/// Most attributes per node.
+pub const MAX_ATTRS: usize = 64;
+/// Longest attribute value (bytes of UTF-8); a frame stays under [`MAX_FRAME`].
+pub const MAX_ATTR_LEN: usize = 256 << 10;
 
 const OP_UPSERT: u8 = 1;
 const OP_SEGS: u8 = 2;
@@ -101,7 +109,8 @@ const OP_EDGES: u8 = 3;
 const OP_TOUCH: u8 = 4;
 const OP_REMOVE: u8 = 5;
 const OP_PIN: u8 = 6;
-const OP_IMPORTANCE: u8 = 7;
+// 7 was segment importance (enrichment), retired.
+const OP_ATTRS: u8 = 8;
 
 fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
     match s {
@@ -132,11 +141,12 @@ impl Op {
             | Self::Touch { key, .. }
             | Self::Remove { key }
             | Self::SetPinned { key, .. }
-            | Self::SetImportance { key, .. } => *key,
+            | Self::SetAttrs { key, .. } => *key,
         }
     }
 
     /// Serialize into `out`.
+    #[allow(clippy::too_many_lines)] // one arm per op, mirroring decode
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::UpsertNode {
@@ -175,7 +185,7 @@ impl Op {
             Self::SetEdges { key, edges } => {
                 out.push(OP_EDGES);
                 put_u64(out, key.0);
-                out.push(edges.len() as u8);
+                put_u16(out, edges.len() as u16);
                 let mut prev: Option<u64> = None;
                 for (dst, etype, eflags, weight) in edges {
                     let delta = match prev {
@@ -228,13 +238,13 @@ impl Op {
                 put_u64(out, key.0);
                 out.push(u8::from(*pinned));
             }
-            Self::SetImportance { key, scores } => {
-                out.push(OP_IMPORTANCE);
+            Self::SetAttrs { key, attrs } => {
+                out.push(OP_ATTRS);
                 put_u64(out, key.0);
-                out.push(scores.len() as u8);
-                for (ordinal, importance) in scores {
-                    out.push(*ordinal);
-                    put_u16(out, *importance);
+                out.push(attrs.len() as u8);
+                for (k, v) in attrs {
+                    out.push(*k);
+                    crate::bytesio::put_blob(out, v);
                 }
             }
         }
@@ -277,8 +287,8 @@ impl Op {
                 Self::SetSegments { key, segs }
             }
             OP_EDGES => {
-                let n = usize::from(r.u8()?);
-                if n > 64 {
+                let n = usize::from(r.u16()?);
+                if n > MAX_EDGES {
                     return Err(Error::format("too many edges"));
                 }
                 let mut edges = Vec::with_capacity(n.min(r.remaining()));
@@ -318,14 +328,21 @@ impl Op {
             },
             OP_REMOVE => Self::Remove { key },
             OP_PIN => Self::SetPinned { key, pinned: r.u8()? != 0 },
-            OP_IMPORTANCE => {
+            OP_ATTRS => {
                 let n = usize::from(r.u8()?);
-                let mut scores = Vec::with_capacity(n.min(r.remaining()));
-                for _ in 0..n {
-                    let ordinal = r.u8()?;
-                    scores.push((ordinal, r.u16()?));
+                if n > MAX_ATTRS {
+                    return Err(Error::format("too many attributes"));
                 }
-                Self::SetImportance { key, scores }
+                let mut attrs = Vec::with_capacity(n.min(r.remaining()));
+                for _ in 0..n {
+                    let k = r.u8()?;
+                    let v = r.blob()?;
+                    if v.len() > MAX_ATTR_LEN {
+                        return Err(Error::format("attribute too long"));
+                    }
+                    attrs.push((k, CompactString::from(v)));
+                }
+                Self::SetAttrs { key, attrs }
             }
             other => return Err(Error::format(format!("unknown opcode {other}"))),
         })
@@ -369,21 +386,81 @@ pub fn parse_header(bytes: &[u8]) -> Result<u64> {
     Ok(crate::bytesio::get_u64(bytes, 16))
 }
 
+/// The frame checksum: xxh3 over `seq‖payload`, streamed so neither side
+/// needs a concatenated copy (the value is identical to the one-shot hash).
+fn frame_sum(seq: u64, payload: &[u8]) -> u64 {
+    let mut h = crate::hash::Hasher::new();
+    h.update(&seq.to_le_bytes());
+    h.update(payload);
+    h.digest64()
+}
+
 /// Serialize one frame.
 #[must_use]
 pub fn encode_frame(seq: u64, op: &Op) -> Vec<u8> {
-    let mut payload = Vec::new();
-    op.encode(&mut payload);
-    debug_assert!(payload.len() <= MAX_FRAME);
-    let mut sum_input = Vec::with_capacity(8 + payload.len());
-    sum_input.extend_from_slice(&seq.to_le_bytes());
-    sum_input.extend_from_slice(&payload);
-    let mut out = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
-    put_u32(&mut out, payload.len() as u32);
-    put_u64(&mut out, xxh3_64(&sum_input));
-    put_u64(&mut out, seq);
-    out.extend_from_slice(&payload);
+    // Encode the payload in place after a reserved frame head: one buffer.
+    let mut out = vec![0u8; FRAME_OVERHEAD];
+    op.encode(&mut out);
+    let len = out.len() - FRAME_OVERHEAD;
+    debug_assert!(len <= MAX_FRAME);
+    let sum = frame_sum(seq, &out[FRAME_OVERHEAD..]);
+    out[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+    out[4..12].copy_from_slice(&sum.to_le_bytes());
+    out[12..20].copy_from_slice(&seq.to_le_bytes());
     out
+}
+
+/// One intact frame at `pos`: its sequence, op, and the offset just past it.
+/// `None` at the first torn, corrupt or undecodable frame (the crash model).
+fn next_frame(bytes: &[u8], pos: usize) -> Option<(u64, Op, usize)> {
+    if bytes.len() - pos < FRAME_OVERHEAD {
+        return None;
+    }
+    let len = crate::bytesio::get_u32(bytes, pos) as usize;
+    if len > MAX_FRAME || bytes.len() - pos - FRAME_OVERHEAD < len {
+        return None;
+    }
+    let sum = crate::bytesio::get_u64(bytes, pos + 4);
+    let seq = crate::bytesio::get_u64(bytes, pos + 12);
+    let payload = &bytes[pos + FRAME_OVERHEAD..pos + FRAME_OVERHEAD + len];
+    if frame_sum(seq, payload) != sum {
+        return None;
+    }
+    let mut r = Reader::new(payload);
+    let op = Op::decode(&mut r).ok()?;
+    if r.remaining() != 0 {
+        return None;
+    }
+    Some((seq, op, pos + FRAME_OVERHEAD + len))
+}
+
+/// Byte length of the intact prefix of a WAL image — exactly the
+/// [`Replay::good_len`] that [`replay`] would report, without collecting the
+/// ops — or 0 when the header itself is invalid. This is the length that is
+/// safe to copy elsewhere: it ends on a frame boundary and every frame in it
+/// is committed.
+#[must_use]
+pub fn committed_len(image: &[u8]) -> usize {
+    if parse_header(image).is_err() {
+        return 0;
+    }
+    HEADER_LEN + committed_frames_len(&image[HEADER_LEN..])
+}
+
+/// Like [`committed_len`] for a run of frames with no header (for example
+/// the bytes appended since a previously measured frame boundary).
+#[must_use]
+pub fn committed_frames_len(frames: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut last = None;
+    while let Some((seq, _, next)) = next_frame(frames, pos) {
+        if last.is_some_and(|l| seq <= l) {
+            break; // a regression is corruption, never a committed frame
+        }
+        last = Some(seq);
+        pos = next;
+    }
+    pos
 }
 
 /// The result of replaying a WAL byte image.
@@ -402,41 +479,26 @@ pub struct Replay {
 /// the crash model, not an error); a corrupt *header* is an error.
 pub fn replay(bytes: &[u8]) -> Result<Replay> {
     let base_generation = parse_header(bytes)?;
-    let mut ops = Vec::new();
-    let mut pos = HEADER_LEN;
-    loop {
-        if bytes.len() - pos < FRAME_OVERHEAD {
-            break;
-        }
-        let len = crate::bytesio::get_u32(bytes, pos) as usize;
-        if len > MAX_FRAME || bytes.len() - pos - FRAME_OVERHEAD < len {
-            break;
-        }
-        let sum = crate::bytesio::get_u64(bytes, pos + 4);
-        let seq = crate::bytesio::get_u64(bytes, pos + 12);
-        let payload = &bytes[pos + FRAME_OVERHEAD..pos + FRAME_OVERHEAD + len];
-        let mut sum_input = Vec::with_capacity(8 + len);
-        sum_input.extend_from_slice(&seq.to_le_bytes());
-        sum_input.extend_from_slice(payload);
-        if xxh3_64(&sum_input) != sum {
-            break;
-        }
-        let mut r = Reader::new(payload);
-        let Ok(op) = Op::decode(&mut r) else { break };
-        if r.remaining() != 0 {
-            break;
-        }
+    let (ops, used) = replay_frames(&bytes[HEADER_LEN..])?;
+    Ok(Replay { ops, good_len: HEADER_LEN + used, base_generation })
+}
+
+/// Replay a run of frames with no header (for example the bytes appended
+/// since a previously consumed frame boundary): the ops up to the first tear
+/// and the byte length they occupy.
+pub fn replay_frames(frames: &[u8]) -> Result<(Vec<(u64, Op)>, usize)> {
+    let mut ops: Vec<(u64, Op)> = Vec::new();
+    let mut pos = 0;
+    while let Some((seq, op, next)) = next_frame(frames, pos) {
         // Sequences must be strictly increasing; a regression means foreign
         // tampering, not a torn tail.
-        if let Some(&(last, _)) = ops.last() {
-            if seq <= last {
-                return Err(Error::corrupt("wal sequence regression"));
-            }
+        if ops.last().is_some_and(|&(last, _)| seq <= last) {
+            return Err(Error::corrupt("wal sequence regression"));
         }
         ops.push((seq, op));
-        pos += FRAME_OVERHEAD + len;
+        pos = next;
     }
-    Ok(Replay { ops, good_len: pos, base_generation })
+    Ok((ops, pos))
 }
 
 #[cfg(test)]
@@ -484,7 +546,10 @@ mod tests {
             },
             Op::Remove { key: UrlKey(11) },
             Op::SetPinned { key: UrlKey(9), pinned: true },
-            Op::SetImportance { key: UrlKey(9), scores: vec![(0, 1000), (3, 65_535)] },
+            Op::SetAttrs {
+                key: UrlKey(9),
+                attrs: vec![(1, "INT64".into()), (2, "SELECT 1".repeat(10_000).into())],
+            },
         ]
     }
 
@@ -532,6 +597,34 @@ mod tests {
         let mut bad_header = encode_header(1, 0);
         bad_header[3] ^= 0xff;
         assert!(replay(&bad_header).is_err());
+    }
+
+    #[test]
+    fn committed_len_matches_replay_at_every_cut() {
+        let mut image = encode_header(3, 0);
+        for (i, op) in sample_ops().into_iter().enumerate() {
+            image.extend_from_slice(&encode_frame(i as u64 + 1, &op));
+        }
+        for cut in 0..=image.len() {
+            let want = replay(&image[..cut]).map_or(0, |r| r.good_len);
+            assert_eq!(committed_len(&image[..cut]), want, "cut {cut}");
+            if cut >= HEADER_LEN {
+                assert_eq!(committed_frames_len(&image[HEADER_LEN..cut]) + HEADER_LEN, want);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_frame_checksum_equals_the_one_shot_hash() {
+        // Pins byte-compatibility with files written by 0.2.x.
+        let op = Op::Remove { key: UrlKey(42) };
+        let frame = encode_frame(7, &op);
+        let mut payload = Vec::new();
+        op.encode(&mut payload);
+        let mut one_shot = 7u64.to_le_bytes().to_vec();
+        one_shot.extend_from_slice(&payload);
+        assert_eq!(crate::bytesio::get_u64(&frame, 4), xxh3_64(&one_shot));
+        assert_eq!(&frame[FRAME_OVERHEAD..], &payload[..]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # cargo-deny configuration. Run by .github/workflows/security.yml.
 
@@ -30,6 +30,9 @@ ignore = [
 version = 2
 confidence-threshold = 0.9
 allow = [
+    # The stack\'s own license: the crates are published, so cargo-deny
+    # checks them (and their uu-* siblings) like any dependency.
+    "AGPL-3.0-or-later",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

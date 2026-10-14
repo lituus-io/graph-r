@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Little-endian byte codec shared by the base and WAL formats. All readers
 //! return [`Error::Format`] rather than panicking on truncated or hostile
@@ -36,6 +36,19 @@ pub fn put_str(out: &mut Vec<u8>, s: &str) {
     debug_assert!(u16::try_from(s.len()).is_ok());
     put_u16(out, s.len() as u16);
     out.extend_from_slice(s.as_bytes());
+}
+/// Append a `u32`-length-prefixed UTF-8 string (large values: SQL, text).
+pub fn put_blob(out: &mut Vec<u8>, s: &str) {
+    put_len_prefixed(out, s.as_bytes());
+}
+/// Append `u32`-length-prefixed bytes.
+pub fn put_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(out, u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    out.extend_from_slice(bytes);
+}
+/// Append an `f32` LE.
+pub fn put_f32(out: &mut Vec<u8>, v: f32) {
+    put_u32(out, v.to_bits());
 }
 /// Append an unsigned LEB128 varint.
 pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -121,6 +134,15 @@ impl<'a> Reader<'a> {
         a.copy_from_slice(b);
         Ok(u64::from_le_bytes(a))
     }
+    /// Read an `f32` LE.
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.u32()?))
+    }
+    /// Read `u32`-length-prefixed bytes (borrowed).
+    pub fn len_prefixed(&mut self) -> Result<&'a [u8]> {
+        let len = self.u32()? as usize;
+        self.take(len)
+    }
     /// Read `n` raw bytes.
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         self.take(n)
@@ -130,6 +152,11 @@ impl<'a> Reader<'a> {
         let len = usize::from(self.u16()?);
         let raw = self.take(len)?;
         std::str::from_utf8(raw).map_err(|_| Error::format("invalid utf-8 in string"))
+    }
+    /// Read a `u32`-length-prefixed UTF-8 string.
+    pub fn blob(&mut self) -> Result<&'a str> {
+        let raw = self.len_prefixed()?;
+        std::str::from_utf8(raw).map_err(|_| Error::format("invalid utf-8 in blob"))
     }
     /// Read an unsigned LEB128 varint (max 10 bytes).
     pub fn varint(&mut self) -> Result<u64> {

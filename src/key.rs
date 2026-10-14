@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Identity types. The durable foreign key everywhere is [`UrlKey`] — the
 //! 64-bit xxh3 of a canonical URL, byte-compatible with link-r's key of the
@@ -8,7 +8,7 @@
 //! compaction; they are stable *within* one base generation and never
 //! persisted across it, exactly link-r's `DocId` philosophy.
 
-use xxhash_rust::xxh3::xxh3_64;
+use crate::hash::xxh3_64;
 
 /// Durable identity of a document node: xxh3 of its canonical URL.
 ///
@@ -68,6 +68,15 @@ pub enum EdgeType {
     Related,
     /// A redirect observed at fetch time.
     Redirect,
+    /// Structural containment: a table contains its columns.
+    Contains,
+    /// Value lineage: the source computes from the destination (a column
+    /// from the columns it is calculated from). With `eflags::EXACT`, an
+    /// unchanged copy along which a description carries over verbatim.
+    Derives,
+    /// Row lineage: the destination decides which rows the source holds (a
+    /// filter, join key, grouping or match condition of its producing SQL).
+    Conditions,
     /// Forward-compatibility catch-all for tags this build does not know.
     Unknown(u8),
 }
@@ -80,6 +89,9 @@ impl EdgeType {
             Self::Link => 0,
             Self::Related => 2,
             Self::Redirect => 3,
+            Self::Contains => 4,
+            Self::Derives => 5,
+            Self::Conditions => 6,
             Self::Unknown(t) => t,
         }
     }
@@ -91,6 +103,9 @@ impl EdgeType {
             0 => Self::Link,
             2 => Self::Related,
             3 => Self::Redirect,
+            4 => Self::Contains,
+            5 => Self::Derives,
+            6 => Self::Conditions,
             t => Self::Unknown(t),
         }
     }

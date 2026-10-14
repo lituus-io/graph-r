@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Zero-alloc traversal. [`LendingIterator`] is the crate's GAT seam: each
 //! step lends a view tied to the iterator's borrow, so implementations are
@@ -37,11 +37,6 @@ pub struct EdgeRef<'a> {
 }
 
 impl EdgeRef<'_> {
-    /// True when the edge came from the enrichment tier.
-    #[must_use]
-    pub fn is_enrichment(&self) -> bool {
-        self.flags & crate::format::base::eflags::TIER_ENRICH != 0
-    }
     /// True when the edge was inferred rather than extracted from source.
     #[must_use]
     pub fn is_inferred(&self) -> bool {
@@ -112,6 +107,108 @@ impl LendingIterator for Neighbors<'_> {
                 })
             }
             NeighborsInner::Empty => None,
+        }
+    }
+}
+
+/// Which edges a [`crate::Snapshot::walk`] follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Outbound: from a node to what it points at (a column to the columns
+    /// it derives from — upstream lineage).
+    Out,
+    /// Inbound: from a node to what points at it (a column to the columns
+    /// computed from it — downstream impact).
+    In,
+}
+
+/// One node reached by a walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hop {
+    /// The node reached.
+    pub key: UrlKey,
+    /// The node it was reached from.
+    pub from: UrlKey,
+    /// The type of the edge crossed.
+    pub etype: EdgeType,
+    /// Hops from the start (1 for direct neighbours).
+    pub depth: u32,
+    /// Every edge on the path carries `eflags::EXACT` (an unchanged copy).
+    pub exact_chain: bool,
+}
+
+/// Reusable walk state (visited set and frontiers). Keep one per thread:
+/// once its buffers have grown, walks allocate nothing.
+#[derive(Debug, Default)]
+pub struct Walk {
+    seen: std::collections::HashSet<u64>,
+    frontier: Vec<(UrlKey, bool)>,
+    next: Vec<(UrlKey, bool)>,
+}
+
+impl Walk {
+    /// Empty walk state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl crate::Snapshot<'_> {
+    /// Breadth-first walk from `from` along edges in `dir` whose type
+    /// `follow` accepts, at most `max_depth` hops. `visit` sees every node
+    /// reached once, nearest first, and returns whether to continue past it
+    /// (so "the nearest described ancestor" is a walk that stops at
+    /// described nodes).
+    pub fn walk(
+        &self,
+        from: UrlKey,
+        dir: Direction,
+        max_depth: u32,
+        follow: impl Fn(EdgeType) -> bool,
+        w: &mut Walk,
+        mut visit: impl FnMut(Hop) -> bool,
+    ) {
+        w.seen.clear();
+        w.frontier.clear();
+        w.seen.insert(from.0);
+        w.frontier.push((from, true));
+        let exact = crate::format::base::eflags::EXACT;
+        for depth in 1..=max_depth {
+            w.next.clear();
+            for k in 0..w.frontier.len() {
+                let (node, chain) = w.frontier[k];
+                let mut step = |key: UrlKey, etype: EdgeType, flags: u8, w: &mut Walk| {
+                    if !follow(etype) || !w.seen.insert(key.0) {
+                        return;
+                    }
+                    let hop = Hop {
+                        key,
+                        from: node,
+                        etype,
+                        depth,
+                        exact_chain: chain && flags & exact != 0,
+                    };
+                    if visit(hop) {
+                        w.next.push((key, hop.exact_chain));
+                    }
+                };
+                match dir {
+                    Direction::Out => {
+                        let mut it = self.neighbors(node);
+                        while let Some(e) = it.next() {
+                            step(e.dst_key, e.etype, e.flags, w);
+                        }
+                    }
+                    Direction::In => {
+                        self.in_edges(node, |src, etype, flags, _| step(src, etype, flags, w));
+                    }
+                }
+            }
+            if w.next.is_empty() {
+                break;
+            }
+            std::mem::swap(&mut w.frontier, &mut w.next);
         }
     }
 }

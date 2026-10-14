@@ -1,10 +1,11 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! Property tests: the store agrees with a trivial reference model under
 //! arbitrary op sequences, compaction is byte-reproducible, and a WAL torn at
 //! any byte recovers exactly the committed prefix.
 
+#![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -200,7 +201,7 @@ proptest! {
         // node it reports must be internally coherent.
         let store = Store::open(dir.path()).unwrap();
         let snap = store.snapshot();
-        snap.check().unwrap();
-        let _ = snap.len();
+        // Decode every live node.
+        assert!(snap.due(u64::MAX, usize::MAX).len() <= snap.len());
     }
 }

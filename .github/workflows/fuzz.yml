@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 name: Fuzz
 
 on:
@@ -35,14 +35,16 @@ jobs:
           - fuzz_wal_replay
           - fuzz_op_decode
           - fuzz_postings_decode
+          - fuzz_wal_committed_len
+          - fuzz_open_image
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch the pinned sibling repositories
+        shell: bash
+        env:
+          SIBLING_TOKEN: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+        run: scripts/fetch-siblings.sh
 
-      - name: Fetch the link-r sibling
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SIBLING_REPO_TOKEN || github.token }}@github.com/lituus-io/link-r.git" \
-            "$GITHUB_WORKSPACE/../link-r"
 
       # rust-toolchain.toml already pins a nightly, which is what cargo-fuzz
       # needs to build the instrumented target.

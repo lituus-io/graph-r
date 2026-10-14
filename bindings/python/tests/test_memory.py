@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # Memory profile of the harness read path. A harness session holds one store
 # and calls query/due hundreds of times; the mmapped read path must not

@@ -1,5 +1,5 @@
-# Copyright: lituus-io, all rights reserved.
-# Author: terekete <spicyzhug@gmail.com>
+# Author: support@lituus.io
+# Copyright: lituus-io, all rights reserved
 #
 # The whole loop, end to end, against a local conditional-GET server: crawl,
 # absorb, DISCARD the index, reopen the store in a fresh session, and sync

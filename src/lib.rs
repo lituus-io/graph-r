@@ -1,5 +1,5 @@
-// Copyright: lituus-io, all rights reserved.
-// Author: terekete <spicyzhug@gmail.com>
+// Author: support@lituus.io
+// Copyright: lituus-io, all rights reserved
 //
 //! # graph-r
 //!
@@ -26,29 +26,16 @@
 //!   link-r or at the source URL. Lookups answer with URLs + anchors, which
 //!   is what keeps repeat token spend near zero.
 //!
-//! ## Quick start (with link-r, feature `bridge`)
+//! ## Quick start
+//!
+//! The link-r ingest path is link-r's `graph` feature (`link_r::bridge`),
+//! and object-store mirroring is objstore-r's `mirror` feature; both build
+//! on this crate's core, so none of them is a dependency here:
 //!
 //! ```toml
-//! graph-r = { path = "../graph-r", features = ["bridge"] }
+//! uu-graph-r = "0.4"
+//! uu-link-r = { version = "0.4", features = ["graph"] }
 //! ```
-//!
-//! ```no_run
-//! # #[cfg(feature = "bridge")]
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use graph_r::{Config, Store};
-//!
-//! let store = Store::create("kb", Config::default())?;
-//! let mut index = link_r::LinkIndex::in_memory()?;
-//! index.update("https://docs.example.com/guide").run().await?;
-//! graph_r::bridge::absorb(&store, &index)?;          // offload: graph-r now serves alone
-//!
-//! let snap = store.snapshot();
-//! for hit in snap.query("install on linux", &graph_r::QueryOpts::default()) {
-//!     println!("{} ({})", hit.url, hit.score);
-//! }
-//! # Ok(()) }
-//! ```
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -66,39 +53,59 @@
     clippy::cast_possible_wrap
 )]
 
+// Core (always built; xxh3 is the only dependency): hashing, keys, byte
+// codecs, the checksummed container, errors and file primitives.
 pub mod bytesio;
-mod compact;
+pub mod container;
 pub mod error;
-pub mod format;
+pub mod fsio;
+pub mod hash;
 pub mod key;
-mod os;
-mod overlay;
-pub mod query;
-pub mod rank;
-pub mod snapshot;
-pub mod store;
-pub mod traverse;
-pub mod ttl;
-pub mod writer;
+pub mod text;
 
-#[cfg(feature = "bridge")]
-pub mod bridge;
-#[cfg(feature = "llm")]
-pub mod enrich;
+/// Zero-copy read-only images (feature `mmap`).
+#[cfg(feature = "mmap")]
+pub mod mmap;
+
+// The embedded graph store (feature `store`, on by default).
+#[cfg(feature = "store")]
+mod compact;
+#[cfg(feature = "store")]
+pub mod format;
+#[cfg(feature = "store")]
+mod overlay;
+#[cfg(feature = "store")]
+pub mod query;
+#[cfg(feature = "store")]
+pub mod rank;
+#[cfg(feature = "store")]
+pub mod snapshot;
+#[cfg(feature = "store")]
+pub mod store;
+#[cfg(feature = "store")]
+pub mod traverse;
+#[cfg(feature = "store")]
+pub mod ttl;
+#[cfg(feature = "store")]
+pub mod writer;
 
 pub use error::{Error, Result};
 pub use key::{EdgeType, NodeId, SegKey, UrlKey};
+#[cfg(feature = "store")]
 pub use query::{Anchor, Hit, QueryOpts, TokenBudget};
+#[cfg(feature = "store")]
 pub use snapshot::{DueItem, NodeRef, SegRef, Snapshot};
+#[cfg(feature = "store")]
 pub use store::{Config, Durability, Store};
-pub use traverse::{EdgeRef, LendingIterator, Neighbors};
+#[cfg(feature = "store")]
+pub use traverse::{Direction, EdgeRef, Hop, LendingIterator, Neighbors, Walk};
+#[cfg(feature = "store")]
 pub use ttl::{Outcome, TtlConfig};
+#[cfg(feature = "store")]
 pub use writer::{DocRecord, SegmentRecord, Touch, Writer};
 
-#[cfg(feature = "llm")]
-pub use enrich::{EnrichContext, Enricher, Enrichment};
-
 /// Convenient single-line import of the working set.
+#[cfg(feature = "store")]
 pub mod prelude {
     pub use crate::{
         Config, DocRecord, Durability, EdgeType, Error, Hit, LendingIterator, NodeId, NodeRef,
