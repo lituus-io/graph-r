@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! `graph.wal` — the append-only op log that extends a base generation.
@@ -377,7 +377,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<u64> {
     }
     let version = crate::bytesio::get_u16(bytes, 4);
     if version != VERSION {
-        return Err(Error::format(format!("unsupported wal version {version}")));
+        return Err(Error::Version { found: version, supported: VERSION });
     }
     let stored = crate::bytesio::get_u64(bytes, HEADER_LEN - 8);
     if xxh3_64(&bytes[..HEADER_LEN - 8]) != stored {

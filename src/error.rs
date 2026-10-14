@@ -1,7 +1,8 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
-//! Error taxonomy. Decoders return [`Error::Format`] rather than panicking on
+//! Error taxonomy. Decoders return [`Error::Format`] (or [`Error::Version`]
+//! for a well-formed file of another format version) rather than panicking on
 //! any malformed input — the property the fuzz targets enforce — and every
 //! concurrency- or lock-related refusal has its own variant so callers can
 //! distinguish "retry later" from "corrupt file".
@@ -43,12 +44,31 @@ pub enum Error {
         /// The originating I/O error.
         source: std::io::Error,
     },
+
+    /// A file written in a format version this build does not read (an
+    /// older store to rebuild, or a newer one from a later release). Its own
+    /// variant so a caller can tell "rebuild this" from "this is damaged"
+    /// without reading the message.
+    Version {
+        /// The version the file declares.
+        found: u16,
+        /// The one version this build reads and writes.
+        supported: u16,
+    },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Format { message } => write!(f, "format error: {message}"),
+            // Keeps the `format error: unsupported version N` prefix earlier
+            // releases printed, for callers that still match on the text.
+            Self::Version { found, supported } => {
+                write!(
+                    f,
+                    "format error: unsupported version {found} (this build reads {supported})"
+                )
+            }
             Self::Locked => f.write_str("store is locked by another writer"),
             Self::Busy { message } => write!(f, "store is busy: {message}"),
             Self::Corrupt { message } => write!(f, "store is corrupt: {message}"),

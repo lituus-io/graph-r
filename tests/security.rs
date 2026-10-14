@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! Security tests: the untrusted-input boundary and the access-control
@@ -383,4 +383,48 @@ fn only_supplied_metadata_reaches_the_base_file() {
         "a 4 KiB byte_range must store an offset, not the region ({} bytes)",
         bytes.len()
     );
+}
+
+/// A store written by another format version is refused with a typed error
+/// carrying both versions — never read as this build's layout, and never
+/// confused with damage (`Format`/`Corrupt`).
+#[test]
+fn another_format_version_is_a_typed_refusal() {
+    use graph_r::store::{BASE_FILE, WAL_FILE};
+    for (file, supported) in
+        [(BASE_FILE, graph_r::format::base::VERSION), (WAL_FILE, graph_r::format::wal::VERSION)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::create(dir.path(), Config::default()).unwrap());
+        let path = dir.path().join(file);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        for opened in [Store::open(dir.path()), Store::open_read_only(dir.path())] {
+            match opened {
+                Err(Error::Version { found, supported: s }) => {
+                    assert_eq!((found, s), (1, supported), "{file}");
+                }
+                other => panic!("{file}: expected Error::Version, got {other:?}"),
+            }
+        }
+        let text = Store::open(dir.path()).unwrap_err().to_string();
+        assert!(text.starts_with("format error: unsupported version 1"), "{text}");
+    }
+}
+
+/// The same refusal on a real store from the format-v1 line (written by the
+/// published 0.2.1 release: one compacted document plus one in the log).
+#[test]
+fn a_store_written_by_format_v1_is_a_typed_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/format_v1");
+    for f in [graph_r::store::BASE_FILE, graph_r::store::WAL_FILE] {
+        std::fs::copy(fixture.join(f), dir.path().join(f)).unwrap();
+    }
+    assert!(matches!(
+        Store::open(dir.path()),
+        Err(Error::Version { found: 1, supported: graph_r::format::base::VERSION })
+    ));
+    assert!(matches!(Store::open_read_only(dir.path()), Err(Error::Version { found: 1, .. })));
 }

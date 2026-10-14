@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Author: support@lituus.io
+# Author: spicyzhug@gmail.com
 # Copyright: lituus-io, all rights reserved
 #
 # Clone the sibling repositories pinned in .github/siblings next to this

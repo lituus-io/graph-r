@@ -4,6 +4,59 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.2
+
+Additive release: format v2 unchanged, every 0.4.1 API kept.
+
+**Fixed: a large attribute set lost data on the next open.** Each attribute
+value was capped at 256 KiB but a node's whole set was not, so a set whose
+values totalled more than about 1 MiB (four maximal values) was written as
+one log record over the 1 MiB record limit. The commit succeeded and the values read back in that session, but
+the next writable open treated the oversized record as a torn tail and
+truncated the log there — silently discarding that attribute set **and every
+commit made after it**. `Writer::set_attrs` now refuses a set over
+`writer::MAX_ATTR_BYTES` (what fits one record) before anything is staged.
+Stores that never wrote such a set are unaffected.
+
+**Python: the lineage model, enumeration, a typed format error, `close()`**
+- `Store.set_edges(url, [(dst, kind, exact)])` with `kind` in `contains`,
+  `derives`, `conditions` and `exact` the copy flag: a whole-set replacement
+  of `url`'s outbound edges (never a merge; `[]` clears). `url` and every
+  destination must be committed documents (`GraphRError`); an unknown kind,
+  a self-edge or more than 4096 edges is a `ValueError`.
+- `Store.out_edges(url)` / `Store.in_edges(url)`: `(url, kind, exact)`
+  lists. Both see an edge as soon as `set_edges` returns — `in_edges` reads
+  the reverse index from the last compaction plus every edge committed since.
+- `Store.walk(url, direction="out"|"in"|"both", depth=3, kinds=None,
+  limit=None)`: breadth-first, ordered by distance then url, each node once,
+  the start excluded, at most 10 000 urls by default. Built on
+  `Snapshot::walk` with a per-thread reusable `Walk`, outside the GIL.
+- `Store.set_attrs(url, {name: value})` / `Store.attrs(url)`: string
+  attributes (up to 64 names, 255-byte names, 256 KiB per name+value, 1 MiB
+  per node); `{}` for an unknown url.
+- `Store.urls(prefix="")`: every live document url under a prefix, sorted —
+  exhaustive where `query` is ranked. One pass over the documents.
+- `Store.close()`: releases the mapping, the writer lock and the runtime now;
+  later calls raise `GraphRError("store is closed")`; idempotent.
+- `FormatVersionError(GraphRError)` with `found` and `supported`, raised by
+  every open (and `reload_if_stale`) on a store of another format version.
+- Type stubs cover the whole `Store` surface.
+- Ids are canonicalised exactly as `add` stores them, which drops a
+  `#fragment`: `bq://p/d/t#c` and `bq://p/d/t` are one document. Give a
+  column its own path segment. Now stated in the README and pinned by a test.
+
+**Rust**
+- `Error::Version { found, supported }`: a well-formed file of another format
+  version (base or log) is now its own variant instead of `Error::Format`.
+  Its message keeps the `format error: unsupported version N` prefix. A
+  caller that matched `Error::Format` to detect an old store should match
+  `Error::Version`.
+- `Writer::set_named_attrs` / `Snapshot::named_attrs`: string-named
+  attributes in one shared encoding (`name NUL value`, keys in name order),
+  read back borrowed; `writer::MAX_ATTR_NAME`.
+- `Snapshot::walk_both`: one walk along outbound and inbound edges, each node
+  at its shortest distance either way.
+
 ## 0.4.1
 
 - Security: every lockfile (crate, Python binding, fuzz) refreshed to

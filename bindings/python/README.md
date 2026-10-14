@@ -34,6 +34,29 @@ store.sync("https://docs.example.com/", depth=2)   # unchanged: zero bodies
   check next, ranked by importance.
 - **Any producer.** `add`/`touch` are the writer seam for corpora that do not
   arrive by crawl.
+- **Lineage.** Typed edges (`contains`, `derives` with an exact-copy flag,
+  `conditions`) between documents, read in both directions, a breadth-first
+  `walk` up, down or both ways, and string attributes for large values:
+
+  ```python
+  store.set_edges(view_col, [(table_col, "derives", True)])   # replaces the set
+  store.walk(table, direction="in", depth=3, kinds=["derives"])  # downstream
+  store.set_attrs(view, {"sql": producing_sql, "type": "VIEW"})
+  ```
+
+  **Ids are canonicalised.** Every method keys a url exactly as `add`
+  stores it: scheme and host lower-cased; userinfo, a default port, one
+  trailing slash and the `#fragment` dropped; query parameters sorted (a
+  string that does not parse as a URL is kept verbatim). So `bq://p/d/t#c` and
+  `bq://p/d/t` are the *same* document — give a column its own path
+  segment (`bq://p/d/t/c`).
+- **Exhaustive listing.** `urls(prefix)` returns every live document under a
+  prefix, sorted — not ranked like `query`.
+- **Deterministic release.** `close()` drops the mapping and the writer lock
+  now, so the directory can be deleted (Windows refuses while a file is
+  mapped). A store written
+  by another format version raises `FormatVersionError` (a `GraphRError`)
+  with `found` and `supported`.
 - **Thread-safe.** Every method detaches from the interpreter; driving the
   store through `asyncio.to_thread` is the intended pattern.
 - **Durable.** An mmapped, checksummed store with write-ahead logging,

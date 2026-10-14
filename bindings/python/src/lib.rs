@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! Python bindings for `graph-r` (PyO3 + maturin).
@@ -11,6 +11,12 @@
 //! vectors never outlive the call. Lookups (`query`, `related`, `due`) answer
 //! with URLs and anchors, never content.
 //!
+//! The lineage model rides on the same store: typed edges (`set_edges`,
+//! `out_edges`, `in_edges`), node attributes (`set_attrs`, `attrs`) and a
+//! breadth-first `walk`, plus exhaustive enumeration (`urls`). Reads borrow
+//! from the snapshot until the one copy each string needs to become a Python
+//! object.
+//!
 //! Every method detaches from the interpreter around Rust work, and the class
 //! is deliberately not `unsendable`: consumers dispatch through thread pools
 //! (`asyncio.to_thread`), so the object must be usable from any thread.
@@ -18,20 +24,167 @@
 //! The wheel is built against the stable ABI (`abi3-py312`), so one artifact
 //! per platform serves every Python from 3.12 up.
 
+use graphr::format::base::eflags;
 use graphr::{
-    Config, DocRecord, Outcome, QueryOpts, SegmentRecord, Store, TokenBudget, Touch, UrlKey,
+    Config, DocRecord, EdgeType, LendingIterator as _, Outcome, QueryOpts, SegmentRecord, Snapshot,
+    Store, TokenBudget, Touch, UrlKey, Walk,
 };
 use linkr::{self as link_r, bridge};
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 create_exception!(graph_r, GraphRError, pyo3::exceptions::PyException);
+// A subclass, so callers that catch `GraphRError` keep working.
+create_exception!(graph_r, FormatVersionError, GraphRError);
 
 fn map_err(e: graphr::Error) -> PyErr {
     GraphRError::new_err(e.to_string())
+}
+
+/// [`map_err`] for the paths that can meet another build's files (opens and
+/// reloads): a format-version mismatch becomes a typed `FormatVersionError`
+/// carrying `found` and `supported`, so callers never parse the message.
+/// Needs the interpreter to set the attributes, so it runs after `detach`.
+fn map_open_err(py: Python<'_>, e: graphr::Error) -> PyErr {
+    let graphr::Error::Version { found, supported } = e else { return map_err(e) };
+    let err = FormatVersionError::new_err(e.to_string());
+    let value = err.value(py);
+    match value.setattr("found", found).and_then(|()| value.setattr("supported", supported)) {
+        Ok(()) => err,
+        Err(set) => set,
+    }
+}
+
+fn closed() -> PyErr {
+    GraphRError::new_err("store is closed")
+}
+
+/// Edges per node a `set_edges` call may carry (the store's own cap).
+const MAX_EDGES: usize = graphr::writer::MAX_EDGES;
+/// What `walk` returns at most when the caller sets no `limit`.
+const WALK_LIMIT: usize = 10_000;
+
+/// The edge-type vocabulary, by on-disk tag. `set_edges` accepts the three
+/// lineage kinds; reads and `walk(kinds=...)` know all six.
+const KINDS: [(&str, EdgeType); 6] = [
+    ("link", EdgeType::Link),
+    ("related", EdgeType::Related),
+    ("redirect", EdgeType::Redirect),
+    ("contains", EdgeType::Contains),
+    ("derives", EdgeType::Derives),
+    ("conditions", EdgeType::Conditions),
+];
+
+fn kind_name(t: EdgeType) -> &'static str {
+    KINDS.iter().find(|(_, k)| *k == t).map_or("unknown", |(n, _)| n)
+}
+
+fn parse_kind(s: &str) -> PyResult<EdgeType> {
+    KINDS.iter().find(|(n, _)| *n == s).map(|(_, k)| *k).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "kind must be one of 'link', 'related', 'redirect', 'contains', 'derives', \
+             'conditions'; got {s:?}"
+        ))
+    })
+}
+
+fn parse_lineage_kind(s: &str) -> PyResult<EdgeType> {
+    match s {
+        "contains" => Ok(EdgeType::Contains),
+        "derives" => Ok(EdgeType::Derives),
+        "conditions" => Ok(EdgeType::Conditions),
+        other => Err(PyValueError::new_err(format!(
+            "kind must be one of 'contains', 'derives', 'conditions'; got {other:?}"
+        ))),
+    }
+}
+
+/// Which way a walk goes, from the caller's vocabulary.
+#[derive(Clone, Copy)]
+enum Way {
+    Out,
+    In,
+    Both,
+}
+
+fn parse_direction(s: &str) -> PyResult<Way> {
+    match s {
+        "out" => Ok(Way::Out),
+        "in" => Ok(Way::In),
+        "both" => Ok(Way::Both),
+        other => Err(PyValueError::new_err(format!(
+            "direction must be one of 'out', 'in', 'both'; got {other:?}"
+        ))),
+    }
+}
+
+/// The url of `key` when it is a committed document (tombstoned included:
+/// tombstoning keeps history, and a tombstone's edges stay). Stubs and
+/// removed nodes have none.
+fn doc_url<'a>(snap: &'a Snapshot<'_>, key: UrlKey) -> Option<&'a str> {
+    snap.node(key).filter(|n| !n.is_stub() && !n.url.is_empty()).map(|n| n.url)
+}
+
+thread_local! {
+    /// One reusable walk state per thread: once its buffers have grown, a
+    /// walk allocates nothing per step.
+    static WALK: RefCell<Walk> = RefCell::new(Walk::new());
+}
+
+/// Strings copied once out of a snapshot into one buffer. A snapshot is not
+/// `Send`, so nothing it lends can leave `detach`; this is the single copy
+/// (and the single allocation) between the mmap and the Python objects.
+#[derive(Default)]
+struct Strs {
+    buf: String,
+    ends: Vec<usize>,
+}
+
+impl Strs {
+    fn with_capacity(bytes: usize, n: usize) -> Self {
+        Self { buf: String::with_capacity(bytes), ends: Vec::with_capacity(n) }
+    }
+
+    fn of<'a>(items: impl Iterator<Item = &'a str> + Clone) -> Self {
+        let (bytes, n) = items.clone().fold((0, 0), |(b, n), s| (b + s.len(), n + 1));
+        let mut out = Self::with_capacity(bytes, n);
+        for s in items {
+            out.push(s);
+        }
+        out
+    }
+
+    fn push(&mut self, s: &str) {
+        self.buf.push_str(s);
+        self.ends.push(self.buf.len());
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        let starts = std::iter::once(0).chain(self.ends.iter().copied());
+        starts.zip(self.ends.iter()).map(|(a, &b)| &self.buf[a..b])
+    }
+}
+
+/// `(url, kind, exact)` edges, with their urls in one buffer.
+struct Edges {
+    urls: Strs,
+    meta: Vec<(EdgeType, bool)>,
+}
+
+impl Edges {
+    fn into_py<'py>(self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(
+            py,
+            self.urls.iter().zip(&self.meta).map(|(url, &(t, exact))| (url, kind_name(t), exact)),
+        )
+    }
 }
 
 fn map_linkr(e: link_r::Error) -> PyErr {
@@ -186,8 +339,17 @@ impl PySyncReport {
 ///
 /// Deliberately not `unsendable`: `Store` and the runtime are both `Send`,
 /// and consumers dispatch through thread pools (`asyncio.to_thread`).
+///
+/// The handle sits behind a lock so `close()` can release the mapping and
+/// the writer lock deterministically: every call holds the read side for its
+/// duration (one uncontended atomic), `close()` takes the write side, waits
+/// for calls in flight on other threads, and drops the store.
 #[pyclass(name = "Store")]
 struct PyStore {
+    open: RwLock<Option<Open>>,
+}
+
+struct Open {
     inner: Store,
     rt: tokio::runtime::Runtime,
 }
@@ -219,37 +381,38 @@ fn merge_report(
 }
 
 fn wrap(inner: Store) -> PyResult<PyStore> {
-    Ok(PyStore { inner, rt: runtime()? })
+    Ok(PyStore { open: RwLock::new(Some(Open { inner, rt: runtime()? })) })
 }
 
 #[pymethods]
 impl PyStore {
     /// Create a fresh store in `path` (errors if one already exists there).
     #[staticmethod]
-    fn create(path: String) -> PyResult<Self> {
-        wrap(Store::create(&path, Config::default()).map_err(map_err)?)
+    fn create(py: Python<'_>, path: String) -> PyResult<Self> {
+        wrap(Store::create(&path, Config::default()).map_err(|e| map_open_err(py, e))?)
     }
 
-    /// Open an existing store read-write (errors if missing or locked).
+    /// Open an existing store read-write (errors if missing or locked;
+    /// `FormatVersionError` if another format version wrote it).
     #[staticmethod]
-    fn open(path: String) -> PyResult<Self> {
-        wrap(Store::open(&path).map_err(map_err)?)
+    fn open(py: Python<'_>, path: String) -> PyResult<Self> {
+        wrap(Store::open(&path).map_err(|e| map_open_err(py, e))?)
     }
 
     /// Open the store at `path`, creating it first if it does not exist.
     #[staticmethod]
-    fn open_or_create(path: String) -> PyResult<Self> {
+    fn open_or_create(py: Python<'_>, path: String) -> PyResult<Self> {
         let exists = Path::new(&path).join("graph.base").exists();
         let inner =
             if exists { Store::open(&path) } else { Store::create(&path, Config::default()) };
-        wrap(inner.map_err(map_err)?)
+        wrap(inner.map_err(|e| map_open_err(py, e))?)
     }
 
     /// Open read-only: takes no lock, so it coexists with a live writer in
     /// another process. Mutating methods raise `GraphRError`.
     #[staticmethod]
-    fn open_read_only(path: String) -> PyResult<Self> {
-        wrap(Store::open_read_only(&path).map_err(map_err)?)
+    fn open_read_only(py: Python<'_>, path: String) -> PyResult<Self> {
+        wrap(Store::open_read_only(&path).map_err(|e| map_open_err(py, e))?)
     }
 
     /// Acquire `source` and absorb the result — the whole loop in one call.
@@ -314,38 +477,40 @@ impl PyStore {
                 ));
             }
             return py.detach(|| {
-                self.rt.block_on(async {
-                    let seed = bridge::crawl_seed(&self.inner);
-                    let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
-                    let mut update = index
-                        .update_github(&source)
-                        .map_err(map_linkr)?
-                        .concurrency(concurrency)
-                        .validators(seed.validators);
-                    // GitHub Enterprise (and hermetic tests): the pairing
-                    // guard above already ensured both bases move together.
-                    if let (Some(api), Some(raw)) = (&api_base, &raw_base) {
-                        update = update.bases(api.as_str(), raw.as_str());
-                    }
-                    if let Some(d) = depth {
-                        update = update.depth(d);
-                    }
-                    if let Some(b) = max_bytes {
-                        update = update.max_bytes(b);
-                    }
-                    for ext in extensions.into_iter().flatten() {
-                        update = update.accept_extension(ext);
-                    }
-                    if let Some(t) = token {
-                        update = update.token(t);
-                    }
-                    if pin {
-                        update = update.pin();
-                    }
-                    let report = update.run().await.map_err(map_linkr)?;
-                    let ingest =
-                        bridge::ingest_update(&self.inner, &index, &report).map_err(map_err)?;
-                    Ok(merge_report(&report, &ingest))
+                self.with(|o| {
+                    o.rt.block_on(async {
+                        let seed = bridge::crawl_seed(&o.inner);
+                        let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
+                        let mut update = index
+                            .update_github(&source)
+                            .map_err(map_linkr)?
+                            .concurrency(concurrency)
+                            .validators(seed.validators);
+                        // GitHub Enterprise (and hermetic tests): the pairing
+                        // guard above already ensured both bases move together.
+                        if let (Some(api), Some(raw)) = (&api_base, &raw_base) {
+                            update = update.bases(api.as_str(), raw.as_str());
+                        }
+                        if let Some(d) = depth {
+                            update = update.depth(d);
+                        }
+                        if let Some(b) = max_bytes {
+                            update = update.max_bytes(b);
+                        }
+                        for ext in extensions.into_iter().flatten() {
+                            update = update.accept_extension(ext);
+                        }
+                        if let Some(t) = token {
+                            update = update.token(t);
+                        }
+                        if pin {
+                            update = update.pin();
+                        }
+                        let report = update.run().await.map_err(map_linkr)?;
+                        let ingest =
+                            bridge::ingest_update(&o.inner, &index, &report).map_err(map_err)?;
+                        Ok(merge_report(&report, &ingest))
+                    })
                 })
             });
         }
@@ -357,36 +522,39 @@ impl PyStore {
         }
         let crawl_scope = parse_scope(scope.as_deref())?;
         py.detach(|| {
-            self.rt.block_on(async {
-                let seed = bridge::crawl_seed(&self.inner);
-                let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
-                let mut update = index
-                    .update(source)
-                    .depth(depth.unwrap_or(2))
-                    .max_pages(max_pages)
-                    .concurrency(concurrency)
-                    .scope(crawl_scope)
-                    .min_delay(Duration::from_millis(min_delay_ms))
-                    .validators(seed.validators)
-                    .known_edges(seed.known_edges);
-                for substring in path_contains.into_iter().flatten() {
-                    update = update.require_path(substring);
-                }
-                for ext in extensions.into_iter().flatten() {
-                    update = update.accept_extension(ext);
-                }
-                for substring in index_path_contains.into_iter().flatten() {
-                    update = update.index_path(substring);
-                }
-                if let Some(t) = token {
-                    update = update.token(t);
-                }
-                if pin {
-                    update = update.pin();
-                }
-                let crawl = update.run().await.map_err(map_linkr)?;
-                let ingest = bridge::ingest_update(&self.inner, &index, &crawl).map_err(map_err)?;
-                Ok(merge_report(&crawl, &ingest))
+            self.with(|o| {
+                o.rt.block_on(async {
+                    let seed = bridge::crawl_seed(&o.inner);
+                    let mut index = link_r::LinkIndex::in_memory().map_err(map_linkr)?;
+                    let mut update = index
+                        .update(source)
+                        .depth(depth.unwrap_or(2))
+                        .max_pages(max_pages)
+                        .concurrency(concurrency)
+                        .scope(crawl_scope)
+                        .min_delay(Duration::from_millis(min_delay_ms))
+                        .validators(seed.validators)
+                        .known_edges(seed.known_edges);
+                    for substring in path_contains.into_iter().flatten() {
+                        update = update.require_path(substring);
+                    }
+                    for ext in extensions.into_iter().flatten() {
+                        update = update.accept_extension(ext);
+                    }
+                    for substring in index_path_contains.into_iter().flatten() {
+                        update = update.index_path(substring);
+                    }
+                    if let Some(t) = token {
+                        update = update.token(t);
+                    }
+                    if pin {
+                        update = update.pin();
+                    }
+                    let crawl = update.run().await.map_err(map_linkr)?;
+                    let ingest =
+                        bridge::ingest_update(&o.inner, &index, &crawl).map_err(map_err)?;
+                    Ok(merge_report(&crawl, &ingest))
+                })
             })
         })
     }
@@ -401,26 +569,28 @@ impl PyStore {
         k: usize,
         depth: u8,
         budget_tokens: u32,
-    ) -> Vec<PyHit> {
+    ) -> PyResult<Vec<PyHit>> {
         py.detach(|| {
-            let snap = self.inner.snapshot();
-            let opts = QueryOpts {
-                limit: k,
-                depth,
-                budget: TokenBudget(budget_tokens),
-                ..QueryOpts::default()
-            };
-            snap.query(&text, &opts).into_iter().map(PyHit::from).collect()
+            self.read(|snap| {
+                let opts = QueryOpts {
+                    limit: k,
+                    depth,
+                    budget: TokenBudget(budget_tokens),
+                    ..QueryOpts::default()
+                };
+                snap.query(&text, &opts).into_iter().map(PyHit::from).collect()
+            })
         })
     }
 
     /// The `k` documents most related to `url` (outbound links and similarity
     /// edges), strongest first.
     #[pyo3(signature = (url, k=10))]
-    fn related(&self, py: Python<'_>, url: String, k: usize) -> Vec<PyHit> {
+    fn related(&self, py: Python<'_>, url: String, k: usize) -> PyResult<Vec<PyHit>> {
         py.detach(|| {
-            let snap = self.inner.snapshot();
-            snap.related(bridge::key_of(&url), k).into_iter().map(PyHit::from).collect()
+            self.read(|snap| {
+                snap.related(bridge::key_of(&url), k).into_iter().map(PyHit::from).collect()
+            })
         })
     }
 
@@ -428,19 +598,20 @@ impl PyStore {
     /// the stored validator to send as `If-None-Match`. `sync` consumes this
     /// implicitly; it is exposed for callers driving their own fetch loop.
     #[pyo3(signature = (limit=64, now_ms=None))]
-    fn due(&self, py: Python<'_>, limit: usize, now_ms: Option<u64>) -> Vec<PyDueItem> {
+    fn due(&self, py: Python<'_>, limit: usize, now_ms: Option<u64>) -> PyResult<Vec<PyDueItem>> {
         py.detach(|| {
             let now = now_ms.unwrap_or_else(bridge::now_ms);
-            let snap = self.inner.snapshot();
-            snap.due(now, limit)
-                .into_iter()
-                .map(|d| PyDueItem {
-                    url: d.url.to_owned(),
-                    etag: d.etag.map(str::to_owned),
-                    overdue_ms: d.overdue_ms,
-                    rank_permille: d.rank_permille,
-                })
-                .collect()
+            self.read(|snap| {
+                snap.due(now, limit)
+                    .into_iter()
+                    .map(|d| PyDueItem {
+                        url: d.url.to_owned(),
+                        etag: d.etag.map(str::to_owned),
+                        overdue_ms: d.overdue_ms,
+                        rank_permille: d.rank_permille,
+                    })
+                    .collect()
+            })
         })
     }
 
@@ -466,41 +637,43 @@ impl PyStore {
         links: Option<Vec<String>>,
     ) -> PyResult<()> {
         py.detach(|| {
-            let url = bridge::canonical(&url);
-            let key = UrlKey::of(&url);
-            let mut w = self.inner.writer().map_err(map_err)?;
-            w.upsert_node(&DocRecord {
-                url: &url,
-                url_key: key,
-                content_hash,
-                fetched_at_ms: fetched_at_ms.unwrap_or_else(bridge::now_ms),
-                title: title.as_deref(),
-                snippet: snippet.as_deref(),
-                etag: etag.as_deref(),
-                pinned,
+            self.with(|o| {
+                let url = bridge::canonical(&url);
+                let key = UrlKey::of(&url);
+                let mut w = o.inner.writer().map_err(map_err)?;
+                w.upsert_node(&DocRecord {
+                    url: &url,
+                    url_key: key,
+                    content_hash,
+                    fetched_at_ms: fetched_at_ms.unwrap_or_else(bridge::now_ms),
+                    title: title.as_deref(),
+                    snippet: snippet.as_deref(),
+                    etag: etag.as_deref(),
+                    pinned,
+                })
+                .map_err(map_err)?;
+                if let Some(segs) = &segments {
+                    let records: Vec<SegmentRecord<'_>> = segs
+                        .iter()
+                        .map(|(label, depth, importance)| SegmentRecord {
+                            label,
+                            byte_range: None,
+                            depth: *depth,
+                            importance: *importance,
+                        })
+                        .collect();
+                    w.set_segments(key, &records).map_err(map_err)?;
+                }
+                if let Some(links) = &links {
+                    let edges: Vec<(UrlKey, graphr::EdgeType, u16)> = links
+                        .iter()
+                        .map(|l| (bridge::key_of(l), graphr::EdgeType::Link, 65_535))
+                        .collect();
+                    w.set_edges(key, &edges);
+                }
+                w.commit().map_err(map_err)?;
+                Ok(())
             })
-            .map_err(map_err)?;
-            if let Some(segs) = &segments {
-                let records: Vec<SegmentRecord<'_>> = segs
-                    .iter()
-                    .map(|(label, depth, importance)| SegmentRecord {
-                        label,
-                        byte_range: None,
-                        depth: *depth,
-                        importance: *importance,
-                    })
-                    .collect();
-                w.set_segments(key, &records).map_err(map_err)?;
-            }
-            if let Some(links) = &links {
-                let edges: Vec<(UrlKey, graphr::EdgeType, u16)> = links
-                    .iter()
-                    .map(|l| (bridge::key_of(l), graphr::EdgeType::Link, 65_535))
-                    .collect();
-                w.set_edges(key, &edges);
-            }
-            w.commit().map_err(map_err)?;
-            Ok(())
         })
     }
 
@@ -520,20 +693,22 @@ impl PyStore {
     ) -> PyResult<bool> {
         let outcome = parse_outcome(&outcome)?;
         py.detach(|| {
-            let mut w = self.inner.writer().map_err(map_err)?;
-            let recorded = w
-                .touch(
-                    bridge::key_of(&url),
-                    Touch {
-                        checked_at_ms: checked_at_ms.unwrap_or_else(bridge::now_ms),
-                        outcome,
-                        content_hash,
-                        etag: etag.as_deref(),
-                    },
-                )
-                .map_err(map_err)?;
-            w.commit().map_err(map_err)?;
-            Ok(recorded)
+            self.with(|o| {
+                let mut w = o.inner.writer().map_err(map_err)?;
+                let recorded = w
+                    .touch(
+                        bridge::key_of(&url),
+                        Touch {
+                            checked_at_ms: checked_at_ms.unwrap_or_else(bridge::now_ms),
+                            outcome,
+                            content_hash,
+                            etag: etag.as_deref(),
+                        },
+                    )
+                    .map_err(map_err)?;
+                w.commit().map_err(map_err)?;
+                Ok(recorded)
+            })
         })
     }
 
@@ -552,10 +727,12 @@ impl PyStore {
     /// compaction. A later re-add is a new document at the same address.
     fn remove(&self, py: Python<'_>, url: String) -> PyResult<()> {
         py.detach(|| {
-            let mut w = self.inner.writer().map_err(map_err)?;
-            w.remove(bridge::key_of(&url)).map_err(map_err)?;
-            w.commit().map_err(map_err)?;
-            Ok(())
+            self.with(|o| {
+                let mut w = o.inner.writer().map_err(map_err)?;
+                w.remove(bridge::key_of(&url)).map_err(map_err)?;
+                w.commit().map_err(map_err)?;
+                Ok(())
+            })
         })
     }
 
@@ -563,7 +740,7 @@ impl PyStore {
     /// automatically past the configured thresholds, and after every `sync`).
     /// Returns the new generation number.
     fn compact(&self, py: Python<'_>) -> PyResult<u64> {
-        py.detach(|| self.inner.compact().map(|s| s.generation).map_err(map_err))
+        py.detach(|| self.with(|o| o.inner.compact().map(|s| s.generation).map_err(map_err)))
     }
 
     /// For read-only stores: pick up commits/compactions made by a writing
@@ -572,28 +749,282 @@ impl PyStore {
     /// grew, only the appended bytes are read. Returns True when anything new
     /// became visible; a no-op on a writable handle.
     fn reload_if_stale(&self, py: Python<'_>) -> PyResult<bool> {
-        py.detach(|| self.inner.reload_if_stale().map_err(map_err))
+        py.detach(|| self.with(|o| Ok(o.inner.reload_if_stale())))?.map_err(|e| map_open_err(py, e))
     }
 
     /// The base generation currently serving reads.
     #[getter]
-    fn generation(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.inner.snapshot().generation())
+    fn generation(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| self.read(|snap| snap.generation()))
     }
 
     /// Live (non-tombstoned) document count.
-    fn __len__(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.inner.len())
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        py.detach(|| self.with(|o| Ok(o.inner.len())))
+    }
+
+    /// Replace `url`'s typed outbound edges with `edges`, a list of
+    /// `(dst_url, kind, exact)`: `kind` is `'contains'`, `'derives'` or
+    /// `'conditions'`; `exact` marks an unchanged copy (`eflags::EXACT`).
+    ///
+    /// Whole-set replacement, never a merge: every earlier outbound edge of
+    /// `url` is gone — `links` recorded by `add` included — and `[]` clears
+    /// them. A repeated destination keeps its first entry. `url` and every
+    /// destination must be committed documents (`add` them first), or the
+    /// call raises `GraphRError` and changes nothing; an edge to `url` itself
+    /// or more than 4096 edges is a `ValueError`. Visible to `out_edges`,
+    /// `in_edges` and `walk` as soon as the call returns.
+    fn set_edges(
+        &self,
+        py: Python<'_>,
+        url: String,
+        edges: Vec<(String, String, bool)>,
+    ) -> PyResult<()> {
+        if edges.len() > MAX_EDGES {
+            return Err(PyValueError::new_err(format!(
+                "{} edges exceed the per-node cap of {MAX_EDGES}",
+                edges.len()
+            )));
+        }
+        let key = bridge::key_of(&url);
+        let mut staged: Vec<(UrlKey, EdgeType, u16, u8)> = Vec::with_capacity(edges.len());
+        for (dst, kind, exact) in &edges {
+            let dst_key = bridge::key_of(dst);
+            if dst_key == key {
+                return Err(PyValueError::new_err(format!("an edge from {url:?} to itself")));
+            }
+            let flags = if *exact { eflags::EXACT } else { 0 };
+            staged.push((dst_key, parse_lineage_kind(kind)?, 65_535, flags));
+        }
+        py.detach(|| {
+            self.with(|o| {
+                {
+                    let snap = o.inner.snapshot();
+                    if doc_url(&snap, key).is_none() {
+                        return Err(not_a_document(&url));
+                    }
+                    if let Some(i) = staged.iter().position(|e| doc_url(&snap, e.0).is_none()) {
+                        return Err(not_a_document(&edges[i].0));
+                    }
+                }
+                let mut w = o.inner.writer().map_err(map_err)?;
+                w.set_edges_with_flags(key, &staged);
+                w.commit().map_err(map_err)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// `url`'s outbound edges as `(dst_url, kind, exact)`, in destination
+    /// key order (stable for a given store state). An unknown url has none.
+    fn out_edges<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyList>> {
+        let key = bridge::key_of(&url);
+        py.detach(|| {
+            self.read(|snap| {
+                let mut found: Vec<(&str, EdgeType, bool)> = Vec::new();
+                let mut it = snap.neighbors(key);
+                while let Some(e) = it.next() {
+                    if let Some(u) = doc_url(snap, e.dst_key) {
+                        found.push((u, e.etype, e.flags & eflags::EXACT != 0));
+                    }
+                }
+                Edges {
+                    urls: Strs::of(found.iter().map(|f| f.0)),
+                    meta: found.iter().map(|f| (f.1, f.2)).collect(),
+                }
+            })
+        })?
+        .into_py(py)
+    }
+
+    /// The edges pointing at `url` as `(src_url, kind, exact)`. Reads the
+    /// reverse index written at compaction plus the committed edges since,
+    /// so it agrees with `out_edges` at every moment — before and after
+    /// `compact()`.
+    fn in_edges<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyList>> {
+        let key = bridge::key_of(&url);
+        py.detach(|| {
+            self.read(|snap| {
+                let mut found: Vec<(&str, EdgeType, bool)> = Vec::new();
+                snap.in_edges(key, |src, t, flags, _| {
+                    if let Some(u) = doc_url(snap, src) {
+                        found.push((u, t, flags & eflags::EXACT != 0));
+                    }
+                });
+                Edges {
+                    urls: Strs::of(found.iter().map(|f| f.0)),
+                    meta: found.iter().map(|f| (f.1, f.2)).collect(),
+                }
+            })
+        })?
+        .into_py(py)
+    }
+
+    /// The documents reachable from `url` within `depth` hops, breadth
+    /// first: ordered by distance, then url; each once, `url` itself never.
+    /// `direction` is `'out'` (what `url` points at: upstream lineage),
+    /// `'in'` (what points at it: downstream impact) or `'both'`. `kinds`
+    /// limits the edge types followed (default: all). At most `limit` urls
+    /// (default 10000) — the nearest ones. An unknown url reaches nothing.
+    #[pyo3(signature = (url, direction="out", depth=3, kinds=None, limit=None))]
+    fn walk<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        direction: &str,
+        depth: u32,
+        kinds: Option<Vec<String>>,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let way = parse_direction(direction)?;
+        // Known kinds are tags 0..=6: one bit each.
+        let mask: u8 = match &kinds {
+            None => u8::MAX,
+            Some(ks) => {
+                ks.iter().try_fold(0u8, |m, k| parse_kind(k).map(|t| m | 1 << t.as_tag()))?
+            }
+        };
+        let follow = move |t: EdgeType| t.as_tag() < 8 && mask & (1 << t.as_tag()) != 0;
+        let limit = limit.unwrap_or(WALK_LIMIT);
+        let key = bridge::key_of(&url);
+        let urls = py.detach(|| {
+            self.read(|snap| {
+                if limit == 0 || doc_url(snap, key).is_none() {
+                    return Strs::default();
+                }
+                let mut reached: Vec<(u32, &str)> = Vec::new();
+                // Expanding stops once `limit` documents are in hand. Every
+                // node up to that distance was still reached (its frontier
+                // was expanded before the count filled), so the nearest
+                // `limit` by (distance, url) are exactly the first `limit`
+                // after sorting.
+                let visit = |h: graphr::Hop| match doc_url(snap, h.key) {
+                    Some(u) => {
+                        reached.push((h.depth, u));
+                        reached.len() < limit
+                    }
+                    None => false, // a stub or removed node: not a document
+                };
+                WALK.with_borrow_mut(|w| match way {
+                    Way::Out => snap.walk(key, graphr::Direction::Out, depth, follow, w, visit),
+                    Way::In => snap.walk(key, graphr::Direction::In, depth, follow, w, visit),
+                    Way::Both => snap.walk_both(key, depth, follow, w, visit),
+                });
+                reached.sort_unstable();
+                reached.truncate(limit);
+                Strs::of(reached.iter().map(|r| r.1))
+            })
+        })?;
+        PyList::new(py, urls.iter())
+    }
+
+    /// Replace `url`'s attributes with `mapping` (`str -> str`): values
+    /// for large text beside a node (a table's SQL, a column's type).
+    /// Whole-set replacement; `{}` clears. Limits: at most 64 names, each
+    /// 1-255 UTF-8 bytes without NUL; a name plus its value at most 262143
+    /// bytes; all values together under 1 MiB — beyond any of them
+    /// `ValueError`. `url` must be a committed document (`GraphRError`).
+    fn set_attrs(
+        &self,
+        py: Python<'_>,
+        url: String,
+        mapping: HashMap<String, String>,
+    ) -> PyResult<()> {
+        let key = bridge::key_of(&url);
+        py.detach(|| {
+            self.with(|o| {
+                if doc_url(&o.inner.snapshot(), key).is_none() {
+                    return Err(not_a_document(&url));
+                }
+                let pairs: Vec<(&str, &str)> =
+                    mapping.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let mut w = o.inner.writer().map_err(map_err)?;
+                // The writer refuses only the shape of the set (sizes, names).
+                w.set_named_attrs(key, &pairs).map_err(|e| PyValueError::new_err(e.to_string()))?;
+                w.commit().map_err(map_err)?;
+                Ok(())
+            })
+        })
+    }
+
+    /// `url`'s attributes as a `dict` (`{}` for an unknown url).
+    fn attrs<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyDict>> {
+        let key = bridge::key_of(&url);
+        let pairs = py.detach(|| {
+            self.read(|snap| {
+                let mut out = Strs::default();
+                snap.named_attrs(key, |name, value| {
+                    out.push(name);
+                    out.push(value);
+                });
+                out
+            })
+        })?;
+        let dict = PyDict::new(py);
+        let mut it = pairs.iter();
+        while let (Some(name), Some(value)) = (it.next(), it.next()) {
+            dict.set_item(name, value)?;
+        }
+        Ok(dict)
+    }
+
+    /// Every committed, non-tombstoned document url starting with `prefix`,
+    /// sorted. Exhaustive, not ranked: one pass over the node records
+    /// (O(documents)) plus a sort of the matches — the store keeps no
+    /// url-ordered index.
+    #[pyo3(signature = (prefix=""))]
+    fn urls<'py>(&self, py: Python<'py>, prefix: &str) -> PyResult<Bound<'py, PyList>> {
+        let urls = py.detach(|| {
+            self.read(|snap| {
+                let mut found: Vec<&str> = Vec::new();
+                snap.for_each_live(|n| {
+                    if !n.url.is_empty() && n.url.starts_with(prefix) {
+                        found.push(n.url);
+                    }
+                });
+                found.sort_unstable();
+                Strs::of(found.iter().copied())
+            })
+        })?;
+        PyList::new(py, urls.iter())
+    }
+
+    /// Release the store now: the mapping, the writer lock and the private
+    /// runtime. Waits for calls in flight on other threads; every later
+    /// call raises `GraphRError("store is closed")`. Idempotent.
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| {
+            let open = self.open.write().unwrap_or_else(PoisonError::into_inner).take();
+            drop(open);
+        });
     }
 }
 
+fn not_a_document(url: &str) -> PyErr {
+    GraphRError::new_err(format!("not a committed document: {url:?}"))
+}
+
 impl PyStore {
+    /// Run `f` on the open store, or refuse once `close()` has run. Call it
+    /// inside `detach`: it may wait for a `close()` in progress.
+    fn with<R>(&self, f: impl FnOnce(&Open) -> PyResult<R>) -> PyResult<R> {
+        let open = self.open.read().unwrap_or_else(PoisonError::into_inner);
+        f(open.as_ref().ok_or_else(closed)?)
+    }
+
+    /// Run `f` on a fresh snapshot of the open store.
+    fn read<R>(&self, f: impl FnOnce(&Snapshot<'_>) -> R) -> PyResult<R> {
+        self.with(|o| Ok(f(&o.inner.snapshot())))
+    }
+
     fn set_pin(&self, py: Python<'_>, url: &str, pinned: bool) -> PyResult<bool> {
         py.detach(|| {
-            let mut w = self.inner.writer().map_err(map_err)?;
-            let changed = w.set_pinned(bridge::key_of(url), pinned).map_err(map_err)?;
-            w.commit().map_err(map_err)?;
-            Ok(changed)
+            self.with(|o| {
+                let mut w = o.inner.writer().map_err(map_err)?;
+                let changed = w.set_pinned(bridge::key_of(url), pinned).map_err(map_err)?;
+                w.commit().map_err(map_err)?;
+                Ok(changed)
+            })
         })
     }
 }
@@ -607,6 +1038,7 @@ fn graph_r(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDueItem>()?;
     m.add_class::<PySyncReport>()?;
     m.add("GraphRError", m.py().get_type::<GraphRError>())?;
+    m.add("FormatVersionError", m.py().get_type::<FormatVersionError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

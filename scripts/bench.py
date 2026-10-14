@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Author: support@lituus.io
+# Author: spicyzhug@gmail.com
 # Copyright: lituus-io, all rights reserved
 """Record and check criterion benchmark baselines.
 

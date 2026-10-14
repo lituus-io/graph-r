@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! Read views. A [`Snapshot`] pins one base generation plus the overlay ops
@@ -562,6 +562,20 @@ impl<'s> Snapshot<'s> {
             // Validated at open: in bounds and UTF-8.
             f(rec[0], std::str::from_utf8(&blobs[o..o + l]).unwrap_or(""));
         }
+    }
+
+    /// Every named attribute of `key` (see [`crate::Writer::set_named_attrs`])
+    /// in name order, as `(name, value)` borrowed from the mmap or overlay.
+    /// Records written without a name ([`crate::Writer::set_attrs`]) carry
+    /// no NUL and are skipped.
+    pub fn named_attrs<'a>(&'a self, key: UrlKey, mut f: impl FnMut(&'a str, &'a str)) {
+        self.attrs(key, |_, rec| {
+            if let Some((name, value)) = rec.split_once('\0') {
+                if !name.is_empty() {
+                    f(name, value);
+                }
+            }
+        });
     }
 
     /// The node's segments (anchors). Overlay whole-set replacement wins.

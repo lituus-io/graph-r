@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Author: support@lituus.io
+# Author: spicyzhug@gmail.com
 # Copyright: lituus-io, all rights reserved
 #
 # Run graph-r's CI gates locally, in CI order: fmt, clippy, feature matrix,
