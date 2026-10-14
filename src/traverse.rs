@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! Zero-alloc traversal. [`LendingIterator`] is the crate's GAT seam: each

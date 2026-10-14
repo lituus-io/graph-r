@@ -1,4 +1,4 @@
-# Author: support@lituus.io
+# Author: spicyzhug@gmail.com
 # Copyright: lituus-io, all rights reserved
 #
 # Cross-thread access to a Store. The link-r binding shipped (pre-release)

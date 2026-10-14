@@ -1,4 +1,4 @@
-// Author: support@lituus.io
+// Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
 //! Error taxonomy. Decoders return [`Error::Format`] (or [`Error::Version`]
