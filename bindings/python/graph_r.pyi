@@ -3,12 +3,34 @@
 #
 # Type stubs for the graph_r native extension module.
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 __version__: str
 
+#: (Stub-only aliases.) Edge types written by ``set_edges``.
+_LineageKind = Literal["contains", "derives", "conditions"]
+#: Edge types ``walk(kinds=...)`` follows: the lineage kinds plus crawl edges
+#: (``link`` from ``add(links=...)``, ``related``, ``redirect``).
+_WalkKind = Literal["link", "related", "redirect", "contains", "derives", "conditions"]
+#: Every edge type a read reports: the above, and ``unknown`` for a type a
+#: later release writes.
+_EdgeKind = Literal[_WalkKind, "unknown"]
+#: One edge: ``(other_url, kind, exact)``.
+_Edge = Tuple[str, _EdgeKind, bool]
+
 class GraphRError(Exception):
-    """Raised when a graph-r (or embedded link-r) operation fails."""
+    """Raised when a graph-r (or embedded link-r) operation fails, and by
+    every call on a closed store (``"store is closed"``)."""
+
+class FormatVersionError(GraphRError):
+    """The store on disk was written in a format version this build does not
+    read (an older store to rebuild, or a newer one). Raised by ``open``,
+    ``open_or_create`` and ``open_read_only`` (and ``reload_if_stale``)."""
+
+    found: int
+    """The version the file declares."""
+    supported: int
+    """The one version this build reads and writes."""
 
 class Anchor:
     """A sub-document anchor on a hit: fetch the URL and resolve the heading
@@ -74,7 +96,8 @@ class Store:
         """Create a fresh store in ``path`` (errors if one already exists)."""
     @staticmethod
     def open(path: str) -> "Store":
-        """Open an existing store read-write (errors if missing or locked)."""
+        """Open an existing store read-write (errors if missing or locked;
+        ``FormatVersionError`` if another format version wrote it)."""
     @staticmethod
     def open_or_create(path: str) -> "Store":
         """Open the store at ``path``, creating it first if absent."""
@@ -182,3 +205,52 @@ class Store:
         """The base generation currently serving reads."""
     def __len__(self) -> int:
         """Live (non-tombstoned) document count."""
+    def set_edges(self, url: str, edges: Sequence[Tuple[str, _LineageKind, bool]]) -> None:
+        """Replace ``url``'s outbound edges with ``edges``: ``(dst_url, kind,
+        exact)``, ``exact`` marking an unchanged copy along ``derives``.
+
+        Whole-set replacement, never a merge — earlier edges (``links`` from
+        ``add`` included) are gone, and ``[]`` clears. A repeated destination
+        keeps its first entry. ``url`` and every destination must be committed
+        documents, else ``GraphRError`` and nothing changes. An unknown kind,
+        an edge to ``url`` itself, or more than 4096 edges is a ``ValueError``.
+        Visible to ``out_edges``, ``in_edges`` and ``walk`` on return.
+        """
+    def out_edges(self, url: str) -> List[_Edge]:
+        """``url``'s outbound edges as ``(dst_url, kind, exact)``, in a stable
+        order. ``[]`` for an unknown url; edges to removed documents are
+        omitted."""
+    def in_edges(self, url: str) -> List[_Edge]:
+        """The edges pointing at ``url`` as ``(src_url, kind, exact)``. Always
+        agrees with ``out_edges`` — before and after ``compact()``."""
+    def walk(
+        self,
+        url: str,
+        direction: Literal["out", "in", "both"] = "out",
+        depth: int = 3,
+        kinds: Optional[Sequence[_WalkKind]] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """The documents reachable from ``url`` within ``depth`` hops, breadth
+        first: ordered by distance, then url; each once; ``url`` itself never.
+
+        ``'out'`` follows what ``url`` points at (upstream lineage), ``'in'``
+        what points at it (downstream impact), ``'both'`` either. ``kinds``
+        limits the edge types followed (default all). At most ``limit`` urls,
+        the nearest ones (default 10000). ``[]`` for an unknown url.
+        """
+    def set_attrs(self, url: str, mapping: Dict[str, str]) -> None:
+        """Replace ``url``'s attributes (``{}`` clears). At most 64 names of
+        1-255 UTF-8 bytes without NUL; a name plus its value at most 262143
+        bytes; all values together under 1 MiB — else ``ValueError``.
+        ``url`` must be a committed document (``GraphRError``)."""
+    def attrs(self, url: str) -> Dict[str, str]:
+        """``url``'s attributes (``{}`` for an unknown url)."""
+    def urls(self, prefix: str = "") -> List[str]:
+        """Every live (committed, non-tombstoned) document url starting with
+        ``prefix``, sorted. Exhaustive, not ranked; one pass over the
+        documents plus a sort of the matches."""
+    def close(self) -> None:
+        """Release the mapping, the writer lock and the runtime now, after
+        calls in flight on other threads finish. Later calls raise
+        ``GraphRError("store is closed")``. Idempotent."""
