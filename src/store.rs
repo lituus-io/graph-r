@@ -2,7 +2,8 @@
 // Copyright: lituus-io, all rights reserved
 //
 //! The store: a directory holding `graph.base` (immutable snapshot),
-//! `graph.wal` (append-only op log) and `graph.lock` (commit exclusion).
+//! `graph.wal` (append-only op log), `graph.lock` (commit exclusion) and
+//! `graph.wait` (the queue of writers waiting for it).
 //!
 //! # Concurrency model
 //!
@@ -11,8 +12,12 @@
 //!   exclusive is the *commit*: [`Writer::commit`], [`Store::transact`] and
 //!   compaction take an exclusive `flock` on `graph.lock` only around the
 //!   append (and its fsync) and release it straight after. A busy lock is
-//!   retried with exponential backoff (1 ms doubling to 50 ms) for up to
-//!   [`Config::lock_wait`], then refused with [`Error::Locked`]. `flock` is
+//!   retried with exponential backoff (250 µs doubling to 2 ms) for up to
+//!   [`Config::lock_wait`], then refused with [`Error::Locked`]. Waiting is
+//!   fair: a waiter holds a shared lock on `graph.wait`, and a writer that
+//!   finds anyone waiting queues behind them instead of taking the commit
+//!   lock first, so one writer committing back to back cannot starve the
+//!   rest. `flock` is
 //!   per open file description, so two handles in one process exclude each
 //!   other exactly like two processes; within one handle a mutex serializes
 //!   [`Writer`]s across threads.
@@ -189,46 +194,104 @@ pub struct CommitLock {
 #[derive(Debug)]
 pub(crate) struct Held(pub(crate) fs::File);
 
-/// Open `dir`'s lock file. The path is fixed (`dir/graph.lock`), and a lock
-/// file that is not a regular file — a symlink planted to make the store
-/// create or lock a file elsewhere — is refused.
-fn open_lock_file(dir: &Path) -> Result<fs::File> {
-    let path = lock_path(dir);
+/// Open one of `dir`'s lock files (`name` is [`LOCK_FILE`] or
+/// [`WAIT_FILE`]). The path is fixed, and a lock file that is not a regular
+/// file — a symlink planted to make the store create or lock a file
+/// elsewhere — is refused.
+fn open_guarded(dir: &Path, name: &str) -> Result<fs::File> {
+    let path = dir.join(name);
     match fs::symlink_metadata(&path) {
         Ok(md) if !md.file_type().is_file() => {
-            return Err(Error::corrupt(format!("{LOCK_FILE} is not a regular file")));
+            return Err(Error::corrupt(format!("{name} is not a regular file")));
         }
         _ => {}
     }
     Ok(fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?)
 }
 
-/// Lock `file`, retrying with exponential backoff (1 ms doubling to 50 ms)
-/// for up to `wait`; `Error::Locked` past it.
-fn lock_within(file: &fs::File, wait: Duration) -> Result<()> {
-    let mut start = None;
-    let mut nap = Duration::from_millis(1);
-    loop {
-        #[cfg(test)]
-        probe::bump(&probe::LOCKS, 1);
-        match file.try_lock() {
-            Ok(()) => return Ok(()),
-            Err(fs::TryLockError::WouldBlock) => {}
-            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
-        let left = wait.saturating_sub(start.get_or_insert_with(Instant::now).elapsed());
-        if left.is_zero() {
-            return Err(Error::Locked);
-        }
-        std::thread::sleep(nap.min(left));
-        nap = (nap * 2).min(Duration::from_millis(50));
+/// The pause before the first retry of a held commit lock, and the longest
+/// pause between retries. A waiter retries at least every [`NAP_MAX`], which
+/// is also how long a writer queued behind waiters stands back.
+const NAP_MIN: Duration = Duration::from_micros(250);
+const NAP_MAX: Duration = Duration::from_millis(2);
+
+/// One attempt on the commit lock.
+fn try_commit_lock(lock: &fs::File) -> Result<bool> {
+    #[cfg(test)]
+    probe::bump(&probe::LOCKS, 1);
+    match lock.try_lock() {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
-/// Take `dir`'s commit lock on a fresh descriptor.
+/// Take the commit lock on `lock`, waiting up to `wait`; `Error::Locked`
+/// past it.
+///
+/// Fair to waiters. A writer that has to wait announces itself with a shared
+/// lock on `turnstile` (`graph.wait`) for as long as it waits. A writer that
+/// finds anyone announced does not take the commit lock ahead of them, even
+/// when it is free: it announces itself too and stands back one full pause,
+/// in which every earlier waiter retries. Without this a writer committing
+/// back to back holds the lock through each fsync and frees it for
+/// microseconds, a gap a polling waiter almost never lands in, and the
+/// waiter times out. A no-wait call (`wait` zero) never jumps the queue
+/// either. Uncontended, this is one probe of `turnstile` and one attempt on
+/// the commit lock; nothing blocks, and nothing spins.
+fn lock_within(lock: &fs::File, turnstile: &fs::File, wait: Duration) -> Result<()> {
+    #[cfg(test)]
+    probe::bump(&probe::TURNSTILE, 1);
+    let queued = match turnstile.try_lock() {
+        Ok(()) => {
+            turnstile.unlock()?;
+            if try_commit_lock(lock)? {
+                return Ok(());
+            }
+            false
+        }
+        Err(fs::TryLockError::WouldBlock) => true,
+        Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+    };
+    if wait.is_zero() {
+        return Err(Error::Locked);
+    }
+    let start = Instant::now();
+    let left = || wait.saturating_sub(start.elapsed());
+    // Announce. Only another writer's probe above holds `turnstile`
+    // exclusively, for two calls, so this lands within microseconds.
+    loop {
+        match turnstile.try_lock_shared() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if left().is_zero() {
+            return Err(Error::Locked);
+        }
+        std::thread::sleep(NAP_MIN.min(left()));
+    }
+    let mut nap = if queued { NAP_MAX } else { NAP_MIN };
+    let won = loop {
+        let l = left();
+        if l.is_zero() {
+            break Err(Error::Locked);
+        }
+        std::thread::sleep(nap.min(l));
+        nap = (nap * 2).min(NAP_MAX);
+        match try_commit_lock(lock) {
+            Ok(false) => {}
+            done => break done.map(|_| ()),
+        }
+    };
+    let _ = turnstile.unlock();
+    won
+}
+
+/// Take `dir`'s commit lock on fresh descriptors.
 fn lock_dir(dir: &Path, wait: Duration) -> Result<Held> {
-    let file = open_lock_file(dir)?;
-    lock_within(&file, wait)?;
+    let file = open_guarded(dir, LOCK_FILE)?;
+    lock_within(&file, &open_guarded(dir, WAIT_FILE)?, wait)?;
     Ok(Held(file))
 }
 
@@ -239,8 +302,10 @@ pub(crate) mod probe {
     use std::cell::Cell;
     use std::thread::LocalKey;
     thread_local! {
-        /// Lock attempts (`try_lock` calls).
+        /// Commit-lock attempts (`try_lock` calls).
         pub(crate) static LOCKS: Cell<u64> = const { Cell::new(0) };
+        /// Lock acquisitions begun (one probe of `graph.wait` each).
+        pub(crate) static TURNSTILE: Cell<u64> = const { Cell::new(0) };
         /// Log fsyncs by commits.
         pub(crate) static FSYNCS: Cell<u64> = const { Cell::new(0) };
         /// Log bytes read by tail catch-ups.
@@ -337,6 +402,9 @@ pub const BASE_FILE: &str = "graph.base";
 pub const WAL_FILE: &str = "graph.wal";
 /// File name of the commit lock inside a store directory.
 pub const LOCK_FILE: &str = "graph.lock";
+/// File name of the commit lock's wait queue inside a store directory: each
+/// writer waiting for the commit lock holds a shared lock on it.
+pub const WAIT_FILE: &str = "graph.wait";
 
 /// Paths inside a store directory.
 pub(crate) fn base_path(dir: &Path) -> PathBuf {
@@ -344,9 +412,6 @@ pub(crate) fn base_path(dir: &Path) -> PathBuf {
 }
 pub(crate) fn wal_path(dir: &Path) -> PathBuf {
     dir.join(WAL_FILE)
-}
-fn lock_path(dir: &Path) -> PathBuf {
-    dir.join(LOCK_FILE)
 }
 
 /// Write `bytes` to `path` atomically (see [`crate::fsio::write_atomic`]).
@@ -714,9 +779,19 @@ impl Store {
     pub(crate) fn acquire(&self, state: &mut WriteState, wait: Duration) -> Result<Held> {
         let file = match state.lock_file.take() {
             Some(f) => f,
-            None => open_lock_file(&self.dir)?,
+            None => open_guarded(&self.dir, LOCK_FILE)?,
         };
-        match lock_within(&file, wait) {
+        if state.wait_file.is_none() {
+            match open_guarded(&self.dir, WAIT_FILE) {
+                Ok(t) => state.wait_file = Some(t),
+                Err(e) => {
+                    state.lock_file = Some(file);
+                    return Err(e);
+                }
+            }
+        }
+        let turnstile = state.wait_file.as_ref().expect("opened above");
+        match lock_within(&file, turnstile, wait) {
             Ok(()) => Ok(Held(file)),
             Err(e) => {
                 state.lock_file = Some(file);
@@ -1343,6 +1418,7 @@ mod tests {
         drop(lock_dir(dir.path(), Duration::ZERO).expect("the lock is free after open"));
         probe::take(&probe::LOCKS);
         probe::take(&probe::FSYNCS);
+        probe::take(&probe::TURNSTILE);
         store
             .transact(|tx| {
                 for i in 0..100 {
@@ -1352,10 +1428,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(probe::take(&probe::LOCKS), 1, "one lock per transaction");
+        assert_eq!(probe::take(&probe::TURNSTILE), 1, "one wait-queue probe per transaction");
         assert_eq!(probe::take(&probe::FSYNCS), 1, "one fsync per transaction");
         assert_eq!(other.len(), 0);
         assert!(other.reload_if_stale().unwrap());
         assert_eq!(other.len(), 100);
+    }
+
+    /// A writer never takes the commit lock ahead of an announced waiter,
+    /// even a free one: a no-wait call is refused, and a waiting call stands
+    /// back one pause before its single attempt. With the queue empty, a
+    /// no-wait call goes straight through.
+    #[test]
+    fn a_writer_queues_behind_an_announced_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let waiter = open_guarded(dir.path(), WAIT_FILE).unwrap();
+        waiter.try_lock_shared().unwrap();
+        let r = store.try_transact(|tx| tx.upsert_node(&doc("https://x.dev/a", 1)));
+        assert!(matches!(r, Err(Error::Locked)), "jumped the queue: {r:?}");
+        probe::take(&probe::LOCKS);
+        store.transact(|tx| tx.upsert_node(&doc("https://x.dev/a", 1))).unwrap();
+        assert_eq!(probe::take(&probe::LOCKS), 1, "tried the lock before standing back");
+        waiter.unlock().unwrap();
+        store.try_transact(|tx| tx.upsert_node(&doc("https://x.dev/b", 2))).unwrap();
+        assert_eq!(store.len(), 2);
     }
 
     /// Counted: a catch-up reads exactly the bytes appended since the

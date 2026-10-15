@@ -1,10 +1,11 @@
 // Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
-//! The commit lock's file. Its path is fixed — `<store dir>/graph.lock` —
-//! so nothing a caller writes (a url, a key, an attribute) can steer where
-//! the lock is created, and a lock file planted as a symlink to somewhere
-//! else is refused rather than followed.
+//! The commit lock's files. Their paths are fixed — `<store dir>/graph.lock`
+//! and its wait queue `<store dir>/graph.wait` — so nothing a caller writes
+//! (a url, a key, an attribute) can steer where either is created, and
+//! either planted as a symlink to somewhere else is refused rather than
+//! followed.
 
 #![cfg(feature = "store")]
 use graph_r::prelude::*;
@@ -53,8 +54,10 @@ fn no_url_key_or_attribute_steers_the_lock_file() {
     }
     a.compact().unwrap();
     assert_eq!(names(root.path()), BTreeSet::from(["s".to_owned()]), "nothing beside the store");
-    let want: BTreeSet<String> =
-        ["graph.base", "graph.lock", "graph.wal"].into_iter().map(str::to_owned).collect();
+    let want: BTreeSet<String> = ["graph.base", "graph.lock", "graph.wait", "graph.wal"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     assert_eq!(names(&dir), want, "only the store's own files inside it");
     assert_eq!(a.len(), hostile.len());
 }
@@ -74,4 +77,20 @@ fn a_lock_file_planted_as_a_symlink_is_refused_not_followed() {
     let opened = Store::open_or_create(root.path().join("t"), Config::default()).unwrap();
     drop(opened);
     assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_wait_file_planted_as_a_symlink_is_refused_not_followed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("s");
+    let store = Store::create(&dir, Config::default()).unwrap();
+    store.transact(|tx| tx.upsert_node(&doc("https://x.dev/a"))).unwrap();
+    let target = root.path().join("elsewhere");
+    let other = Store::open(&dir).unwrap();
+    let _ = std::fs::remove_file(dir.join(graph_r::store::WAIT_FILE));
+    std::os::unix::fs::symlink(&target, dir.join(graph_r::store::WAIT_FILE)).unwrap();
+    let r = other.transact(|tx| tx.upsert_node(&doc("https://x.dev/b")));
+    assert!(matches!(r, Err(Error::Corrupt { .. })), "{r:?}");
+    assert!(!target.exists(), "the wait file was created through the symlink");
 }

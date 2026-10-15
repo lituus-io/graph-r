@@ -537,7 +537,7 @@ def test_no_method_reads_or_writes_outside_the_store_directory(tmp_path):
             store.set_attrs(probe, {"a": "b"})
     store.compact()
     assert sorted(os.listdir(tmp_path)) == ["g", "secret.txt"]
-    assert sorted(os.listdir(tmp_path / "g")) == ["graph.base", "graph.lock", "graph.wal"]
+    assert sorted(os.listdir(tmp_path / "g")) == ["graph.base", "graph.lock", "graph.wait", "graph.wal"]
     assert secret.read_text() == "do-not-read"
 
 
