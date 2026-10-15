@@ -4,6 +4,73 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0
+
+Concurrent writers. The on-disk format is unchanged — base and log bytes are
+identical to 0.4.x for the same ops, and 0.4.x stores open as they are.
+
+**Many writers per store.** Opening a store read-write takes no lock any
+more: any number of writable handles, in one process or many, may be open on
+one directory. What is exclusive is the commit. `Writer::commit`,
+`Store::transact` and compaction take the `flock` on `graph.lock` only around
+their append (and fsync), retrying a busy lock with exponential backoff (1 ms
+doubling to 50 ms) for up to the new `Config::lock_wait` (default 10 s), then
+`Error::Locked` — which now means "waited past `lock_wait`", with the ops
+still staged. Under the lock a committer first catches up: two `stat`s; a new
+base (another handle compacted) is installed through the generation ring; a
+grown log has only its appended bytes read; the sequence counter advances to
+the file's. Sequence numbers stay strictly increasing across every writer.
+
+- `Store::transact(|tx| ...)`: a serializable read-modify-write. The lock is
+  taken and the handle caught up before the closure runs and held until its
+  single append — one lock and one fsync however many ops it stages.
+  `Txn::snapshot()` is the caught-up committed state; `Err` from the closure
+  aborts with nothing written. `Store::try_transact` never waits (`Locked` at
+  once), for callers that retry on their own schedule.
+- `Store::commit_lock` / `try_commit_lock` + `Store::transact_with`: the same
+  transaction across several calls (what the Python binding's `with` block
+  uses). `CommitLock` and `Txn` are exported.
+- `Store::open_or_create`: safe when many processes race to create one store.
+- A torn tail left by a writer that died mid-append is truncated by the next
+  committer, under the lock (and at open when the lock happens to be free).
+- `reload_if_stale` now works on writable handles too; on one whose `Writer`
+  is busy on another thread it returns `false` instead of waiting.
+- A failed append is cut back off the log, so it writes nothing.
+- A `graph.lock` that is not a regular file (a planted symlink) is refused
+  rather than followed.
+- Readers never wait: a writer parked on the lock holds nothing a snapshot
+  needs.
+
+**Fixed: data loss on concurrent first creation.** Two processes creating
+the same store at the same moment could both lay down a fresh base and log;
+the later one replaced a store the other had already committed to, silently
+dropping that commit (and a racing opener could fail with "No such file or
+directory"). Creation now happens once, under the commit lock, never
+replacing a file that exists — the log is written before the base, so a base
+on disk always has its log beside it — and a racing `open_or_create` waits
+for the creator and opens the result.
+
+**Behaviour changes.** A second `Store::open` on a directory with a live
+writable handle no longer fails with `Error::Locked` — it opens. Code that
+relied on the open-time lock for exclusion must use the commit lock
+(`commit_lock`) instead. `Config` gained a field, so a struct literal needs
+`..Config::default()`. Contention is polled, not queued: under sustained
+back-to-back commits a waiter is not guaranteed a turn before `lock_wait`.
+The log has no batch marker, so a power loss during a multi-op append can
+still leave a prefix of it (as a multi-op commit always could).
+
+**Python**
+- Writable `Store`s coexist across processes; each write method is a one-op
+  transaction whose checks (`set_edges`, `set_attrs`) run under the lock.
+- `with store.transaction(wait=True) as tx:` — the lock is held from
+  `__enter__` to `__exit__`; `tx` has the store's read and write methods, its
+  writes commit together at exit (one append, one fsync) or are dropped when
+  the block raises. Plain writes on the same store wait for the block from
+  other threads and raise from the block's own thread.
+- `graph_r.LockedError(GraphRError)`: a typed "retry later", so callers stop
+  matching message text.
+- `open_or_create` is safe under concurrent creation (the fix above).
+
 ## 0.4.2
 
 Additive release: format v2 unchanged, every 0.4.1 API kept.
