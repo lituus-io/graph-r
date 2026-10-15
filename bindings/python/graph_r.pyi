@@ -3,7 +3,8 @@
 #
 # Type stubs for the graph_r native extension module.
 
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from types import TracebackType
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type
 
 __version__: str
 
@@ -31,6 +32,12 @@ class FormatVersionError(GraphRError):
     """The version the file declares."""
     supported: int
     """The one version this build reads and writes."""
+
+class LockedError(GraphRError):
+    """Another writer held the store's commit lock past the wait (ten
+    seconds; none for ``transaction(wait=False)``). Nothing was written:
+    retry later. A subclass of ``GraphRError``, so existing handlers keep
+    catching it."""
 
 class Anchor:
     """A sub-document anchor on a hit: fetch the URL and resolve the heading
@@ -89,6 +96,11 @@ class Store:
 
     Safe to use from any thread (e.g. via ``asyncio.to_thread``); blocking
     calls detach from the interpreter so other Python threads keep running.
+
+    Any number of writable handles, in any number of processes, may be open
+    on one path. Every write is a transaction: the commit lock is held only
+    for its append, and a writer that cannot get it within ten seconds raises
+    ``LockedError``. ``transaction()`` holds it across a block.
     """
 
     @staticmethod
@@ -96,11 +108,14 @@ class Store:
         """Create a fresh store in ``path`` (errors if one already exists)."""
     @staticmethod
     def open(path: str) -> "Store":
-        """Open an existing store read-write (errors if missing or locked;
-        ``FormatVersionError`` if another format version wrote it)."""
+        """Open an existing store read-write (errors if missing;
+        ``FormatVersionError`` if another format version wrote it). Takes no
+        lock: writable handles coexist."""
     @staticmethod
     def open_or_create(path: str) -> "Store":
-        """Open the store at ``path``, creating it first if absent."""
+        """Open the store at ``path``, creating it first if absent. Safe when
+        many processes race to create it: one creates, the others wait for it
+        and open the result."""
     @staticmethod
     def open_read_only(path: str) -> "Store":
         """Open read-only; coexists with a live writer in another process."""
@@ -191,11 +206,11 @@ class Store:
     def compact(self) -> int:
         """Fold the WAL into a fresh immutable base; returns the generation."""
     def reload_if_stale(self) -> bool:
-        """Pick up commits made by a writing process (read-only handles).
+        """Pick up commits and compactions made through other handles.
 
         Cheap when nothing changed: two file stats, no remap, no read. When
-        only the log grew, only the appended bytes are read. A no-op on a
-        writable handle.
+        only the log grew, only the appended bytes are read. Works on writable
+        handles too (which also catch up at every write).
         Returns True when anything new became visible.
         """
         ...
@@ -250,7 +265,82 @@ class Store:
         """Every live (committed, non-tombstoned) document url starting with
         ``prefix``, sorted. Exhaustive, not ranked; one pass over the
         documents plus a sort of the matches."""
+    def transaction(self, wait: bool = True) -> "Transaction":
+        """``with store.transaction() as tx:`` — a serializable block.
+
+        The commit lock is taken at entry (waiting up to ten seconds, else
+        ``LockedError``; at once with ``wait=False``), so ``tx``'s reads see
+        every writer's commits and no other writer can commit until the block
+        ends. ``tx`` has the store's read and write methods; the writes are
+        staged and committed together — one append, one fsync — at exit, or
+        dropped when the block raises. Reads show committed state, not the
+        block's own staged writes. On this store, plain writes from other
+        threads wait for the block; from the block's own thread they raise.
+        """
     def close(self) -> None:
-        """Release the mapping, the writer lock and the runtime now, after
+        """Release the mapping, the open files and the runtime now, after
         calls in flight on other threads finish. Later calls raise
         ``GraphRError("store is closed")``. Idempotent."""
+
+class Transaction:
+    """A block made by ``Store.transaction()``; use it with ``with``.
+
+    Writes are checked when called (``set_edges``/``set_attrs`` accept
+    documents added earlier in the block) and committed at exit; an error
+    from the store's limits surfaces at exit and aborts the whole block.
+    """
+
+    def __enter__(self) -> "Transaction": ...
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool: ...
+    def add(
+        self,
+        url: str,
+        *,
+        content_hash: int,
+        title: Optional[str] = None,
+        snippet: Optional[str] = None,
+        etag: Optional[str] = None,
+        pinned: bool = False,
+        fetched_at_ms: Optional[int] = None,
+        segments: Optional[List[Tuple[str, int, int]]] = None,
+        links: Optional[List[str]] = None,
+    ) -> None: ...
+    def touch(
+        self,
+        url: str,
+        outcome: str,
+        *,
+        content_hash: Optional[int] = None,
+        etag: Optional[str] = None,
+        checked_at_ms: Optional[int] = None,
+    ) -> bool:
+        """As ``Store.touch``: a committed document only."""
+    def pin(self, url: str) -> bool: ...
+    def unpin(self, url: str) -> bool: ...
+    def remove(self, url: str) -> None: ...
+    def set_edges(self, url: str, edges: Sequence[Tuple[str, _LineageKind, bool]]) -> None: ...
+    def set_attrs(self, url: str, mapping: Dict[str, str]) -> None: ...
+    def query(self, text: str, k: int = 20, depth: int = 3, budget_tokens: int = 2000) -> List[Hit]: ...
+    def related(self, url: str, k: int = 10) -> List[Hit]: ...
+    def due(self, limit: int = 64, now_ms: Optional[int] = None) -> List[DueItem]: ...
+    def out_edges(self, url: str) -> List[_Edge]: ...
+    def in_edges(self, url: str) -> List[_Edge]: ...
+    def walk(
+        self,
+        url: str,
+        direction: Literal["out", "in", "both"] = "out",
+        depth: int = 3,
+        kinds: Optional[Sequence[_WalkKind]] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]: ...
+    def attrs(self, url: str) -> Dict[str, str]: ...
+    def urls(self, prefix: str = "") -> List[str]: ...
+    @property
+    def generation(self) -> int: ...
+    def __len__(self) -> int:
+        """Committed live documents (the block's staged ones not counted)."""

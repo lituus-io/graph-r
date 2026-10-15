@@ -52,16 +52,22 @@ store.sync("https://docs.example.com/", depth=2)   # unchanged: zero bodies
   segment (`bq://p/d/t/c`).
 - **Exhaustive listing.** `urls(prefix)` returns every live document under a
   prefix, sorted — not ranked like `query`.
-- **Deterministic release.** `close()` drops the mapping and the writer lock
+- **Deterministic release.** `close()` drops the mapping and the open files
   now, so the directory can be deleted (Windows refuses while a file is
   mapped). A store written
   by another format version raises `FormatVersionError` (a `GraphRError`)
   with `found` and `supported`.
 - **Thread-safe.** Every method detaches from the interpreter; driving the
   store through `asyncio.to_thread` is the intended pattern.
+- **Many writers.** Any number of processes may hold a writable `Store` on
+  one path; `open_or_create` is safe when they race to create it. Each write
+  holds the commit lock only for its append; `with store.transaction() as
+  tx:` holds it across a block, so a read-modify-write is serializable and
+  the block commits as one append. A writer that cannot get the lock in ten
+  seconds raises `LockedError` (a `GraphRError`).
 - **Durable.** An mmapped, checksummed store with write-ahead logging,
-  crash-safe compaction, and lock-protected single-writer / many-reader
-  access — implemented in Rust, shipped as one `abi3` wheel per platform
+  crash-safe compaction, and many-writer / many-reader access — implemented
+  in Rust, shipped as one `abi3` wheel per platform
   (Python ≥ 3.12).
 
 Dual-licensed AGPL-3.0-or-later / commercial (contact spicyzhug@gmail.com).

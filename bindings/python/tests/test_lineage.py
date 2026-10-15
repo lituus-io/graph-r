@@ -446,11 +446,12 @@ def test_close_releases_the_store_and_the_directory_can_be_deleted(tmp_path):
     path = tmp_path / "g"
     store = lineage(path)
     store.set_attrs(V, {"type": "VIEW"})
-    with pytest.raises(graph_r.GraphRError, match="locked"):
-        graph_r.Store.open(str(path))
+    other = graph_r.Store.open(str(path))  # writable handles coexist (0.5)
+    assert other.attrs(V) == {"type": "VIEW"}
+    other.close()
     store.close()
     store.close()  # idempotent
-    reopened = graph_r.Store.open(str(path))  # the writer lock is free
+    reopened = graph_r.Store.open(str(path))
     assert reopened.attrs(V) == {"type": "VIEW"}
     reopened.close()
     shutil.rmtree(path)  # nothing mapped or locked: deletable on every OS
