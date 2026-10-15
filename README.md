@@ -23,7 +23,7 @@ re-searching, or shipping page bodies to a model on every question.
 ## Quick start (with link-r)
 
 ```toml
-uu-graph-r = "0.4"
+uu-graph-r = "0.5"
 uu-link-r = { version = "0.4", features = ["graph"] }   # the crawl → graph bridge
 ```
 
@@ -113,13 +113,19 @@ move compaction off the commit path.
 - **Storage**: two files. `graph.base` — an immutable, mmapped, checksummed,
   sectioned snapshot (fixed-width sorted node records, CSR edges, label heap,
   lexicon + delta-varint postings, ranks) read zero-copy; `graph.wal` — an
-  append-only op log with per-frame checksums, torn tails truncated on open.
+  append-only op log with per-frame checksums, a torn tail truncated by the
+  next committer.
   Compaction folds both into a new byte-reproducible base via atomic rename.
-- **Concurrency**: any number of snapshot readers, one writer (in-process
-  mutex + cross-process `flock`). Snapshots are borrow guards over a pinned
-  generation — readers never block on commits, and compaction swaps
-  generations under them. No `Arc`, no async runtime, one `unsafe` island
-  (mmap + flock).
+- **Concurrency**: any number of snapshot readers and any number of
+  writers, in one process or many. Opening takes no lock; each commit takes
+  a cross-process `flock` only around its append, catches up with other
+  writers' frames first, and gives up with `Error::Locked` past
+  `Config::lock_wait` (or at once, via `Store::try_transact`).
+  `Store::transact` holds the lock from its read view to its single append,
+  so a read-modify-write is serializable across processes. Snapshots are
+  borrow guards over a pinned generation — readers never block on commits
+  or on the lock, and compaction swaps generations under them. No `Arc`, no
+  async runtime, one `unsafe` island (mmap).
 - **Freshness**: every document carries an adaptive revalidation interval —
   grown 1.5× per unchanged check, cut 4× on change, clamped, biased by
   importance — and `due()` emits the work list, with stored ETags for

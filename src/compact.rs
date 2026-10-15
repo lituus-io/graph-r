@@ -13,7 +13,7 @@
 //! place before the WAL is reset; replay of the old WAL against the new base
 //! skips everything already folded, so any crash interleaving recovers.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::format::base::{
     self, encode_postings, nflags, push_label, write_lex_rec, write_node_rec, write_seg_rec,
     BaseWriter, Header, SectionKind, NO_LABEL,
@@ -22,7 +22,7 @@ use crate::format::wal;
 use crate::fsio::now_ms;
 use crate::key::{SegKey, UrlKey};
 use crate::rank;
-use crate::store::{atomic_write, base_path, wal_path, Store};
+use crate::store::{atomic_write, base_path, wal_path, Seen, Stamp, Store};
 use crate::traverse::LendingIterator;
 use crate::writer::WriteState;
 use compact_str::CompactString;
@@ -77,7 +77,8 @@ pub(crate) fn render_empty_base(generation: u64) -> Vec<u8> {
 }
 
 /// Fold the current generation + overlay into a new base and install it.
-/// Caller holds the writer mutex; staged ops must already be committed.
+/// Caller holds the writer mutex and the commit lock, on a caught-up handle;
+/// staged ops must already be committed.
 #[allow(clippy::too_many_lines)] // one linear render pass; splitting obscures the layout
 pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<CompactStats> {
     debug_assert!(state.staged_is_empty(), "compact with staged ops");
@@ -415,30 +416,23 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     state.disk_generation = new_generation;
     atomic_write(&wal_path(&store.dir), &wal::encode_header(new_generation, now_ms()))?;
     state.reset_after_compact(wal_applied_seq + 1);
+    // Until the install below succeeds this handle serves the old generation:
+    // forget the stamp so the next catch-up reloads (and installs) the new one.
+    state.seen = Seen::default();
     store.due.store(false, Ordering::Release);
 
     // ---- 5. install into a free ring slot -----------------------------------
+    // Every other slot pinned by a long-lived snapshot is `Busy`: the new base
+    // is durable on disk and the next catch-up installs it.
     let map = crate::mmap::MappedFile::open(&base_path(&store.dir))?;
     let dir = base::BaseDir::parse(map.bytes())?;
-    let mut pending = Some(crate::store::GenInner::from_parts(map, dir));
-    let cur = store.current.load(Ordering::Acquire);
-    for (i, slot) in store.gens.iter().enumerate() {
-        if i == cur {
-            continue;
-        }
-        if let Ok(mut wslot) = slot.inner.try_write() {
-            *wslot = pending.take();
-            drop(wslot);
-            slot.seq.store(new_generation, Ordering::Release);
-            store.current.store(i, Ordering::Release);
-            break;
-        }
-    }
-    if pending.is_some() {
-        // Every other slot is pinned by a long-lived snapshot. The new base
-        // is durable on disk; the in-memory swap happens on the next attempt.
-        return Err(Error::busy("all generation slots pinned by snapshots"));
-    }
+    store.install(crate::store::GenInner::from_parts(map, dir), new_generation)?;
+    state.seen = Seen {
+        stamp: Stamp::read(&store.dir),
+        wal_pos: wal::HEADER_LEN as u64,
+        log_current: true,
+        base_gen: new_generation,
+    };
 
     Ok(CompactStats {
         generation: new_generation,

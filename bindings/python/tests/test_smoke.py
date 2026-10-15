@@ -116,13 +116,16 @@ def test_open_or_create_both_ways(tmp_path):
     assert len(again) == 1
 
 
-def test_second_writer_is_refused(tmp_path):
+def test_a_second_writer_opens_and_waits_only_for_commits(tmp_path):
     path = str(tmp_path / "kb")
     first = graph_r.Store.create(path)
-    with pytest.raises(graph_r.GraphRError):
-        graph_r.Store.open(path)
-    del first
-    graph_r.Store.open(path)  # released on drop
+    second = graph_r.Store.open(path)  # writable handles coexist (0.5)
+    with first.transaction():
+        with pytest.raises(graph_r.LockedError):  # a commit is what excludes
+            with second.transaction(wait=False):
+                pass
+    second.add("https://x.dev/a", content_hash=1)
+    assert first.reload_if_stale() and len(first) == 1
 
 
 def test_bad_outcome_is_a_value_error(tmp_path):

@@ -20,7 +20,8 @@ pub enum Error {
         message: String,
     },
 
-    /// Another process holds the writer lock for this store directory.
+    /// Another writer held this store's commit lock for longer than
+    /// the store's `Config::lock_wait` (in this process or another).
     Locked,
 
     /// A bounded wait for internal capacity expired (e.g. every generation

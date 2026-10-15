@@ -3,5 +3,5 @@
 #
 # Sibling repositories this one builds against, cloned beside the checkout
 # at these exact refs (scripts/fetch-siblings.sh). Bumped with each release.
-link-r v0.4.1
-objstore-r v0.2.2
+link-r v0.4.2
+objstore-r v0.2.4

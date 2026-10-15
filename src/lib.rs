@@ -14,9 +14,10 @@
 //!
 //! - **Zero-copy reads.** The base snapshot is an mmapped, checksummed,
 //!   sectioned file; lookups binary-search fixed-width records in place.
-//! - **Readers never block.** Snapshots pin a generation lock-free; a single
-//!   writer appends to a WAL and publishes into an append-only overlay;
-//!   compaction swaps generations under readers without pausing them.
+//! - **Readers never block.** Snapshots pin a generation lock-free; writers
+//!   (any number, across processes) take turns appending to a WAL under a
+//!   commit-scoped lock and publish into an append-only overlay; compaction
+//!   swaps generations under readers without pausing them.
 //! - **Lifetimes over `Arc`.** [`Snapshot`], [`NodeRef`], hits, and iterators
 //!   are borrow guards tied to the [`Store`]; nothing is reference-counted.
 //! - **Determinism.** Compaction is byte-reproducible; ranking, communities,
@@ -33,7 +34,7 @@
 //! on this crate's core, so none of them is a dependency here:
 //!
 //! ```toml
-//! uu-graph-r = "0.4"
+//! uu-graph-r = "0.5"
 //! uu-link-r = { version = "0.4", features = ["graph"] }
 //! ```
 #![deny(unsafe_code)]
@@ -96,13 +97,13 @@ pub use query::{Anchor, Hit, QueryOpts, TokenBudget};
 #[cfg(feature = "store")]
 pub use snapshot::{DueItem, NodeRef, SegRef, Snapshot};
 #[cfg(feature = "store")]
-pub use store::{Config, Durability, Store};
+pub use store::{CommitLock, Config, Durability, Store};
 #[cfg(feature = "store")]
 pub use traverse::{Direction, EdgeRef, Hop, LendingIterator, Neighbors, Walk};
 #[cfg(feature = "store")]
 pub use ttl::{Outcome, TtlConfig};
 #[cfg(feature = "store")]
-pub use writer::{DocRecord, SegmentRecord, Touch, Writer};
+pub use writer::{DocRecord, SegmentRecord, Touch, Txn, Writer};
 
 /// Convenient single-line import of the working set.
 #[cfg(feature = "store")]
@@ -110,6 +111,6 @@ pub mod prelude {
     pub use crate::{
         Config, DocRecord, Durability, EdgeType, Error, Hit, LendingIterator, NodeId, NodeRef,
         Outcome, QueryOpts, Result, SegmentRecord, Snapshot, Store, TokenBudget, Touch, TtlConfig,
-        UrlKey, Writer,
+        Txn, UrlKey, Writer,
     };
 }

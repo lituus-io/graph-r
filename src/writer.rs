@@ -1,17 +1,20 @@
 // Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
-//! The single writer. Mutations are staged as WAL ops, made durable on
-//! [`Writer::commit`] (encode → append → fsync per policy), then published
-//! into the current generation's overlay where new snapshots see them
-//! immediately. Freshness math runs *here*, at touch time, and the computed
-//! state travels inside the op — replay never re-derives policy.
+//! Writers and transactions. Mutations are staged as WAL ops, made durable
+//! on [`Writer::commit`] (commit lock → catch up → encode → append → fsync
+//! per policy → unlock), then published into the current generation's
+//! overlay where new snapshots see them immediately. Freshness math runs
+//! *here*, at touch time, and the computed state travels inside the op —
+//! replay never re-derives policy. [`Txn`] is the serializable form: the
+//! lock is held from its read view to its append.
 
 use crate::error::{Error, Result};
 use crate::format::base::{nflags, sflags};
 use crate::format::wal::{encode_frame, Op, OwnedSeg};
 use crate::key::{EdgeType, UrlKey};
-use crate::store::{wal_path, Durability, Store};
+use crate::snapshot::Snapshot;
+use crate::store::{wal_path, CommitLock, Durability, Held, Seen, Store};
 use crate::ttl::Outcome;
 use compact_str::CompactString;
 use std::io::Write as _;
@@ -93,6 +96,11 @@ pub(crate) struct WriteState {
     /// durable base behind; numbering from this, not from the served
     /// snapshot, means a generation number is never reused.
     pub(crate) disk_generation: u64,
+    /// What this handle last saw of the files (see `Store::sync`).
+    pub(crate) seen: Seen,
+    /// The lock file, kept open between commits (unlocked) so a commit costs
+    /// one lock call, not an open as well.
+    pub(crate) lock_file: Option<std::fs::File>,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // file handle and op buffer are noise
@@ -111,6 +119,7 @@ impl WriteState {
         replayed_ops: usize,
         wal_bytes: u64,
         disk_generation: u64,
+        seen: Seen,
     ) -> Self {
         Self {
             next_seq,
@@ -120,7 +129,29 @@ impl WriteState {
             commits_since_sync: 0,
             wal: None,
             disk_generation,
+            seen,
+            lock_file: None,
         }
+    }
+
+    /// Forget the open log handle: the log may have been replaced.
+    pub(crate) fn drop_wal_handle(&mut self) {
+        self.wal = None;
+    }
+
+    /// Advance to what a catch-up found: the served generation's next
+    /// sequence number and overlay size, and the log offset consumed.
+    pub(crate) fn adopt(&mut self, next_seq: u64, overlay_ops: usize, generation: u64) {
+        self.next_seq = self.next_seq.max(next_seq);
+        self.ops_since_compact = overlay_ops;
+        self.wal_bytes = self.seen.wal_pos;
+        self.disk_generation = self.disk_generation.max(generation);
+    }
+
+    /// Unlock and keep the descriptor for the next commit.
+    pub(crate) fn release(&mut self, held: Held) {
+        let _ = held.0.unlock();
+        self.lock_file = Some(held.0);
     }
 
     pub(crate) fn reset_after_compact(&mut self, next_seq: u64) {
@@ -140,9 +171,10 @@ impl WriteState {
     }
 }
 
-/// The exclusive write handle; holds the store's writer mutex for its
-/// lifetime. Stage mutations, then [`Writer::commit`] to make them durable
-/// and visible.
+/// A handle's writer; holds the handle's writer mutex for its lifetime (so
+/// threads sharing one handle take turns). Stage mutations, then
+/// [`Writer::commit`] to make them durable and visible. Writers on other
+/// handles stage concurrently; commits take turns on the commit lock.
 #[derive(Debug)]
 pub struct Writer<'s> {
     store: &'s Store,
@@ -153,11 +185,14 @@ pub struct Writer<'s> {
     /// enrichment carry, the other tier's edges, freshness counters, node
     /// existence). Taking a fresh snapshot per staged op folds the overlay
     /// arena every time — during a bulk ingest that made staging O(batch ×
-    /// pending-ops). Nothing can commit while this writer holds the mutex, so
-    /// one snapshot is exactly as current as a fresh one for the whole batch;
-    /// [`Writer::commit`] drops it, both because the world changes there and so
-    /// the pinned generation slot is free before any auto-compaction installs.
-    snap: Option<crate::snapshot::Snapshot<'s>>,
+    /// pending-ops). Nothing on this handle can commit while this writer holds
+    /// the mutex, so one snapshot is as current as a fresh one for the whole
+    /// batch (other handles' commits arrive at the next catch-up; a
+    /// read-modify-write that must see them is a [`Store::transact`]).
+    /// [`Writer::commit`] drops it, both because the world changes there and
+    /// so the pinned generation slot is free before a catch-up or an
+    /// auto-compaction installs another.
+    snap: Option<Snapshot<'s>>,
 }
 
 fn check_label(name: &str, s: &str) -> Result<()> {
@@ -173,7 +208,7 @@ impl<'s> Writer<'s> {
     }
 
     /// The cached committed-state view (created on first use per batch).
-    fn view(&mut self) -> &crate::snapshot::Snapshot<'s> {
+    fn view(&mut self) -> &Snapshot<'s> {
         if self.snap.is_none() {
             self.snap = Some(self.store.snapshot());
         }
@@ -437,14 +472,28 @@ impl<'s> Writer<'s> {
         Ok(())
     }
 
-    /// Make staged ops durable and visible: encode frames, append to the
-    /// WAL, fsync per the configured [`Durability`], publish to the overlay,
-    /// then auto-compact past thresholds. Returns the last committed
-    /// sequence number.
+    /// Make staged ops durable and visible: take the commit lock (waiting up
+    /// to [`crate::Config::lock_wait`], else [`Error::Locked`] with the ops
+    /// still staged), catch up with other writers, encode frames, append to
+    /// the WAL, fsync per the configured [`Durability`], publish to the
+    /// overlay, auto-compact past thresholds, unlock. Returns the last
+    /// committed sequence number.
     pub fn commit(&mut self) -> Result<u64> {
         // The cached view is about to go stale, and its pinned generation slot
-        // must be free before any auto-compaction below installs a new one.
+        // must be free before a catch-up or auto-compaction installs another.
         self.snap = None;
+        if self.state.staged.is_empty() {
+            return Ok(self.state.next_seq.saturating_sub(1));
+        }
+        let held = self.store.acquire(&mut self.state, self.store.cfg.lock_wait)?;
+        let r = self.store.sync(&mut self.state, true).and_then(|_| self.append_held());
+        self.state.release(held);
+        r
+    }
+
+    /// The commit itself, with the commit lock held and the handle caught
+    /// up. A failed append is cut back off the log, so it writes nothing.
+    fn append_held(&mut self) -> Result<u64> {
         if self.state.staged.is_empty() {
             return Ok(self.state.next_seq.saturating_sub(1));
         }
@@ -460,26 +509,37 @@ impl<'s> Writer<'s> {
             self.state.wal =
                 Some(std::fs::OpenOptions::new().append(true).open(wal_path(&self.store.dir))?);
         }
-        {
-            let state = &mut *self.state;
-            let f = state.wal.as_mut().expect("opened above");
-            f.write_all(&buf)?;
-            f.flush()?;
-            let sync = match self.store.cfg.durability {
-                Durability::Always => true,
-                Durability::Batch(n) => {
-                    state.commits_since_sync += 1;
-                    state.commits_since_sync >= n.max(1)
-                }
-                Durability::Never => false,
-            };
-            if sync {
-                f.sync_all()?;
-                state.commits_since_sync = 0;
+        let durability = self.store.cfg.durability;
+        let state = &mut *self.state;
+        let f = state.wal.as_mut().expect("opened above");
+        let sync = match durability {
+            Durability::Always => true,
+            Durability::Batch(n) => state.commits_since_sync + 1 >= n.max(1),
+            Durability::Never => false,
+        };
+        let appended = f.write_all(&buf).and_then(|()| f.flush()).and_then(|()| {
+            if !sync {
+                return Ok(());
             }
+            #[cfg(test)]
+            crate::store::probe::bump(&crate::store::probe::FSYNCS, 1);
+            f.sync_all()
+        });
+        if let Err(e) = appended {
+            // Nothing of a failed append may survive: cut the log back to
+            // where it was (best effort; the next committer's repair would
+            // treat a partial frame as a torn tail anyway).
+            state.wal = None;
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(wal_path(&self.store.dir)) {
+                let _ = f.set_len(state.seen.wal_pos);
+                let _ = f.sync_all();
+            }
+            return Err(e.into());
         }
-        // Publish into the current generation (stable while we hold the
-        // writer mutex — only the writer compacts).
+        state.commits_since_sync = if sync { 0 } else { state.commits_since_sync + 1 };
+        state.seen.appended(buf.len() as u64);
+        // Publish into the current generation (stable: installs on this
+        // handle happen only under its writer mutex, which we hold).
         let cur = self.store.current.load(Ordering::Acquire);
         {
             let guard = self.store.gens[cur]
@@ -508,5 +568,112 @@ impl<'s> Writer<'s> {
             }
         }
         Ok(last)
+    }
+}
+
+/// A serializable transaction: the commit lock is held from before its read
+/// view is taken until its single append lands. Made by [`Store::transact`];
+/// stage through it like a [`Writer`], read through [`Txn::snapshot`].
+#[derive(Debug)]
+pub struct Txn<'t> {
+    w: Writer<'t>,
+}
+
+impl<'t> Txn<'t> {
+    /// The caught-up committed state — every writer's commits up to the
+    /// moment the lock was taken, and nothing can commit after it until this
+    /// transaction does. Ops staged in this transaction are not in it.
+    #[must_use]
+    pub fn snapshot(&self) -> &Snapshot<'t> {
+        self.w.snap.as_ref().expect("a transaction holds its view for its whole life")
+    }
+
+    /// [`Writer::upsert_node`].
+    pub fn upsert_node(&mut self, doc: &DocRecord<'_>) -> Result<()> {
+        self.w.upsert_node(doc)
+    }
+
+    /// [`Writer::set_segments`].
+    pub fn set_segments(&mut self, key: UrlKey, segs: &[SegmentRecord<'_>]) -> Result<()> {
+        self.w.set_segments(key, segs)
+    }
+
+    /// [`Writer::set_edges`].
+    pub fn set_edges(&mut self, key: UrlKey, edges: &[(UrlKey, EdgeType, u16)]) {
+        self.w.set_edges(key, edges);
+    }
+
+    /// [`Writer::set_edges_with_flags`].
+    pub fn set_edges_with_flags(&mut self, key: UrlKey, edges: &[(UrlKey, EdgeType, u16, u8)]) {
+        self.w.set_edges_with_flags(key, edges);
+    }
+
+    /// [`Writer::set_attrs`].
+    pub fn set_attrs(&mut self, key: UrlKey, attrs: &[(u8, &str)]) -> Result<()> {
+        self.w.set_attrs(key, attrs)
+    }
+
+    /// [`Writer::set_named_attrs`].
+    pub fn set_named_attrs(&mut self, key: UrlKey, attrs: &[(&str, &str)]) -> Result<()> {
+        self.w.set_named_attrs(key, attrs)
+    }
+
+    /// [`Writer::touch`], computed from this transaction's caught-up view.
+    pub fn touch(&mut self, key: UrlKey, t: Touch<'_>) -> Result<bool> {
+        self.w.touch(key, t)
+    }
+
+    /// [`Writer::set_pinned`].
+    pub fn set_pinned(&mut self, key: UrlKey, pinned: bool) -> Result<bool> {
+        self.w.set_pinned(key, pinned)
+    }
+
+    /// [`Writer::remove`].
+    pub fn remove(&mut self, key: UrlKey) -> Result<()> {
+        self.w.remove(key)
+    }
+}
+
+/// [`Store::transact`] / [`Store::transact_with`]: lock (unless the caller
+/// holds `lock`), catch up, run `f` on a caught-up view, then commit what it
+/// staged in one append — or, on `Err`, drop it with nothing written.
+pub(crate) fn transact<F, R>(
+    store: &Store,
+    lock: Option<&CommitLock>,
+    wait: std::time::Duration,
+    f: F,
+) -> Result<R>
+where
+    F: for<'t> FnOnce(&mut Txn<'t>) -> Result<R>,
+{
+    let mut txn = Txn { w: store.writer()? };
+    let held = match lock {
+        Some(_) => None,
+        None => Some(store.acquire(&mut txn.w.state, wait)?),
+    };
+    let r = run(store, &mut txn, f);
+    if let Some(h) = held {
+        txn.w.state.release(h);
+    }
+    r
+}
+
+fn run<'t, F, R>(store: &'t Store, txn: &mut Txn<'t>, f: F) -> Result<R>
+where
+    F: for<'x> FnOnce(&mut Txn<'x>) -> Result<R>,
+{
+    store.sync(&mut txn.w.state, true)?;
+    txn.w.snap = Some(store.snapshot());
+    // Ops a dropped, uncommitted writer left staged on this handle are kept
+    // (a writer's next commit includes them); an abort removes only its own.
+    let mark = txn.w.state.staged.len();
+    let out = f(txn);
+    txn.w.snap = None; // free the pinned slot before any auto-compaction
+    match out {
+        Ok(r) => txn.w.append_held().map(|_| r),
+        Err(e) => {
+            txn.w.state.staged.truncate(mark);
+            Err(e)
+        }
     }
 }

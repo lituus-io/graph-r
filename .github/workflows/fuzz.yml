@@ -27,9 +27,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One target per decoder that reads bytes this crate did not write.
-        # The invariant is uniform: any input yields a typed error, never a
-        # panic and never an over-allocation.
+        # One target per decoder that reads bytes this crate did not write
+        # (any input yields a typed error, never a panic and never an
+        # over-allocation), plus fuzz_two_writers: arbitrary schedules of two
+        # writers, compactions, aborts and torn tails never lose a committed
+        # op and never show an uncommitted one.
         target:
           - fuzz_base_parse
           - fuzz_wal_replay
@@ -37,6 +39,7 @@ jobs:
           - fuzz_postings_decode
           - fuzz_wal_committed_len
           - fuzz_open_image
+          - fuzz_two_writers
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the pinned sibling repositories
