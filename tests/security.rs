@@ -41,17 +41,44 @@ fn seed(dir: &std::path::Path) -> Store {
 
 // ---- access control -------------------------------------------------------
 
-/// The cross-process writer lock is the only thing standing between two BLI-style
-/// processes and a corrupted store. A second writer must be refused, not queued.
+/// The commit lock is the only thing standing between two writers and an
+/// interleaved log. A second read-write handle opens freely (since 0.5), but
+/// it cannot commit while another writer holds the lock: past `lock_wait` it
+/// is refused with `Error::Locked` — not queued forever, nothing written, its
+/// ops still staged for a retry.
 #[test]
-fn second_writer_on_the_same_store_is_refused() {
+fn a_commit_under_another_writers_lock_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let _first = seed(dir.path());
-    match Store::open(dir.path()) {
+    let first = seed(dir.path());
+    let cfg = Config { lock_wait: std::time::Duration::from_millis(20), ..Config::default() };
+    let second = Store::open_cfg(dir.path(), cfg).expect("a second writable handle opens");
+    let wal = dir.path().join(graph_r::store::WAL_FILE);
+    let before = std::fs::read(&wal).unwrap();
+    let held = first.commit_lock().unwrap();
+    let mut w = second.writer().unwrap();
+    let url = "https://x.dev/b";
+    w.upsert_node(&DocRecord {
+        url,
+        url_key: UrlKey::of(url),
+        content_hash: 1,
+        fetched_at_ms: 1,
+        title: None,
+        snippet: None,
+        etag: None,
+        pinned: false,
+    })
+    .unwrap();
+    match w.commit() {
         Err(Error::Locked) => {}
-        Ok(_) => panic!("a second writer acquired the lock"),
+        Ok(_) => panic!("a commit landed under another writer's lock"),
         Err(e) => panic!("expected Error::Locked, got {e}"),
     }
+    assert_eq!(std::fs::read(&wal).unwrap(), before, "a refused commit wrote nothing");
+    drop(held);
+    w.commit().expect("the staged op commits once the lock is free");
+    drop(w);
+    assert!(first.reload_if_stale().unwrap());
+    assert_eq!(first.len(), 2);
 }
 
 /// A read-only handle must refuse every mutating entry point. This is what lets
