@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "uu-link-r"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-stream",
  "bytes",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "uu-objstore-r"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "thiserror 1.0.69",
