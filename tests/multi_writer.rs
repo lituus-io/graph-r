@@ -10,6 +10,7 @@
 
 #![cfg(feature = "store")]
 use graph_r::prelude::*;
+use graph_r::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -140,7 +141,67 @@ fn child() {
             wait_for(&dir.join("release"));
             drop(held);
         }
+        // Commit back to back, no pause, until told to stop.
+        "hot" => {
+            let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
+            let store = Store::open(&dir).unwrap();
+            ready_then_go(&dir.join("go"), id);
+            let mut k = 0;
+            while !dir.join("stop").exists() {
+                let url = url_of(id, k % 64);
+                store.transact(|tx| tx.upsert_node(&doc(&url))).unwrap();
+                k += 1;
+            }
+            std::fs::write(dir.join(format!("hot.{id}")), k.to_string()).unwrap();
+        }
+        // A writer with a short patience committing now and then: report how
+        // many commits went through and how many were refused as Locked.
+        "polite" => {
+            let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
+            let commits: usize = args[2].parse().unwrap();
+            let cfg = Config { lock_wait: Duration::from_millis(300), ..Config::default() };
+            let store = Store::open_cfg(&dir, cfg).unwrap();
+            ready_then_go(&dir.join("go"), id);
+            let (mut ok, mut locked) = (0, 0);
+            for k in 0..commits {
+                let url = url_of(id, k);
+                match store.transact(|tx| tx.upsert_node(&doc(&url))) {
+                    Ok(()) => ok += 1,
+                    Err(Error::Locked) => locked += 1,
+                    Err(e) => panic!("{e}"),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::fs::write(dir.join("polite"), format!("{ok} {locked}")).unwrap();
+        }
         other => panic!("unknown role {other}"),
+    }
+}
+
+/// Two writers commit back to back, with no pause between commits, while a
+/// third commits now and then with a 300 ms patience. Each of the busy pair
+/// frees the lock for microseconds between its fsyncs; without a fair queue
+/// the third would almost never land in that gap and be refused. With it,
+/// every one of its commits goes through.
+#[test]
+fn writers_committing_back_to_back_cannot_starve_another() {
+    const COMMITS: usize = 40;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("s");
+    drop(Store::create(&dir, Config::default()).unwrap());
+    let d = dir.display().to_string();
+    let hot: Vec<Child> = (0..2).map(|id| spawn("hot", &[d.clone(), id.to_string()])).collect();
+    let polite = spawn("polite", &[d.clone(), "2".into(), COMMITS.to_string()]);
+    go_when_ready(&dir.join("go"), 3);
+    wait_all(vec![polite]);
+    std::fs::write(dir.join("stop"), b"").unwrap();
+    wait_all(hot);
+    let got = std::fs::read_to_string(dir.join("polite")).unwrap();
+    assert_eq!(got, format!("{COMMITS} 0"), "commits through, refused as Locked");
+    for id in 0..2 {
+        let n: usize =
+            std::fs::read_to_string(dir.join(format!("hot.{id}"))).unwrap().parse().unwrap();
+        assert!(n > COMMITS, "busy writer {id} kept committing too ({n})");
     }
 }
 

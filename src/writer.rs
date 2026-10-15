@@ -101,6 +101,8 @@ pub(crate) struct WriteState {
     /// The lock file, kept open between commits (unlocked) so a commit costs
     /// one lock call, not an open as well.
     pub(crate) lock_file: Option<std::fs::File>,
+    /// The wait-queue file (`graph.wait`), kept open likewise.
+    pub(crate) wait_file: Option<std::fs::File>,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // file handle and op buffer are noise
@@ -131,6 +133,7 @@ impl WriteState {
             disk_generation,
             seen,
             lock_file: None,
+            wait_file: None,
         }
     }
 

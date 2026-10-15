@@ -4,6 +4,37 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.1
+
+**Fair commit lock.** In 0.5.0 a writer waiting for the commit lock polled it
+with backoff up to 50 ms, while a writer committing back to back held it
+through each fsync and freed it for microseconds. The waiter almost never
+landed in that gap: next to one busy writer an occasional commit waited 1.5 s
+at the median and 5.6 s at worst, some were refused with `Locked` after the
+full `lock_wait`, and next to two busy writers one of those starved too.
+
+- A writer that has to wait now announces itself with a shared lock on a
+  new file, `graph.wait`, for as long as it waits. A writer that finds
+  anyone announced does not take the commit lock ahead of them, even when it
+  is free: it joins the queue and stands back one pause, in which every
+  earlier waiter retries. A no-wait call (`try_transact`, `try_commit_lock`,
+  Python `wait=False`) is refused with `Locked` rather than jump the queue.
+- Retries back off from 250 µs to 2 ms (was 1 ms to 50 ms), so a freed lock
+  is taken within about 2 ms under contention.
+- Measured with one busy writer: the occasional commit waits 4.9 ms at the
+  median and 14 ms at worst, and none is refused; two busy writers now split
+  the lock evenly. Uncontended, a commit is one probe of `graph.wait` plus
+  the one attempt on the commit lock it was before, with no measurable
+  change in commit latency (2.96 ms median, fsync-bound).
+- `graph.wait` is opened like `graph.lock`: a fixed name in the store
+  directory, and a non-regular file there (a planted symlink) is refused,
+  never followed. Writers from 0.5.0 and 0.4.x ignore it; exclusion is still
+  the commit lock alone, so mixing versions stays correct and only the
+  older writers are not fair.
+- New multi-process test: two writers committing back to back and a third
+  with a 300 ms `lock_wait`; all 40 of the third's commits go through. On
+  0.5.0's lock it got 1 of 40.
+
 ## 0.5.0
 
 Concurrent writers. The on-disk format is unchanged — base and log bytes are
