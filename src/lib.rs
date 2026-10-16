@@ -34,7 +34,7 @@
 //! on this crate's core, so none of them is a dependency here:
 //!
 //! ```toml
-//! uu-graph-r = "0.5"
+//! uu-graph-r = "0.6"
 //! uu-link-r = { version = "0.4", features = ["graph"] }
 //! ```
 #![deny(unsafe_code)]

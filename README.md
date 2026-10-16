@@ -23,7 +23,7 @@ re-searching, or shipping page bodies to a model on every question.
 ## Quick start (with link-r)
 
 ```toml
-uu-graph-r = "0.5"
+uu-graph-r = "0.6"
 uu-link-r = { version = "0.4", features = ["graph"] }   # the crawl → graph bridge
 ```
 
@@ -98,7 +98,7 @@ mirror.pull_into(dir).await?;                 // rebuild graph.base + graph.wal 
 let store = graph_r::Store::open(dir)?;       // the unchanged API
 mirror.acquire_lease("instance-7", 60_000).await?;
 // ... writer.commit() as usual ...
-mirror.publish(&store).await?;                // ships only the new WAL frames
+mirror.publish(&store).await?;                // ships only the new log records
 ```
 
 Remote layout: `HEAD` (a checksummed manifest, compare-and-swap only),
@@ -113,13 +113,25 @@ move compaction off the commit path.
 - **Storage**: two files. `graph.base` — an immutable, mmapped, checksummed,
   sectioned snapshot (fixed-width sorted node records, CSR edges, label heap,
   lexicon + delta-varint postings, ranks) read zero-copy; `graph.wal` — an
-  append-only op log with per-frame checksums, a torn tail truncated by the
-  next committer.
+  append-only log of one checksummed record per transaction.
   Compaction folds both into a new byte-reproducible base via atomic rename.
+- **Atomic transactions**: a commit or a `transact` block is one record —
+  one write, one fsync. A crash mid-append leaves a torn record that replay
+  ignores and the next committer cuts off: that transaction is absent whole,
+  every earlier one present. In memory too, a commit, a catch-up and a
+  replay each publish whole records, so no snapshot and no other process
+  ever sees part of a transaction. A record whose checksum holds but whose
+  contents break a rule is `Error::Corrupt` (with its offset) and is never
+  cut: cutting it would silently drop every later commit.
+- **Zero-copy log**: the log is read once at open and served in place — the
+  bytes a commit wrote, or a catch-up read, are the overlay, never decoded
+  into owned ops; strings come back as `&str` over validated bytes. A
+  steady-state commit allocates nothing after staging; opening 10k ops
+  allocates about what opening 1k does.
 - **Concurrency**: any number of snapshot readers and any number of
   writers, in one process or many. Opening takes no lock; each commit takes
   a cross-process `flock` only around its append, catches up with other
-  writers' frames first, and gives up with `Error::Locked` past
+  writers' records first, and gives up with `Error::Locked` past
   `Config::lock_wait` (or at once, via `Store::try_transact`).
   `Store::transact` holds the lock from its read view to its single append,
   so a read-modify-write is serializable across processes. Snapshots are
@@ -141,6 +153,28 @@ move compaction off the commit path.
   conditions as typed edges with reverse adjacency; one allocation-free
   `walk` up, down or both ways; large per-node attributes (SQL text, types,
   provenance), numbered or named.
+
+## Format versions and upgrading
+
+A store is refused, never rewritten, by a build that does not read its
+format: every opener returns `Error::Version { found, supported }` (Python
+`FormatVersionError` with `.found` and `.supported`) before anything is
+written, and the files stay byte-identical.
+
+| Store written by | Opened by 0.6        | Opened by 0.4 / 0.5  |
+|------------------|----------------------|----------------------|
+| 0.4.x, 0.5.x     | `Version { found: 2, supported: 3 }` | reads it |
+| 0.6.x            | reads it             | `Version { found: 3, supported: 2 }` |
+
+The base carries the version bump as well as the log (its layout is
+unchanged): every release reads the base first, so an older writer refuses a
+0.6 store there, before it could take an empty log for its own. There is no
+in-place upgrade, and no mixing 0.5 and 0.6 writers on one store: **drain,
+then rebuild** — stop the old writers, read out what you need with the
+release that wrote the store, and re-ingest with 0.6 (a crawl cache or
+metadata store simply regenerates). 0.6.0 also supersedes a 0.5.x defect: a
+commit that failed after its append could reuse sequence numbers, after
+which the store no longer opened (`wal sequence regression`).
 
 ## Features
 
@@ -164,11 +198,16 @@ Rust library, embeddable in any runtime.
 
 `cargo test` (unit + hermetic lifecycle), `cargo test --test
 proptest_model` (model-based agreement through compaction/reopen,
-byte-reproducibility, torn-WAL recovery), `cargo test --test concurrency`
+byte-reproducibility, a log cut at any byte holding exactly the first k
+transactions), `cargo test --test multi_writer` (writers as real processes:
+no snapshot holds part of another process's transaction, a crash mid-append
+loses that transaction whole), `cargo test --test alloc_count` (counted
+allocations: open, fold, commit), `cargo test --test concurrency`
 (8 readers under a compacting writer), `cargo bench` (criterion, including
-read-latency-under-write), `cargo +nightly fuzz run <target>` (every decoder:
-arbitrary bytes must produce a typed error, never a panic or an
-over-allocation).
+read-latency-under-write and log replay), `cargo +nightly fuzz run <target>`
+(every decoder: arbitrary bytes must produce a typed error, never a panic or
+an over-allocation; plus crash cuts and two writers), and `scripts/xver` (a
+released 0.5.1 must refuse a 0.6 store and leave it untouched).
 
 ## Python
 
