@@ -29,17 +29,27 @@ jobs:
       matrix:
         # One target per decoder that reads bytes this crate did not write
         # (any input yields a typed error, never a panic and never an
-        # over-allocation), plus fuzz_two_writers: arbitrary schedules of two
-        # writers, compactions, aborts and torn tails never lose a committed
-        # op and never show an uncommitted one.
+        # over-allocation), plus the crash models: fuzz_two_writers
+        # (arbitrary schedules of two writers, multi-op transactions,
+        # compactions, aborts and torn records never lose a committed op and
+        # never show part of a transaction) and fuzz_crash_cut (a log cut or
+        # bit-flipped anywhere in its last record holds exactly the earlier
+        # transactions). A target missing from this list never runs.
         target:
           - fuzz_base_parse
           - fuzz_wal_replay
           - fuzz_op_decode
+          - fuzz_record_decode
           - fuzz_postings_decode
           - fuzz_wal_committed_len
           - fuzz_open_image
           - fuzz_two_writers
+          - fuzz_crash_cut
+        include:
+          # No length field may size an allocation: any single allocation
+          # over 64 MiB fails the run.
+          - target: fuzz_record_decode
+            extra: -malloc_limit_mb=64
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the pinned sibling repositories
@@ -64,7 +74,7 @@ jobs:
         run: RUSTUP_TOOLCHAIN=stable cargo install cargo-fuzz --locked
 
       - name: Run fuzzer
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_DURATION }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_DURATION }} ${{ matrix.extra }}
 
       # A crash artifact is the whole point of the run: keep it, because the
       # corpus itself is not tracked (findings are promoted into

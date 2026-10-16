@@ -64,6 +64,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_record_decode"
+path = "fuzz_targets/fuzz_record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crash_cut"
+path = "fuzz_targets/fuzz_crash_cut.rs"
+test = false
+doc = false
+bench = false
+
 # Detached from the parent workspace on purpose (mirrors link-r's layout).
 [workspace]
 members = ["."]

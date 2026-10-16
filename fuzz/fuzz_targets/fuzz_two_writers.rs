@@ -2,11 +2,12 @@
 // Copyright: lituus-io, all rights reserved
 //
 //! Two writable handles on one store directory, driven by an arbitrary
-//! schedule of commits, removals, compactions, aborted transactions, handle
-//! restarts and crashes (a torn record left at the end of the log, as a
-//! writer killed mid-append leaves it). After every step a fresh read-only
-//! open must show exactly the committed documents: no committed op is ever
-//! lost, and nothing uncommitted ever appears.
+//! schedule of commits, multi-op transactions, removals, compactions,
+//! aborted transactions, handle restarts and crashes (a strict prefix of a
+//! real multi-op record left at the end of the log, as a writer killed
+//! mid-append leaves it). After every step a fresh read-only open must show
+//! exactly the committed documents: no committed op is ever lost, nothing
+//! uncommitted ever appears, and a transaction is all or none.
 
 #![no_main]
 use graph_r::format::wal::RecordBuf;
@@ -57,7 +58,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         let (op, arg) = (pair[0], pair.get(1).copied().unwrap_or(0));
         let h = usize::from(op & 1);
         let store = handles[h].as_ref().unwrap();
-        match (op >> 1) % 6 {
+        match (op >> 1) % 7 {
             0 => {
                 let u = url(arg);
                 store.transact(|tx| tx.upsert_node(&doc(&u))).unwrap();
@@ -82,10 +83,18 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                 assert!(r.is_err());
             }
             4 => {
-                // A crash mid-append: a strict prefix of a real record.
+                // A crash mid-append: a strict prefix of a real record of
+                // two or three ops, the sequence it would have had.
+                let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
+                let next = graph_r::format::wal::replay(&raw)
+                    .ok()
+                    .and_then(|r| r.records().last().map(|r| r.last_seq() + 1))
+                    .unwrap_or(1);
                 let mut rec = RecordBuf::new();
-                rec.push_remove(UrlKey(u64::from(arg)));
-                rec.seal(u64::MAX / 2).unwrap();
+                for i in 0..2 + arg % 2 {
+                    rec.push_upsert(&doc(&url(arg.wrapping_add(i))), 0).unwrap();
+                }
+                rec.seal(next.max(1)).unwrap();
                 let frame = rec.into_vec();
                 let cut = 1 + usize::from(arg) % (frame.len() - 1);
                 let mut f = std::fs::OpenOptions::new()
@@ -93,6 +102,28 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                     .open(dir.join(graph_r::store::WAL_FILE))
                     .unwrap();
                 f.write_all(&frame[..cut]).unwrap();
+            }
+            5 => {
+                // A transaction of two or three ops: all of it, or none.
+                let urls: Vec<String> =
+                    (0..2 + arg % 2).map(|i| url(arg.wrapping_mul(3).wrapping_add(i))).collect();
+                let remove_first = arg & 0x80 != 0;
+                store
+                    .transact(|tx| {
+                        if remove_first {
+                            tx.remove(UrlKey::of(&urls[0]))?;
+                        }
+                        urls.iter()
+                            .skip(usize::from(remove_first))
+                            .try_for_each(|u| tx.upsert_node(&doc(u)))
+                    })
+                    .unwrap();
+                if remove_first {
+                    model.remove(&urls[0]);
+                }
+                for u in urls.iter().skip(usize::from(remove_first)) {
+                    model.insert(u.clone());
+                }
             }
             _ => {
                 // The process holding this handle restarts.
