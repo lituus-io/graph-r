@@ -64,16 +64,42 @@ impl Arena {
         Some(&chunk[off])
     }
 
-    /// Publish one committed op. Single-producer: only the writer (holding
-    /// the store's write mutex) calls this, so `frontier` is not contended.
-    /// Returns `false` when the arena is full (caller must compact).
-    pub(crate) fn publish(&self, seq: u64, op: Op) -> bool {
-        let i = self.frontier.load(Ordering::Relaxed);
-        let Some(cell) = self.cell(i) else { return false };
-        let ok = cell.set((seq, op)).is_ok();
-        debug_assert!(ok, "arena cell double-initialized");
-        self.frontier.store(i + 1, Ordering::Release);
+    /// Make room for `n` more entries, before anything is written anywhere:
+    /// `false` when the arena cannot hold them (the caller must compact).
+    /// After `true`, [`Arena::publish`] of up to `n` entries cannot fail.
+    pub(crate) fn reserve(&self, n: usize) -> bool {
+        #[cfg(test)]
+        if crate::store::probe::full() {
+            return false;
+        }
+        let from = self.frontier.load(Ordering::Relaxed);
+        let Some(end) = from.checked_add(n) else { return false };
+        if end > BASE_CAP * ((1 << CHUNKS) - 1) {
+            return false;
+        }
+        // Materialize the chunks now, so publishing allocates nothing.
+        let mut i = from;
+        while i < end {
+            let (k, _) = locate(i);
+            let _ = self.cell(i);
+            i = BASE_CAP * ((1 << (k + 1)) - 1);
+        }
         true
+    }
+
+    /// Publish one commit's ops, reserved beforehand with
+    /// [`Arena::reserve`]. Single-producer: only the writer (holding the
+    /// store's write mutex) calls this, so `frontier` is not contended. The
+    /// frontier moves once, after every op is in place, so a snapshot sees
+    /// all of a commit or none of it.
+    pub(crate) fn publish(&self, ops: impl IntoIterator<Item = (u64, Op)>) {
+        let mut i = self.frontier.load(Ordering::Relaxed);
+        for entry in ops {
+            let set = self.cell(i).is_some_and(|cell| cell.set(entry).is_ok());
+            debug_assert!(set, "arena cell unreserved or double-initialized");
+            i += 1;
+        }
+        self.frontier.store(i, Ordering::Release);
     }
 
     /// Sequence number of the last published op (0 when none): readers
@@ -249,11 +275,50 @@ mod tests {
     fn publish_then_read_below_frontier() {
         let a = Arena::new();
         for i in 0..200u64 {
-            assert!(a.publish(i + 1, Op::Remove { key: UrlKey(i) }));
+            assert!(a.reserve(1));
+            a.publish([(i + 1, Op::Remove { key: UrlKey(i) })]);
         }
         assert_eq!(a.len(), 200);
         let seen: Vec<u64> = a.committed(200).map(|(s, _)| *s).collect();
         assert_eq!(seen, (1..=200).collect::<Vec<_>>());
+    }
+
+    /// A commit is published whole: a reader polling the frontier while
+    /// commits of `N` ops land only ever sees a multiple of `N`.
+    #[test]
+    fn a_reader_never_sees_part_of_a_publish() {
+        const N: usize = 7;
+        const COMMITS: u64 = 2_000;
+        let a = Arena::new();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut polls = 0u64;
+                while !done.load(Ordering::Acquire) || polls == 0 {
+                    let len = a.len();
+                    assert_eq!(len % N, 0, "saw {len} ops: part of a commit");
+                    polls += 1;
+                }
+            });
+            for c in 0..COMMITS {
+                assert!(a.reserve(N));
+                a.publish(
+                    (0..N as u64).map(|i| (c * N as u64 + i + 1, Op::Remove { key: UrlKey(i) })),
+                );
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(a.len(), N * COMMITS as usize);
+    }
+
+    #[test]
+    fn reserve_refuses_past_capacity() {
+        let a = Arena::new();
+        let cap = BASE_CAP * ((1 << CHUNKS) - 1);
+        assert!(!a.reserve(cap + 1));
+        assert!(!a.reserve(usize::MAX));
+        assert!(a.reserve(1));
+        assert_eq!(a.len(), 0, "reserving publishes nothing");
     }
 
     #[test]

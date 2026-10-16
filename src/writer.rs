@@ -495,17 +495,32 @@ impl<'s> Writer<'s> {
     }
 
     /// The commit itself, with the commit lock held and the handle caught
-    /// up. A failed append is cut back off the log, so it writes nothing.
+    /// up. Everything that can refuse runs before the first byte is written;
+    /// a failed write is cut back off the log, so `Err` means nothing was
+    /// appended and nothing published, with the ops still staged.
     fn append_held(&mut self) -> Result<u64> {
         if self.state.staged.is_empty() {
             return Ok(self.state.next_seq.saturating_sub(1));
         }
-        let staged = std::mem::take(&mut self.state.staged);
-        let count = staged.len() as u64;
+        let count = self.state.staged.len() as u64;
         let first_seq = self.state.next_seq;
         let mut buf = Vec::new();
-        for (i, op) in staged.iter().enumerate() {
+        for (i, op) in self.state.staged.iter().enumerate() {
             buf.extend_from_slice(&encode_frame(first_seq + i as u64, op));
+        }
+        // The current generation is stable: installs on this handle happen
+        // only under its writer mutex, which we hold. Room in its overlay is
+        // made now, so publishing after the append cannot fail: a durable
+        // commit that this handle did not account for is what reuses
+        // sequence numbers.
+        let cur = self.store.current.load(Ordering::Acquire);
+        let guard = self.store.gens[cur]
+            .inner
+            .try_read()
+            .map_err(|_| Error::busy("current slot mid-install"))?;
+        let inner = guard.as_ref().ok_or_else(|| Error::corrupt("current slot empty"))?;
+        if !inner.arena.reserve(self.state.staged.len()) {
+            return Err(Error::busy("overlay arena full"));
         }
         // Append + flush + fsync-per-policy.
         if self.state.wal.is_none() {
@@ -528,45 +543,57 @@ impl<'s> Writer<'s> {
             crate::store::probe::bump(&crate::store::probe::FSYNCS, 1);
             f.sync_all()
         });
+        // A test can fail an append whose bytes are already durable and
+        // cannot be cut back off: the worst a failing disk does.
+        #[cfg(test)]
+        let (appended, stuck) = match appended {
+            Ok(()) if crate::store::probe::fail_append() => (
+                Err(std::io::Error::other("injected append failure")),
+                crate::store::probe::stuck(),
+            ),
+            other => (other, false),
+        };
+        #[cfg(not(test))]
+        let stuck = false;
         if let Err(e) = appended {
             // Nothing of a failed append may survive: cut the log back to
-            // where it was (best effort; the next committer's repair would
-            // treat a partial frame as a torn tail anyway).
+            // where it was (best effort; the next committer's repair treats
+            // a partial frame as a torn tail anyway), and forget what this
+            // handle knows of the file, so its next commit re-reads it whole
+            // rather than trust a length the cut may not have restored.
             state.wal = None;
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(wal_path(&self.store.dir)) {
-                let _ = f.set_len(state.seen.wal_pos);
-                let _ = f.sync_all();
-            }
-            return Err(e.into());
-        }
-        state.commits_since_sync = if sync { 0 } else { state.commits_since_sync + 1 };
-        state.seen.appended(buf.len() as u64);
-        // Publish into the current generation (stable: installs on this
-        // handle happen only under its writer mutex, which we hold).
-        let cur = self.store.current.load(Ordering::Acquire);
-        {
-            let guard = self.store.gens[cur]
-                .inner
-                .try_read()
-                .map_err(|_| Error::busy("current slot mid-install"))?;
-            let inner = guard.as_ref().ok_or_else(|| Error::corrupt("current slot empty"))?;
-            for (i, op) in staged.into_iter().enumerate() {
-                if !inner.arena.publish(first_seq + i as u64, op) {
-                    return Err(Error::busy("overlay arena full"));
+            if !stuck {
+                if let Ok(f) =
+                    std::fs::OpenOptions::new().write(true).open(wal_path(&self.store.dir))
+                {
+                    let _ = f.set_len(state.seen.wal_pos);
+                    let _ = f.sync_all();
                 }
             }
+            state.seen.stamp = None;
+            return Err(e.into());
         }
-        self.state.wal_bytes += buf.len() as u64;
-        self.state.next_seq += count;
-        self.state.ops_since_compact += count as usize;
+        // Durable: account for it, then publish. Nothing below can fail.
+        state.commits_since_sync = if sync { 0 } else { state.commits_since_sync + 1 };
+        state.seen.appended(buf.len() as u64);
+        state.wal_bytes += buf.len() as u64;
+        state.next_seq += count;
+        state.ops_since_compact += count as usize;
+        let staged = std::mem::take(&mut state.staged);
+        inner
+            .arena
+            .publish(staged.into_iter().enumerate().map(|(i, op)| (first_seq + i as u64, op)));
+        drop(guard);
         let last = self.state.next_seq - 1;
         if self.state.ops_since_compact >= self.store.cfg.compact_after_ops
             || self.state.wal_bytes >= self.store.cfg.compact_after_wal_bytes
         {
-            if self.store.compact_inline.load(Ordering::Relaxed) {
-                crate::compact::compact_locked(self.store, &mut self.state)?;
-            } else {
-                // Off the hot path: the owner compacts when it chooses.
+            // The commit is durable and visible whatever happens here: a
+            // compaction that cannot run now (every ring slot pinned, a full
+            // disk) leaves it due for the next commit or [`Store::compact`].
+            if !self.store.compact_inline.load(Ordering::Relaxed)
+                || crate::compact::compact_locked(self.store, &mut self.state).is_err()
+            {
                 self.store.due.store(true, Ordering::Release);
             }
         }
@@ -672,8 +699,10 @@ where
     let mark = txn.w.state.staged.len();
     let out = f(txn);
     txn.w.snap = None; // free the pinned slot before any auto-compaction
-    match out {
-        Ok(r) => txn.w.append_held().map(|_| r),
+                       // Either way a failed transaction leaves nothing of its own staged: a
+                       // caller retries by running it again.
+    match out.and_then(|r| txn.w.append_held().map(|_| r)) {
+        Ok(r) => Ok(r),
         Err(e) => {
             txn.w.state.staged.truncate(mark);
             Err(e)

@@ -310,6 +310,23 @@ pub(crate) mod probe {
         pub(crate) static FSYNCS: Cell<u64> = const { Cell::new(0) };
         /// Log bytes read by tail catch-ups.
         pub(crate) static TAIL_BYTES: Cell<u64> = const { Cell::new(0) };
+        /// Make every overlay reservation fail, as a full arena would.
+        pub(crate) static FULL: Cell<u64> = const { Cell::new(0) };
+        /// Fail the next appends after their bytes are written and synced.
+        pub(crate) static FAIL_APPEND: Cell<u64> = const { Cell::new(0) };
+        /// … and leave those bytes in the log (the cut-back fails too), as
+        /// a failing disk can.
+        pub(crate) static STUCK: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn full() -> bool {
+        FULL.with(Cell::get) != 0
+    }
+    pub(crate) fn stuck() -> bool {
+        STUCK.with(Cell::get) != 0
+    }
+    /// Consume one injected append failure, if any is armed.
+    pub(crate) fn fail_append() -> bool {
+        FAIL_APPEND.with(|x| x.get().checked_sub(1).map(|n| x.set(n)).is_some())
     }
     pub(crate) fn bump(c: &'static LocalKey<Cell<u64>>, n: u64) {
         c.with(|x| x.set(x.get() + n));
@@ -915,14 +932,15 @@ impl Store {
         let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
         let Some(g) = guard.as_ref() else { return Ok(false) };
         let seen = g.dir.header.wal_applied_seq.max(g.arena.last_seq());
-        let mut changed = false;
-        for (seq, op) in ops.into_iter().filter(|&(s, _)| s > seen) {
-            if !g.arena.publish(seq, op) {
-                return Err(Error::busy("overlay arena full"));
-            }
-            changed = true;
+        let new = ops.partition_point(|&(s, _)| s <= seen);
+        if new == ops.len() {
+            return Ok(false);
         }
-        Ok(changed)
+        if !g.arena.reserve(ops.len() - new) {
+            return Err(Error::busy("overlay arena full"));
+        }
+        g.arena.publish(ops.into_iter().skip(new));
+        Ok(true)
     }
 
     /// Publish the frames of a log image that the current generation has not
@@ -1109,13 +1127,12 @@ fn build_generation(map: MappedFile, raw: &[u8]) -> Result<Built> {
         .ops
         .last()
         .map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
-    let mut count = 0;
-    for (seq, op) in replayed.ops.into_iter().filter(|&(s, _)| s > header.wal_applied_seq) {
-        if !inner.arena.publish(seq, op) {
-            return Err(Error::busy("overlay arena full during replay"));
-        }
-        count += 1;
+    let folded = replayed.ops.partition_point(|&(s, _)| s <= header.wal_applied_seq);
+    let count = replayed.ops.len() - folded;
+    if !inner.arena.reserve(count) {
+        return Err(Error::busy("overlay arena full during replay"));
     }
+    inner.arena.publish(replayed.ops.into_iter().skip(folded));
     Ok(Built {
         inner,
         next_seq,
@@ -1498,5 +1515,121 @@ mod tests {
         drop((a, b));
         let fresh = Store::open_read_only(dir.path()).unwrap();
         assert_eq!(urls(&fresh), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    // ---- a commit that cannot complete ------------------------------------
+
+    fn wal_len(dir: &Path) -> u64 {
+        fs::metadata(wal_path(dir)).unwrap().len()
+    }
+
+    /// The overlay is checked for room before anything is written: a full
+    /// one refuses with `Busy`, the log untouched and the ops still staged.
+    /// (Room checked after a durable append is how 0.5.1 could write a
+    /// commit it never accounted for, and reuse its sequence numbers.)
+    #[test]
+    fn a_full_overlay_refuses_before_writing_and_keeps_the_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let before = wal_len(dir.path());
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FULL.with(|f| f.set(1));
+        let r = w.commit();
+        probe::FULL.with(|f| f.set(0));
+        assert!(matches!(r, Err(Error::Busy { .. })), "{r:?}");
+        assert_eq!(wal_len(dir.path()), before, "a refused commit wrote to the log");
+        w.commit().expect("the staged op commits once there is room");
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    /// A failed append is cut back off the log and keeps the writer's ops
+    /// staged: a retry commits them (0.5.1 dropped them).
+    #[test]
+    fn a_failed_append_keeps_the_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let before = wal_len(dir.path());
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        assert!(matches!(w.commit(), Err(Error::Io { .. })));
+        assert_eq!(wal_len(dir.path()), before, "the failed append was cut back");
+        w.commit().expect("the kept op commits on retry");
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    /// The worst case: the append fails after its bytes reached the log and
+    /// they cannot be cut back off. The next commit re-reads the log rather
+    /// than trust the handle's bookkeeping, so no sequence number is ever
+    /// written twice and the store reopens. (A durable append the handle did
+    /// not account for is how 0.5.1 reused sequences and bricked a store.)
+    #[test]
+    fn a_failed_append_that_stays_in_the_log_never_reuses_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        probe::STUCK.with(|f| f.set(1));
+        let failed = w.commit();
+        probe::STUCK.with(|f| f.set(0));
+        assert!(matches!(failed, Err(Error::Io { .. })));
+        w.commit().expect("the kept op commits on retry");
+        w.upsert_node(&doc("https://x.dev/c", 3)).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        drop(store);
+        let raw = fs::read(wal_path(dir.path())).unwrap();
+        let seqs: Vec<u64> =
+            wal::replay(&raw).expect("no sequence regression").ops.iter().map(|o| o.0).collect();
+        assert!(seqs.windows(2).all(|p| p[0] < p[1]), "sequences {seqs:?}");
+        let reopened = Store::open(dir.path()).expect("the store reopens");
+        assert_eq!(urls(&reopened), ["https://x.dev/a", "https://x.dev/b", "https://x.dev/c"]);
+    }
+
+    /// A transaction is all or nothing for its caller too: when its append
+    /// fails, its ops are dropped (a retry runs the closure again), so they
+    /// never ride along with the next transaction.
+    #[test]
+    fn a_failed_transaction_leaves_nothing_of_its_own_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        let r = store.transact(|tx| tx.upsert_node(&doc("https://x.dev/a", 1)));
+        assert!(matches!(r, Err(Error::Io { .. })), "{r:?}");
+        store.transact(|tx| tx.upsert_node(&doc("https://x.dev/b", 2))).unwrap();
+        assert_eq!(urls(&store), ["https://x.dev/b"]);
+    }
+
+    /// A commit is durable and visible before any inline compaction runs, so
+    /// a compaction that cannot complete (here: every ring slot pinned) must
+    /// not fail it. It leaves the compaction due instead.
+    #[test]
+    fn an_inline_compaction_that_cannot_install_leaves_the_commit_ok_and_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { compact_after_ops: 1, ..Config::default() };
+        let store = Store::create(dir.path(), cfg).unwrap();
+        let mut pins = vec![store.snapshot()];
+        for (i, url) in ["https://x.dev/a", "https://x.dev/b", "https://x.dev/c"].iter().enumerate()
+        {
+            write(&store, url, i as u64);
+            pins.push(store.snapshot());
+        }
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/d", 4)).unwrap();
+        w.commit().expect("the commit itself succeeded");
+        drop(w);
+        assert!(store.compaction_due(), "the compaction is left due");
+        assert_eq!(store.len(), 4, "and the commit is visible");
+        drop(pins);
+        store.compact().unwrap();
+        assert!(!store.compaction_due());
+        assert_eq!(store.len(), 4);
     }
 }
