@@ -3,11 +3,13 @@
 //
 //! `tests/fixtures/store_v042` was written by the 0.4.2 code path (a
 //! compacted base plus an uncompacted log of touches, a removal, a pin and
-//! attributes), in the format every release from 0.4.0 to 0.5.1 wrote. 0.6
-//! logs a transaction as one record, a format those releases cannot read, so
-//! this build refuses such a store with a typed `Error::Version` and writes
-//! nothing to it: a consumer drains it with the release that wrote it and
-//! rebuilds, never has it rewritten underneath it.
+//! attributes), in the format every release from 0.4.0 to 0.5.1 wrote (base
+//! 2, log 2). 0.6 logs a transaction as one record, a format those releases
+//! cannot read, and so writes base 3; this build refuses such a store with a
+//! typed `Error::Version` read from its base, and writes nothing to it: a
+//! consumer drains it with the release that wrote it and rebuilds, never has
+//! it rewritten underneath it. (`compat_v060` holds the same store written
+//! by this format.)
 
 #![cfg(feature = "store")]
 

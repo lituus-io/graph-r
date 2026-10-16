@@ -20,9 +20,12 @@ use crate::key::UrlKey;
 
 /// Magic: `"GRPR"` little-endian.
 pub const MAGIC: u32 = 0x5250_5247;
-/// Format version; strict-equal on read. 2: the shared container framing
-/// (header, directory and section checksums; no whole-file trailer).
-pub const VERSION: u16 = 2;
+/// Format version; strict-equal on read. 3: the layout of 2 (the shared
+/// container framing: header, directory and section checksums), paired with
+/// a log of one record per transaction. Bumped with the log because a base
+/// is always read first: a release that cannot read this log refuses the
+/// store there, before it could take an empty log for its own and rewrite it.
+pub const VERSION: u16 = 3;
 
 /// Node record width.
 pub const NODE_LEN: usize = 72;

@@ -428,7 +428,7 @@ def test_a_format_v1_store_raises_format_version_error(tmp_path, opener):
     path = copy_v1(tmp_path)
     with pytest.raises(graph_r.FormatVersionError) as info:
         getattr(graph_r.Store, opener)(path)
-    assert (info.value.found, info.value.supported) == (1, 2)
+    assert (info.value.found, info.value.supported) == (1, 3)
     assert isinstance(info.value, graph_r.GraphRError), "existing handlers keep catching it"
     assert "unsupported version 1" in str(info.value)
     # Damage is not a version mismatch.
