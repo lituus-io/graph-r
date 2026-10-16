@@ -40,8 +40,10 @@ drain, then rebuild.
   ops is 2.3x / 3.3x / 3.45x faster (100k: 22.2 ms to 6.44 ms); the first
   overlay read of a snapshot 3.4x (492 us to 147 us); a 100-upsert commit
   28% less CPU. Counted: opening 10k ops allocates 23 times (0.5.1: 20 031),
-  folding them 13 (20 013), and a steady-state commit allocates nothing
-  after staging (21). The wheel's extension is no larger than 0.5.1's
+  folding them 13 (20 013), and a steady-state commit allocates nothing of
+  its own after staging (21; on Windows the standard library's UTF-16 copy
+  of each path it hands the OS adds 2, for the two stats that notice another
+  process's compaction). The wheel's extension is no larger than 0.5.1's
   (4 949 712 bytes on macOS arm64; same C-API imports).
 - **Commit fixes** (all from 0.5.1): room in the overlay is reserved before
   the append, so a durable commit can no longer go unaccounted and reuse

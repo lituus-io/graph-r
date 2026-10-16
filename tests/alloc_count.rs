@@ -126,6 +126,13 @@ fn opening_a_log_allocates_independently_of_its_op_count() {
     assert_eq!(again, 0, "a read of the folded view allocates nothing");
 }
 
+/// A commit's catch-up stats the store's two files by path (that is how it
+/// sees another process replace one). On Windows the standard library turns
+/// every path it passes to the OS into a heap-allocated UTF-16 copy, so those
+/// two stats are two allocations there; elsewhere a path call allocates
+/// nothing. Exact, not a bound: a third allocation fails on every platform.
+const OS_PATH_ALLOCS: u64 = if cfg!(windows) { 2 } else { 0 };
+
 #[test]
 fn a_steady_state_commit_allocates_nothing_after_staging() {
     let dir = tempfile::tempdir().unwrap();
@@ -139,7 +146,7 @@ fn a_steady_state_commit_allocates_nothing_after_staging() {
         }
         let (last, n) = counted(|| w.commit().unwrap());
         assert_eq!(last, 1 + (round as u64 + 1) * 3);
-        assert_eq!(n, 0, "commit {round} allocated {n} times after staging");
+        assert_eq!(n, OS_PATH_ALLOCS, "commit {round} allocated {n} times after staging");
     }
     drop(w);
     assert_eq!(store.len(), 61);
