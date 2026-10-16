@@ -178,6 +178,28 @@ jobs:
           maturin develop --release
           pytest tests/ -v
 
+  xver:
+    name: Cross-version (0.5.1 refuses 0.6 stores)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scripts/xver
+          key: xver
+      # Its own project (not a dependency of the crate or its workspace): the
+      # released 0.5.1, from crates.io, opens stores this checkout writes,
+      # empty and missing logs included, and must refuse every one with
+      # Version { found: 3, supported: 2 } and every file untouched.
+      - name: Fmt and clippy the harness
+        run: |
+          cargo fmt --check --manifest-path scripts/xver/Cargo.toml
+          cargo clippy --locked --manifest-path scripts/xver/Cargo.toml --all-targets
+      - name: The released 0.5.1 against this checkout's stores
+        run: cargo run --locked --manifest-path scripts/xver/Cargo.toml
+
   coverage:
     name: Coverage
     needs: fmt

@@ -41,6 +41,8 @@ if have fuzz; then
   done
 else warn "cargo-fuzz not installed"; fi
 
+step "cross-version (scripts/xver)"; cargo run -q --locked --manifest-path scripts/xver/Cargo.toml | tail -1
+
 step "supply chain"
 if have deny; then cargo deny check; else warn "cargo-deny not installed"; fi
 if have audit; then cargo audit; else warn "cargo-audit not installed"; fi
