@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "uu-objstore-r"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "thiserror 1.0.69",
