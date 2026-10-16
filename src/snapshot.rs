@@ -3,8 +3,10 @@
 //
 //! Read views. A [`Snapshot`] pins one base generation plus the overlay ops
 //! committed before it was taken; everything it returns — node refs, edge
-//! refs, hits, due items — borrows either the mmap or the overlay arena, so
-//! reads are zero-copy and never invalidated by concurrent commits.
+//! refs, hits, due items — borrows either the mmap or the log records held
+//! in the overlay arena, so reads are zero-copy and never invalidated by
+//! concurrent commits. Strings from either are UTF-8 validated once, when
+//! the file or record is accepted, and re-checked on access, never copied.
 //!
 //! Structural results (neighbors, ranks, communities, the lexicon behind
 //! query seeds) reflect the last **compaction**; point lookups, freshness
@@ -18,8 +20,9 @@
 //! active.
 
 use crate::format::base::{self, nflags, NodeRec, SegRec};
+use crate::format::wal::{self, AttrsView, EdgesView, OpView, SegsView, TouchView, UpsertView};
 use crate::key::{NodeId, SegKey, UrlKey};
-use crate::overlay::{OverlayNode, OverlayView};
+use crate::overlay::{OpRef, OverlayNode, OverlayView};
 use crate::store::{GenInner, Store};
 use crate::traverse::{Neighbors, NeighborsInner};
 use crate::ttl::TtlConfig;
@@ -33,7 +36,7 @@ pub struct Snapshot<'s> {
     frontier: usize,
     view: OnceCell<OverlayView>,
     /// Overlay edges reversed (destination → sources), built on first use.
-    inbound: OnceCell<std::collections::HashMap<u64, Vec<crate::format::wal::OwnedEdge>>>,
+    inbound: OnceCell<std::collections::HashMap<u64, Vec<wal::Edge>>>,
     hub_threshold: OnceCell<u32>,
     live: OnceCell<usize>,
 }
@@ -133,7 +136,7 @@ pub struct DueItem<'s> {
 
 impl<'s> Snapshot<'s> {
     pub(crate) fn new(store: &'s Store, guard: RwLockReadGuard<'s, Option<GenInner>>) -> Self {
-        let frontier = guard.as_ref().map_or(0, |g| g.arena.len());
+        let frontier = guard.as_ref().map_or(0, |g| g.log.len());
         Self {
             store,
             guard,
@@ -154,7 +157,43 @@ impl<'s> Snapshot<'s> {
     }
 
     pub(crate) fn overlay(&self) -> &OverlayView {
-        self.view.get_or_init(|| OverlayView::build(self.inner().arena.committed(self.frontier)))
+        self.view.get_or_init(|| OverlayView::build(&self.inner().log, self.frontier))
+    }
+
+    // ---- overlay ops, read in place -----------------------------------------
+
+    fn op(&self, r: Option<OpRef>) -> Option<OpView<'_>> {
+        r.and_then(|r| self.inner().log.view(r))
+    }
+    fn upsert_op(&self, r: Option<OpRef>) -> Option<UpsertView<'_>> {
+        match self.op(r)? {
+            OpView::Upsert(v) => Some(v),
+            _ => None,
+        }
+    }
+    fn touch_op(&self, r: Option<OpRef>) -> Option<TouchView<'_>> {
+        match self.op(r)? {
+            OpView::Touch(v) => Some(v),
+            _ => None,
+        }
+    }
+    fn segs_op(&self, r: Option<OpRef>) -> Option<SegsView<'_>> {
+        match self.op(r)? {
+            OpView::Segs(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub(crate) fn edges_op(&self, r: Option<OpRef>) -> Option<EdgesView<'_>> {
+        match self.op(r)? {
+            OpView::Edges(v) => Some(v),
+            _ => None,
+        }
+    }
+    fn attrs_op(&self, r: Option<OpRef>) -> Option<AttrsView<'_>> {
+        match self.op(r)? {
+            OpView::Attrs(v) => Some(v),
+            _ => None,
+        }
     }
 
     /// The base generation this snapshot pins.
@@ -242,11 +281,10 @@ impl<'s> Snapshot<'s> {
             }
         }
         let base_id = self.base_node_id(key);
-        match (base_id, patch.and_then(|p| p.core.as_ref())) {
-            (_, Some(core)) => {
+        match (base_id, patch.and_then(|p| self.upsert_op(p.core).map(|c| (p, c)))) {
+            (_, Some((p, core))) => {
                 // Overlay core wins wholesale (it is the newest fetch).
-                let p = patch.expect("core implies patch");
-                let mut flags = core.flags;
+                let mut flags = core.flags();
                 // Pin resolution: an explicit overlay pin state (from
                 // SetPinned or folded upsert history) is authoritative;
                 // otherwise pins are sticky across the base generation —
@@ -265,22 +303,22 @@ impl<'s> Snapshot<'s> {
                     }
                 }
                 let (mut fetched, mut interval, mut checks, mut changes, mut last_change) =
-                    (core.fetched_at_ms, self.ttl().base_s, 0u16, 0u16, 0u64);
-                let mut content_hash = core.content_hash;
-                let mut etag: Option<&str> = core.etag.as_deref();
-                if let Some(t) = &p.touch {
-                    fetched = t.checked_at_ms;
-                    interval = t.interval_s;
-                    checks = t.checks;
-                    changes = t.changes;
-                    last_change = t.last_change_ms;
-                    if let Some(h) = t.content_hash {
+                    (core.fetched_at_ms(), self.ttl().base_s, 0u16, 0u16, 0u64);
+                let mut content_hash = core.content_hash();
+                let mut etag: Option<&str> = core.etag();
+                if let Some(t) = self.touch_op(p.touch) {
+                    fetched = t.checked_at_ms();
+                    interval = t.interval_s();
+                    checks = t.checks();
+                    changes = t.changes();
+                    last_change = t.last_change_ms();
+                    if let Some(h) = t.content_hash() {
                         content_hash = h;
                     }
-                    if let Some(e) = t.etag.as_deref() {
+                    if let Some(e) = t.etag() {
                         etag = Some(e);
                     }
-                    if t.tombstone {
+                    if t.tombstone() {
                         flags |= nflags::TOMBSTONE;
                     }
                 } else {
@@ -309,9 +347,9 @@ impl<'s> Snapshot<'s> {
                 Some(NodeRef {
                     key,
                     id: base_id,
-                    url: core.url.as_str(),
-                    title: core.title.as_deref(),
-                    snippet: core.snippet.as_deref(),
+                    url: core.url(),
+                    title: core.title(),
+                    snippet: core.snippet(),
                     etag,
                     content_hash,
                     fetched_at_ms: fetched,
@@ -349,19 +387,19 @@ impl<'s> Snapshot<'s> {
             if let Some(pinned) = p.pinned {
                 flags = if pinned { flags | nflags::PINNED } else { flags & !nflags::PINNED };
             }
-            if let Some(t) = &p.touch {
-                fetched = t.checked_at_ms;
-                interval = t.interval_s;
-                checks = t.checks;
-                changes = t.changes;
-                last_change = t.last_change_ms;
-                if let Some(h) = t.content_hash {
+            if let Some(t) = self.touch_op(p.touch) {
+                fetched = t.checked_at_ms();
+                interval = t.interval_s();
+                checks = t.checks();
+                changes = t.changes();
+                last_change = t.last_change_ms();
+                if let Some(h) = t.content_hash() {
                     content_hash = h;
                 }
-                if let Some(e) = t.etag.as_deref() {
+                if let Some(e) = t.etag() {
                     etag = Some(e);
                 }
-                if t.tombstone {
+                if t.tombstone() {
                     flags |= nflags::TOMBSTONE;
                 }
             }
@@ -411,8 +449,11 @@ impl<'s> Snapshot<'s> {
             if patch.is_some_and(|p| p.removed) {
                 continue;
             }
-            let nref = match patch.and_then(|p| p.core.as_ref()) {
-                Some(_) => self.node(key).expect("core implies live"),
+            let nref = match patch.and_then(|p| p.core) {
+                Some(_) => match self.node(key) {
+                    Some(n) => n,
+                    None => continue,
+                },
                 None => self.base_node_ref(id, patch),
             };
             if nref.is_stub() || nref.is_tombstone() {
@@ -447,8 +488,10 @@ impl<'s> Snapshot<'s> {
             if p.removed {
                 return Neighbors { inner: NeighborsInner::Empty };
             }
-            if let Some(edges) = &p.edges {
-                return Neighbors { inner: NeighborsInner::Overlay { snap: self, edges, idx: 0 } };
+            if let Some(edges) = self.edges_op(p.edges) {
+                return Neighbors {
+                    inner: NeighborsInner::Overlay { snap: self, edges: edges.entries(), idx: 0 },
+                };
             }
             if p.severed {
                 // Resurrected after a remove: the base record's old edges are
@@ -499,13 +542,15 @@ impl<'s> Snapshot<'s> {
             }
         }
         let inbound = self.inbound.get_or_init(|| {
-            let mut m: std::collections::HashMap<u64, Vec<crate::format::wal::OwnedEdge>> =
+            let mut m: std::collections::HashMap<u64, Vec<wal::Edge>> =
                 std::collections::HashMap::new();
             for (&src, p) in overlay {
                 if p.removed {
                     continue;
                 }
-                for &(dst, etype, flags, weight) in p.edges.iter().flatten() {
+                for (dst, etype, flags, weight) in
+                    self.edges_op(p.edges).iter().flat_map(EdgesView::iter)
+                {
                     m.entry(dst.0).or_default().push((UrlKey(src), etype, flags, weight));
                 }
             }
@@ -538,9 +583,9 @@ impl<'s> Snapshot<'s> {
             if p.removed || (p.attrs.is_none() && p.severed) {
                 return;
             }
-            if let Some(attrs) = &p.attrs {
-                for (k, v) in attrs {
-                    f(*k, v.as_str());
+            if let Some(attrs) = self.attrs_op(p.attrs) {
+                for (k, v) in attrs.iter() {
+                    f(k, v);
                 }
                 return;
             }
@@ -588,12 +633,12 @@ impl<'s> Snapshot<'s> {
             if p.segs.is_none() && p.severed {
                 return Vec::new();
             }
-            if let Some(segs) = &p.segs {
-                let out: Vec<SegRef<'_>> = segs
+            if let Some(segs) = self.segs_op(p.segs) {
+                return segs
                     .iter()
                     .map(|s| SegRef {
-                        key: SegKey::derive(key, &s.label),
-                        label: s.label.as_str(),
+                        key: SegKey::derive(key, s.label),
+                        label: s.label,
                         byte_range: (s.flags & base::sflags::NO_RANGE == 0)
                             .then_some((s.byte_start, s.byte_len)),
                         depth: s.depth,
@@ -601,7 +646,6 @@ impl<'s> Snapshot<'s> {
                         flags: s.flags,
                     })
                     .collect();
-                return out;
             }
         }
         let Some(id) = self.base_node_id(key) else { return Vec::new() };

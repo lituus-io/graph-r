@@ -3,13 +3,13 @@
 //
 //! Two writable handles on one store directory, driven by an arbitrary
 //! schedule of commits, removals, compactions, aborted transactions, handle
-//! restarts and crashes (a torn frame left at the end of the log, as a
+//! restarts and crashes (a torn record left at the end of the log, as a
 //! writer killed mid-append leaves it). After every step a fresh read-only
 //! open must show exactly the committed documents: no committed op is ever
 //! lost, and nothing uncommitted ever appears.
 
 #![no_main]
-use graph_r::format::wal::{encode_frame, Op};
+use graph_r::format::wal::RecordBuf;
 use graph_r::{Config, DocRecord, Store, UrlKey};
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -82,8 +82,11 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                 assert!(r.is_err());
             }
             4 => {
-                // A crash mid-append: a strict prefix of a real frame.
-                let frame = encode_frame(u64::MAX / 2, &Op::Remove { key: UrlKey(u64::from(arg)) });
+                // A crash mid-append: a strict prefix of a real record.
+                let mut rec = RecordBuf::new();
+                rec.push_remove(UrlKey(u64::from(arg)));
+                rec.seal(u64::MAX / 2).unwrap();
+                let frame = rec.into_vec();
                 let cut = 1 + usize::from(arg) % (frame.len() - 1);
                 let mut f = std::fs::OpenOptions::new()
                     .append(true)

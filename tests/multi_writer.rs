@@ -77,6 +77,12 @@ fn wait_for(go: &Path) {
     }
 }
 
+/// Every op's sequence number in a log image, in log order.
+fn seqs(raw: &[u8]) -> Vec<u64> {
+    let replayed = graph_r::format::wal::replay(raw).unwrap();
+    replayed.records().flat_map(|r| r.first_seq()..=r.last_seq()).collect()
+}
+
 fn live_urls(store: &Store) -> Vec<String> {
     let mut v = Vec::new();
     store.snapshot().for_each_live(|n| v.push(n.url.to_owned()));
@@ -237,7 +243,7 @@ fn concurrent_first_creation_loses_nothing() {
     }
 }
 
-/// N processes × M commits, released together: exactly N·M frames with
+/// N processes × M commits, released together: exactly N·M ops with
 /// strictly increasing sequence numbers 1..=N·M, every document present, and
 /// every handle converged to the same set.
 fn n_by_m(n: usize, m: usize, compact_every: usize) {
@@ -263,9 +269,7 @@ fn n_by_m(n: usize, m: usize, compact_every: usize) {
     }
     if compact_every == 0 {
         let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
-        let seqs: Vec<u64> =
-            graph_r::format::wal::replay(&raw).unwrap().ops.iter().map(|o| o.0).collect();
-        assert_eq!(seqs, (1..=(n * m) as u64).collect::<Vec<_>>(), "N·M frames, in sequence");
+        assert_eq!(seqs(&raw), (1..=(n * m) as u64).collect::<Vec<_>>(), "N·M ops, in sequence");
     }
 }
 
@@ -302,9 +306,7 @@ fn two_handles_in_one_process_both_write() {
     assert_eq!(live_urls(&a).len(), 200);
     assert_eq!(live_urls(&a), live_urls(&b));
     let raw = std::fs::read(dir.path().join(graph_r::store::WAL_FILE)).unwrap();
-    let seqs: Vec<u64> =
-        graph_r::format::wal::replay(&raw).unwrap().ops.iter().map(|o| o.0).collect();
-    assert_eq!(seqs, (1..=200).collect::<Vec<_>>());
+    assert_eq!(seqs(&raw), (1..=200).collect::<Vec<_>>());
 }
 
 /// Readers never wait on a writer: while another process holds the commit

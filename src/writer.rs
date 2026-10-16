@@ -1,22 +1,22 @@
 // Author: spicyzhug@gmail.com
 // Copyright: lituus-io, all rights reserved
 //
-//! Writers and transactions. Mutations are staged as WAL ops, made durable
-//! on [`Writer::commit`] (commit lock → catch up → encode → append → fsync
-//! per policy → unlock), then published into the current generation's
-//! overlay where new snapshots see them immediately. Freshness math runs
-//! *here*, at touch time, and the computed state travels inside the op —
-//! replay never re-derives policy. [`Txn`] is the serializable form: the
-//! lock is held from its read view to its append.
+//! Writers and transactions. Mutations are encoded straight into one log
+//! record as they are staged, made durable on [`Writer::commit`] (commit
+//! lock → catch up → seal → one append → fsync per policy → unlock), and
+//! that very buffer is then published into the current generation's
+//! overlay, where new snapshots see the whole transaction at once. Freshness
+//! math runs *here*, at touch time, and the computed state travels inside
+//! the op — replay never re-derives policy. [`Txn`] is the serializable
+//! form: the lock is held from its read view to its append.
 
 use crate::error::{Error, Result};
-use crate::format::base::{nflags, sflags};
-use crate::format::wal::{encode_frame, Op, OwnedSeg};
+use crate::format::base::nflags;
+use crate::format::wal::{self, OpView, RecordBuf, TouchRecord};
 use crate::key::{EdgeType, UrlKey};
 use crate::snapshot::Snapshot;
-use crate::store::{wal_path, CommitLock, Durability, Held, Seen, Store};
+use crate::store::{CommitLock, Durability, Held, Seen, Store};
 use crate::ttl::Outcome;
-use compact_str::CompactString;
 use std::io::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::MutexGuard;
@@ -28,8 +28,9 @@ pub use crate::format::wal::{MAX_ATTRS, MAX_ATTR_LEN};
 /// Maximum label length persisted (bytes of UTF-8), and segments per document.
 pub use crate::format::wal::{MAX_LABEL, MAX_SEGS};
 /// Most value bytes one node's attribute set may hold in total: what fits a
-/// single log frame (the op's fixed fields and per-value headers included).
-pub const MAX_ATTR_BYTES: usize = crate::format::wal::MAX_FRAME - (1 + 8 + 1) - MAX_ATTRS * (1 + 4);
+/// single log op ([`wal::MAX_OP`], its fixed fields and per-value headers
+/// included).
+pub const MAX_ATTR_BYTES: usize = wal::MAX_OP - (wal::OP_HEADER_LEN + 8) - MAX_ATTRS * 8;
 /// Longest attribute name accepted by [`Writer::set_named_attrs`].
 pub const MAX_ATTR_NAME: usize = 255;
 
@@ -84,7 +85,8 @@ pub struct Touch<'a> {
 
 pub(crate) struct WriteState {
     next_seq: u64,
-    staged: Vec<Op>,
+    /// The pending transaction, encoded as it is staged.
+    staged: RecordBuf,
     pub(crate) ops_since_compact: usize,
     pub(crate) wal_bytes: u64,
     commits_since_sync: u32,
@@ -108,7 +110,7 @@ impl std::fmt::Debug for WriteState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteState")
             .field("next_seq", &self.next_seq)
-            .field("staged", &self.staged.len())
+            .field("staged", &self.staged.ops())
             .finish()
     }
 }
@@ -123,7 +125,7 @@ impl WriteState {
     ) -> Self {
         Self {
             next_seq,
-            staged: Vec::new(),
+            staged: RecordBuf::new(),
             ops_since_compact: replayed_ops,
             wal_bytes,
             commits_since_sync: 0,
@@ -228,43 +230,12 @@ impl<'s> Writer<'s> {
             }
         }
         let flags = if doc.pinned { nflags::PINNED } else { 0 };
-        self.state.staged.push(Op::UpsertNode {
-            key: doc.url_key,
-            content_hash: doc.content_hash,
-            fetched_at_ms: doc.fetched_at_ms,
-            flags,
-            url: doc.url.into(),
-            title: doc.title.map(Into::into),
-            snippet: doc.snippet.map(Into::into),
-            etag: doc.etag.map(Into::into),
-        });
-        Ok(())
+        self.state.staged.push_upsert(doc, flags)
     }
 
     /// Stage a whole-set segment replacement for `key`.
     pub fn set_segments(&mut self, key: UrlKey, segs: &[SegmentRecord<'_>]) -> Result<()> {
-        if segs.len() > MAX_SEGS {
-            return Err(Error::format(format!("more than {MAX_SEGS} segments")));
-        }
-        let mut owned = Vec::with_capacity(segs.len());
-        for s in segs {
-            check_label("segment", s.label)?;
-            let (importance, extra_flags) = (s.importance, 0);
-            let (byte_start, byte_len, range_flag) = match s.byte_range {
-                Some((start, len)) => (start, len, 0),
-                None => (0, 0, sflags::NO_RANGE),
-            };
-            owned.push(OwnedSeg {
-                label: s.label.into(),
-                byte_start,
-                byte_len,
-                depth: s.depth.max(1),
-                importance,
-                flags: range_flag | extra_flags,
-            });
-        }
-        self.state.staged.push(Op::SetSegments { key, segs: owned });
-        Ok(())
+        self.state.staged.push_segments(key, segs)
     }
 
     /// Stage a whole-set outbound-edge replacement for `key`. Edges are
@@ -287,7 +258,7 @@ impl<'s> Writer<'s> {
         edges: impl Iterator<Item = (UrlKey, EdgeType, u16, u8)>,
     ) {
         let mut seen = std::collections::HashSet::new();
-        let mut owned: Vec<(UrlKey, u8, u8, u16)> = Vec::new();
+        let mut owned: Vec<wal::Edge> = Vec::new();
         for (dst, etype, weight, mut flags) in edges {
             if dst == key || !seen.insert(dst.0) {
                 continue;
@@ -301,7 +272,9 @@ impl<'s> Writer<'s> {
             }
         }
         owned.sort_unstable_by_key(|(dst, _, _, _)| dst.0);
-        self.state.staged.push(Op::SetEdges { key, edges: owned });
+        // Deduplicated, capped and sorted above: the encoder cannot refuse it.
+        let staged = self.state.staged.push_edges(key, &owned);
+        debug_assert!(staged.is_ok(), "normalized edges refused");
     }
 
     /// Stage a whole-set replacement of `key`'s attributes: small keyed
@@ -314,26 +287,23 @@ impl<'s> Writer<'s> {
         if attrs.len() > MAX_ATTRS {
             return Err(Error::format("too many attributes"));
         }
-        let mut owned: Vec<(u8, CompactString)> = Vec::with_capacity(attrs.len());
+        let mut owned: Vec<(u8, &str)> = Vec::with_capacity(attrs.len());
         for &(k, v) in attrs.iter().rev() {
             if v.len() > MAX_ATTR_LEN {
                 return Err(Error::format("attribute too long"));
             }
             if !owned.iter().any(|(o, _)| *o == k) {
-                owned.push((k, CompactString::from(v)));
+                owned.push((k, v));
             }
         }
-        // Replay reads an oversized frame as a torn tail and a writable open
-        // truncates there, so an op that does not fit one frame would lose
-        // itself and every later commit on reopen. Bound the whole op.
+        // Bound the whole op, so it always fits one record entry.
         if owned.iter().map(|(_, v)| v.len()).sum::<usize>() > MAX_ATTR_BYTES {
             return Err(Error::format(format!(
                 "attributes exceed {MAX_ATTR_BYTES} bytes in total"
             )));
         }
         owned.sort_unstable_by_key(|(k, _)| *k);
-        self.state.staged.push(Op::SetAttrs { key, attrs: owned });
-        Ok(())
+        self.state.staged.push_attrs(key, &owned)
     }
 
     /// [`Writer::set_attrs`] with string names: a whole-set replacement of
@@ -365,23 +335,18 @@ impl<'s> Writer<'s> {
             }
         }
         named.sort_unstable_by_key(|(n, _)| *n);
-        let mut owned: Vec<(u8, CompactString)> = Vec::with_capacity(named.len());
-        let mut total = 0usize;
-        for (k, (name, value)) in named.into_iter().enumerate() {
-            let mut rec = CompactString::with_capacity(name.len() + 1 + value.len());
-            rec.push_str(name);
-            rec.push('\0');
-            rec.push_str(value);
-            total += rec.len();
-            owned.push((k as u8, rec));
-        }
+        let total: usize = named.iter().map(|(n, v)| n.len() + 1 + v.len()).sum();
         if total > MAX_ATTR_BYTES {
             return Err(Error::format(format!(
                 "attributes exceed {MAX_ATTR_BYTES} bytes in total"
             )));
         }
-        self.state.staged.push(Op::SetAttrs { key, attrs: owned });
-        Ok(())
+        // Each record is `name NUL value`, written straight into the log
+        // record: no value is assembled anywhere first.
+        self.state.staged.push_attr_parts(
+            key,
+            named.iter().enumerate().map(|(k, &(n, v))| (k as u8, [n, "\0", v])),
+        )
     }
 
     /// Record a revalidation outcome. Freshness policy (interval growth/cut,
@@ -404,49 +369,50 @@ impl<'s> Writer<'s> {
         if let Some(e) = t.etag {
             check_label("etag", e)?;
         }
-        let staged = self.state.staged.iter().rev().find_map(|op| match op {
-            Op::UpsertNode { key: k, content_hash, etag, .. } if *k == key => {
-                Some((*content_hash, etag.clone()))
+        // An upsert staged earlier in this batch is the node's newest hash
+        // and etag. Its etag is copied out (onto the stack) because staging
+        // the touch may move the buffer it lies in.
+        let mut etag_buf = [0u8; MAX_LABEL];
+        let mut staged: Option<(u64, Option<usize>)> = None;
+        for op in self.state.staged.op_views() {
+            if let OpView::Upsert(u) = op {
+                if u.key() == key {
+                    let etag = u.etag().map(|e| {
+                        etag_buf[..e.len()].copy_from_slice(e.as_bytes());
+                        e.len()
+                    });
+                    staged = Some((u.content_hash(), etag));
+                }
             }
-            _ => None,
-        });
-        let (interval_s, checks, changes, last_change_ms, content_hash, etag) = {
-            let snap = self.view();
-            let Some(node) = snap.node(key) else { return Ok(false) };
-            let cfg = snap.ttl();
-            let next = cfg.next_interval(node.interval_s.max(1), t.outcome);
-            let checks = node.checks.saturating_add(1);
-            let changes = if t.outcome == Outcome::Changed {
-                node.changes.saturating_add(1)
-            } else {
-                node.changes
-            };
-            let last_change =
-                if t.outcome == Outcome::Changed { t.checked_at_ms } else { node.last_change_ms };
-            // The op carries the node's *full* effective state, not a delta:
-            // touches fold last-wins in the overlay, so an unchanged check
-            // must not erase the hash/etag a prior change observed — nor the
-            // ones an upsert staged earlier in this same batch.
-            let (base_hash, base_etag) = match staged {
-                Some((h, e)) => (h, e),
-                None => (node.content_hash, node.etag.map(Into::into)),
-            };
-            let hash = t.content_hash.unwrap_or(base_hash);
-            let etag: Option<compact_str::CompactString> = t.etag.map(Into::into).or(base_etag);
-            (next, checks, changes, last_change, hash, etag)
+        }
+        let staged_etag = |len: Option<usize>| {
+            len.map(|n| std::str::from_utf8(&etag_buf[..n]).unwrap_or_default())
         };
-        self.state.staged.push(Op::Touch {
-            key,
+        let snap = self.snap.get_or_insert_with(|| self.store.snapshot());
+        let Some(node) = snap.node(key) else { return Ok(false) };
+        let cfg = snap.ttl();
+        let interval_s = cfg.next_interval(node.interval_s.max(1), t.outcome);
+        let changed = t.outcome == Outcome::Changed;
+        // The op carries the node's *full* effective state, not a delta:
+        // touches fold last-wins in the overlay, so an unchanged check must
+        // not erase the hash/etag a prior change observed — nor the ones an
+        // upsert staged earlier in this same batch.
+        let (base_hash, base_etag) = match staged {
+            Some((h, e)) => (h, staged_etag(e)),
+            None => (node.content_hash, node.etag),
+        };
+        let rec = TouchRecord {
             checked_at_ms: t.checked_at_ms,
             outcome: t.outcome.as_tag(),
-            content_hash: Some(content_hash),
-            etag,
+            content_hash: Some(t.content_hash.unwrap_or(base_hash)),
+            etag: t.etag.or(base_etag),
             interval_s,
-            checks,
-            changes,
-            last_change_ms,
+            checks: node.checks.saturating_add(1),
+            changes: if changed { node.changes.saturating_add(1) } else { node.changes },
+            last_change_ms: if changed { t.checked_at_ms } else { node.last_change_ms },
             tombstone: t.outcome == Outcome::Gone,
-        });
+        };
+        self.state.staged.push_touch(key, &rec)?;
         Ok(true)
     }
 
@@ -457,28 +423,44 @@ impl<'s> Writer<'s> {
         let exists = self
             .state
             .staged
-            .iter()
-            .any(|op| matches!(op, Op::UpsertNode { key: k, .. } if *k == key))
+            .op_views()
+            .any(|op| matches!(op, OpView::Upsert(u) if u.key() == key))
             || self.view().node(key).is_some();
         if !exists {
             return Ok(false);
         }
-        self.state.staged.push(Op::SetPinned { key, pinned });
+        self.state.staged.push_pin(key, pinned);
         Ok(true)
     }
 
     /// Stage a hard delete.
     pub fn remove(&mut self, key: UrlKey) -> Result<()> {
-        self.state.staged.push(Op::Remove { key });
+        self.state.staged.push_remove(key);
         Ok(())
+    }
+
+    /// Drop every op staged on this handle and not yet committed. Staged
+    /// ops otherwise outlive a failed commit (a retry commits them) and a
+    /// dropped writer (the handle's next commit includes them); a
+    /// transaction refused for good — larger than [`wal::MAX_RECORD`] — is
+    /// discarded with this, then staged again in parts.
+    pub fn discard(&mut self) {
+        self.state.staged = RecordBuf::new();
     }
 
     /// Make staged ops durable and visible: take the commit lock (waiting up
     /// to [`crate::Config::lock_wait`], else [`Error::Locked`] with the ops
-    /// still staged), catch up with other writers, encode frames, append to
-    /// the WAL, fsync per the configured [`Durability`], publish to the
-    /// overlay, auto-compact past thresholds, unlock. Returns the last
-    /// committed sequence number.
+    /// still staged), catch up with other writers, seal the staged ops into
+    /// one record, append it to the WAL in one write, fsync per the
+    /// configured [`Durability`], publish it to the overlay, auto-compact
+    /// past thresholds, unlock. Returns the last committed sequence number.
+    ///
+    /// `Err` means nothing was appended and nothing published, and the ops
+    /// stay staged: a transaction larger than [`wal::MAX_RECORD`] is a
+    /// typed [`Error::Format`] before anything is written. `Ok` means the
+    /// whole transaction is durable (per policy) and visible at once. An
+    /// inline compaction that cannot run leaves [`Store::compaction_due`]
+    /// set instead of failing the commit.
     pub fn commit(&mut self) -> Result<u64> {
         // The cached view is about to go stale, and its pinned generation slot
         // must be free before a catch-up or auto-compaction installs another.
@@ -493,19 +475,18 @@ impl<'s> Writer<'s> {
     }
 
     /// The commit itself, with the commit lock held and the handle caught
-    /// up. Everything that can refuse runs before the first byte is written;
-    /// a failed write is cut back off the log, so `Err` means nothing was
-    /// appended and nothing published, with the ops still staged.
+    /// up: one record, one write, one fsync. Everything that can refuse runs
+    /// before the first byte is written; a failed write is cut back off the
+    /// log. Steady state, nothing here allocates: the staged buffer is
+    /// sealed in place, written, and moved into the overlay as is.
     fn append_held(&mut self) -> Result<u64> {
         if self.state.staged.is_empty() {
             return Ok(self.state.next_seq.saturating_sub(1));
         }
-        let count = self.state.staged.len() as u64;
+        let count = self.state.staged.ops();
         let first_seq = self.state.next_seq;
-        let mut buf = Vec::new();
-        for (i, op) in self.state.staged.iter().enumerate() {
-            buf.extend_from_slice(&encode_frame(first_seq + i as u64, op));
-        }
+        // Over the record cap: refused here, nothing written, ops kept.
+        self.state.staged.seal(first_seq)?;
         // The current generation is stable: installs on this handle happen
         // only under its writer mutex, which we hold. Room in its overlay is
         // made now, so publishing after the append cannot fail: a durable
@@ -517,23 +498,25 @@ impl<'s> Writer<'s> {
             .try_read()
             .map_err(|_| Error::busy("current slot mid-install"))?;
         let inner = guard.as_ref().ok_or_else(|| Error::corrupt("current slot empty"))?;
-        if !inner.arena.reserve(self.state.staged.len()) {
+        if !inner.log.reserve(count as usize, self.state.staged.len()) {
             return Err(Error::busy("overlay arena full"));
         }
-        // Append + flush + fsync-per-policy.
         if self.state.wal.is_none() {
             self.state.wal =
-                Some(std::fs::OpenOptions::new().append(true).open(wal_path(&self.store.dir))?);
+                Some(std::fs::OpenOptions::new().append(true).open(&self.store.wal_file)?);
         }
         let durability = self.store.cfg.durability;
         let state = &mut *self.state;
-        let f = state.wal.as_mut().expect("opened above");
+        let Some(f) = state.wal.as_mut() else { return Err(Error::corrupt("log handle missing")) };
         let sync = match durability {
             Durability::Always => true,
             Durability::Batch(n) => state.commits_since_sync + 1 >= n.max(1),
             Durability::Never => false,
         };
-        let appended = f.write_all(&buf).and_then(|()| f.flush()).and_then(|()| {
+        let record = state.staged.as_bytes();
+        let appended = f.write_all(record).and_then(|()| f.flush()).and_then(|()| {
+            #[cfg(test)]
+            crate::store::probe::bump(&crate::store::probe::WRITES, 1);
             if !sync {
                 return Ok(());
             }
@@ -555,15 +538,13 @@ impl<'s> Writer<'s> {
         let stuck = false;
         if let Err(e) = appended {
             // Nothing of a failed append may survive: cut the log back to
-            // where it was (best effort; the next committer's repair treats
-            // a partial frame as a torn tail anyway), and forget what this
-            // handle knows of the file, so its next commit re-reads it whole
-            // rather than trust a length the cut may not have restored.
+            // where it was (best effort; the next committer's repair cuts a
+            // torn record anyway), and forget what this handle knows of the
+            // file, so its next commit re-reads it whole rather than trust a
+            // length the cut may not have restored.
             state.wal = None;
             if !stuck {
-                if let Ok(f) =
-                    std::fs::OpenOptions::new().write(true).open(wal_path(&self.store.dir))
-                {
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&self.store.wal_file) {
                     let _ = f.set_len(state.seen.wal_pos);
                     let _ = f.sync_all();
                 }
@@ -572,15 +553,14 @@ impl<'s> Writer<'s> {
             return Err(e.into());
         }
         // Durable: account for it, then publish. Nothing below can fail.
+        let len = record.len() as u64;
         state.commits_since_sync = if sync { 0 } else { state.commits_since_sync + 1 };
-        state.seen.appended(buf.len() as u64);
-        state.wal_bytes += buf.len() as u64;
-        state.next_seq += count;
+        state.seen.appended(len);
+        state.wal_bytes += len;
+        state.next_seq += u64::from(count);
         state.ops_since_compact += count as usize;
-        let staged = std::mem::take(&mut state.staged);
-        inner
-            .arena
-            .publish(staged.into_iter().enumerate().map(|(i, op)| (first_seq + i as u64, op)));
+        let record = std::mem::take(&mut state.staged).into_vec();
+        crate::overlay::publish_records(&inner.log, record, 0);
         drop(guard);
         let last = self.state.next_seq - 1;
         if self.state.ops_since_compact >= self.store.cfg.compact_after_ops
@@ -694,7 +674,7 @@ where
     txn.w.snap = Some(store.snapshot());
     // Ops a dropped, uncommitted writer left staged on this handle are kept
     // (a writer's next commit includes them); an abort removes only its own.
-    let mark = txn.w.state.staged.len();
+    let mark = txn.w.state.staged.mark();
     let out = f(txn);
     txn.w.snap = None; // free the pinned slot before any auto-compaction
                        // Either way a failed transaction leaves nothing of its own staged: a

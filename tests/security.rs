@@ -191,7 +191,8 @@ fn torn_wal_tail_recovers_the_committed_prefix() {
     std::fs::write(&wal_path, &raw).unwrap();
 
     // Replay stops at the tear and reports the intact length.
-    let replayed = wal::replay(&std::fs::read(&wal_path).unwrap()).unwrap();
+    let image = std::fs::read(&wal_path).unwrap();
+    let replayed = wal::replay(&image).unwrap();
     assert_eq!(replayed.good_len, intact_len, "torn tail must not be replayed");
 
     // And the store opens, sees both documents, and repairs the file.
@@ -209,8 +210,12 @@ fn torn_wal_tail_recovers_the_committed_prefix() {
 #[test]
 fn wal_sequence_regression_is_corruption() {
     let mut image = wal::encode_header(1, 0);
-    image.extend_from_slice(&wal::encode_frame(5, &wal::Op::Remove { key: UrlKey(1) }));
-    image.extend_from_slice(&wal::encode_frame(4, &wal::Op::Remove { key: UrlKey(2) }));
+    for (first, key) in [(5, 1), (4, 2)] {
+        let mut rec = wal::RecordBuf::new();
+        rec.push_remove(UrlKey(key));
+        rec.seal(first).unwrap();
+        image.extend_from_slice(rec.as_bytes());
+    }
     assert!(matches!(wal::replay(&image), Err(Error::Corrupt { .. })));
 }
 
@@ -232,17 +237,20 @@ fn hostile_postings_error_instead_of_over_allocating() {
     assert!(base::decode_postings(&hostile).is_err());
 }
 
-/// Frame lengths are bounded before any allocation, so a hostile length field
-/// cannot make replay reserve an arbitrary buffer.
+/// Record lengths are bounded before any allocation, so a hostile length
+/// field cannot make replay reserve an arbitrary buffer: a record claiming
+/// `u32::MAX` bytes with nothing behind it is a torn tail.
 #[test]
-fn oversized_wal_frame_length_is_not_allocated() {
+fn oversized_wal_record_length_is_not_allocated() {
     let mut image = wal::encode_header(1, 0);
-    // A frame claiming far more payload than MAX_FRAME, with no payload behind it.
     image.extend_from_slice(&u32::MAX.to_le_bytes()); // len
-    image.extend_from_slice(&0u64.to_le_bytes()); // checksum
-    image.extend_from_slice(&1u64.to_le_bytes()); // seq
+    image.extend_from_slice(&0x5854u16.to_le_bytes()); // tag
+    image.extend_from_slice(&[1, 0]); // COMMIT
+    image.extend_from_slice(&1u64.to_le_bytes()); // first_seq
+    image.extend_from_slice(&1u32.to_le_bytes()); // op_count
+    image.resize(wal::HEADER_LEN + wal::RECORD_HEADER_LEN, 0);
     let replayed = wal::replay(&image).unwrap();
-    assert!(replayed.ops.is_empty(), "an unbacked frame must not be replayed");
+    assert_eq!(replayed.records().count(), 0, "an unbacked record must not be replayed");
     assert_eq!(replayed.good_len, wal::HEADER_LEN);
 }
 

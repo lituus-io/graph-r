@@ -426,7 +426,9 @@ pub(crate) fn compact_locked(store: &Store, state: &mut WriteState) -> Result<Co
     // is durable on disk and the next catch-up installs it.
     let map = crate::mmap::MappedFile::open(&base_path(&store.dir))?;
     let dir = base::BaseDir::parse(map.bytes())?;
-    store.install(crate::store::GenInner::from_parts(map, dir), new_generation)?;
+    if store.install(crate::store::GenInner::from_parts(map, dir), new_generation).is_some() {
+        return Err(crate::Error::busy("all generation slots pinned by snapshots"));
+    }
     state.seen = Seen {
         stamp: Stamp::read(&store.dir),
         wal_pos: wal::HEADER_LEN as u64,
