@@ -80,9 +80,60 @@ fn closed() -> PyErr {
     GraphRError::new_err("store is closed")
 }
 
-/// How long a write waits for another writer: the store's own default.
-fn lock_wait() -> Duration {
-    Config::default().lock_wait
+/// A wait in seconds from a Python number (an `int`, a `float`, or any
+/// number whose `str()` is a decimal): finite and `>= 0`, else
+/// `ValueError`. Read as the decimal text Python prints (for a float, the
+/// shortest that round-trips) and rounded to whole microseconds with integer
+/// arithmetic, which links neither float conversion nor float parsing into
+/// the wheel.
+fn seconds(v: &Bound<'_, PyAny>) -> PyResult<Duration> {
+    let bad = || PyValueError::new_err("a wait must be a finite number of seconds >= 0");
+    if v.is_instance_of::<pyo3::types::PyString>() {
+        return Err(bad());
+    }
+    let text = v.str()?;
+    micros(text.to_str()?.trim()).map(Duration::from_micros).ok_or_else(bad)
+}
+
+/// `text` (`digits[.digits][e[+-]digits]`) in whole microseconds, rounded
+/// half up; `None` for anything else (a sign, `inf`, `nan`) or past `u64`.
+#[inline]
+fn micros(text: &str) -> Option<u64> {
+    let (mantissa, exp) = match text.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && frac.is_empty() || whole.len() + frac.len() > 36 {
+        return None;
+    }
+    let mut digits: u128 = 0;
+    for c in whole.bytes().chain(frac.bytes()) {
+        digits = digits * 10 + u128::from(c.checked_sub(b'0').filter(|d| *d < 10)?);
+    }
+    let scale = exp.checked_sub(i32::try_from(frac.len()).ok()?)?.checked_add(6)?;
+    let us = if scale >= 0 {
+        digits.checked_mul(10u128.checked_pow(scale.unsigned_abs())?)?
+    } else if scale < -38 {
+        0
+    } else {
+        let div = 10u128.pow(scale.unsigned_abs());
+        (digits + div / 2) / div
+    };
+    u64::try_from(us).ok()
+}
+
+/// How long a write waits for another writer: `lock_wait` seconds, else
+/// the store's own default (ten seconds).
+#[inline]
+fn lock_wait(v: Option<&Bound<'_, PyAny>>) -> PyResult<Duration> {
+    v.map_or(Ok(Config::default().lock_wait), seconds)
+}
+
+/// The configuration a writable handle opens with.
+#[inline]
+fn writable(v: Option<&Bound<'_, PyAny>>) -> PyResult<Config> {
+    Ok(Config { lock_wait: lock_wait(v)?, ..Config::default() })
 }
 
 /// Edges per node a `set_edges` call may carry (the store's own cap).
@@ -367,6 +418,9 @@ impl PySyncReport {
 struct PyStore {
     open: RwLock<Option<Open>>,
     gate: Gate,
+    /// How long a write (and a `transaction()` by default) waits for
+    /// another writer.
+    lock_wait: Duration,
 }
 
 /// Orders this handle's own writes around an open `transaction()`. The
@@ -421,14 +475,14 @@ impl Gate {
         Ok(st)
     }
 
-    fn write(&self) -> PyResult<Ticket<'_>> {
+    fn write(&self, wait: Duration) -> PyResult<Ticket<'_>> {
         let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if st.txn == Some(std::thread::current().id()) {
             return Err(GraphRError::new_err(
                 "a transaction is open on this store in this thread: write through it",
             ));
         }
-        let mut st = self.wait_until_free(st, lock_wait(), |s| s.txn.is_some())?;
+        let mut st = self.wait_until_free(st, wait, |s| s.txn.is_some())?;
         st.writes += 1;
         Ok(Ticket(self))
     }
@@ -678,41 +732,65 @@ fn merge_report(
     }
 }
 
-fn wrap(inner: Store) -> PyResult<PyStore> {
-    Ok(PyStore { open: RwLock::new(Some(Open { inner, rt: runtime()? })), gate: Gate::default() })
+fn wrap(inner: Store, lock_wait: Duration) -> PyResult<PyStore> {
+    Ok(PyStore {
+        open: RwLock::new(Some(Open { inner, rt: runtime()? })),
+        gate: Gate::default(),
+        lock_wait,
+    })
 }
 
 #[pymethods]
 impl PyStore {
     /// Create a fresh store in `path` (errors if one already exists there).
+    /// `lock_wait` (seconds; default ten) is how long a write waits for
+    /// another writer before `LockedError`.
     #[staticmethod]
-    fn create(py: Python<'_>, path: String) -> PyResult<Self> {
-        wrap(Store::create(&path, Config::default()).map_err(|e| map_open_err(py, e))?)
+    #[pyo3(signature = (path, lock_wait=None))]
+    fn create(
+        py: Python<'_>,
+        path: String,
+        lock_wait: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let cfg = writable(lock_wait)?;
+        let inner = py.detach(|| Store::create(&path, cfg));
+        wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
     }
 
     /// Open an existing store read-write (errors if missing;
     /// `FormatVersionError` if another format version wrote it). Takes no
     /// lock: any number of writable handles, in any number of processes,
-    /// may be open on one path.
+    /// may be open on one path. `lock_wait` as for `create`.
     #[staticmethod]
-    fn open(py: Python<'_>, path: String) -> PyResult<Self> {
-        wrap(py.detach(|| Store::open(&path)).map_err(|e| map_open_err(py, e))?)
+    #[pyo3(signature = (path, lock_wait=None))]
+    fn open(py: Python<'_>, path: String, lock_wait: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let cfg = writable(lock_wait)?;
+        let inner = py.detach(|| Store::open_cfg(&path, cfg));
+        wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
     }
 
     /// Open the store at `path`, creating it first if it does not exist.
     /// Safe when many processes race to create it: one creates, the others
-    /// wait for it (up to ten seconds) and open the result.
+    /// wait for it (up to `lock_wait` seconds, default ten) and open the
+    /// result.
     #[staticmethod]
-    fn open_or_create(py: Python<'_>, path: String) -> PyResult<Self> {
-        let inner = py.detach(|| Store::open_or_create(&path, Config::default()));
-        wrap(inner.map_err(|e| map_open_err(py, e))?)
+    #[pyo3(signature = (path, lock_wait=None))]
+    fn open_or_create(
+        py: Python<'_>,
+        path: String,
+        lock_wait: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let cfg = writable(lock_wait)?;
+        let inner = py.detach(|| Store::open_or_create(&path, cfg));
+        wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
     }
 
     /// Open read-only: takes no lock, so it coexists with a live writer in
     /// another process. Mutating methods raise `GraphRError`.
     #[staticmethod]
     fn open_read_only(py: Python<'_>, path: String) -> PyResult<Self> {
-        wrap(Store::open_read_only(&path).map_err(|e| map_open_err(py, e))?)
+        let inner = Store::open_read_only(&path).map_err(|e| map_open_err(py, e))?;
+        wrap(inner, Config::default().lock_wait)
     }
 
     /// Acquire `source` and absorb the result — the whole loop in one call.
@@ -777,7 +855,7 @@ impl PyStore {
                 ));
             }
             return py.detach(|| {
-                let _ticket = self.gate.write()?;
+                let _ticket = self.gate.write(self.lock_wait)?;
                 self.with(|o| {
                     o.rt.block_on(async {
                         let seed = bridge::crawl_seed(&o.inner);
@@ -823,7 +901,7 @@ impl PyStore {
         }
         let crawl_scope = parse_scope(scope.as_deref())?;
         py.detach(|| {
-            let _ticket = self.gate.write()?;
+            let _ticket = self.gate.write(self.lock_wait)?;
             self.with(|o| {
                 o.rt.block_on(async {
                     let seed = bridge::crawl_seed(&o.inner);
@@ -994,24 +1072,36 @@ impl PyStore {
     }
 
     /// A transaction: `with store.transaction() as tx:` takes the commit
-    /// lock at entry (waiting up to ten seconds for another writer, else
-    /// `LockedError`; at once with `wait=False`), so `tx`'s reads see every
+    /// lock at entry, waiting for another writer up to `wait` — `True` (the
+    /// store's `lock_wait`, ten seconds by default), `False` (not at all), or
+    /// a number of seconds — else `LockedError`. So `tx`'s reads see every
     /// writer's commits and nothing else can commit until the block ends.
     /// `tx` has the store's read and write methods; its writes are staged
     /// and committed together — one append, one fsync — when the block
     /// exits, or dropped when it raises. Reads show committed state, not the
     /// block's own staged writes. On this store, plain writes from other
     /// threads wait for the block; from the block's own thread they raise.
-    #[pyo3(signature = (wait=true))]
-    fn transaction(slf: Bound<'_, Self>, wait: bool) -> PyTransaction {
-        PyTransaction {
+    #[pyo3(signature = (wait=None))]
+    fn transaction(
+        slf: Bound<'_, Self>,
+        wait: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyTransaction> {
+        let wait = match wait {
+            None => slf.borrow().lock_wait,
+            Some(w) => match w.extract::<bool>() {
+                Ok(true) => slf.borrow().lock_wait,
+                Ok(false) => Duration::ZERO,
+                Err(_) => seconds(&w)?,
+            },
+        };
+        Ok(PyTransaction {
             store: slf.unbind(),
             wait,
             lock: None,
             cmds: Vec::new(),
             staged: Staged::default(),
             phase: Phase::New,
-        }
+        })
     }
 
     /// Fold the write-ahead log into a fresh immutable base now (also happens
@@ -1019,7 +1109,7 @@ impl PyStore {
     /// Returns the new generation number.
     fn compact(&self, py: Python<'_>) -> PyResult<u64> {
         py.detach(|| {
-            let _ticket = self.gate.write()?;
+            let _ticket = self.gate.write(self.lock_wait)?;
             self.with(|o| o.inner.compact().map(|s| s.generation).map_err(map_err))
         })
     }
@@ -1261,7 +1351,7 @@ impl PyStore {
     /// One write as a one-op transaction, through the gate.
     fn write_one(&self, py: Python<'_>, cmd: Cmd) -> PyResult<bool> {
         py.detach(|| {
-            let _ticket = self.gate.write()?;
+            let _ticket = self.gate.write(self.lock_wait)?;
             self.with(|o| commit(&o.inner, None, std::slice::from_ref(&cmd)))
         })
     }
@@ -1303,7 +1393,8 @@ enum Phase {
 #[pyclass(name = "Transaction")]
 struct PyTransaction {
     store: Py<PyStore>,
-    wait: bool,
+    /// How long `__enter__` waits for the commit lock.
+    wait: Duration,
     lock: Option<CommitLock>,
     cmds: Vec<Cmd>,
     staged: Staged,
@@ -1365,11 +1456,8 @@ impl PyTransaction {
         let store: &PyStore = &store;
         let wait = slf.wait;
         let lock = py.detach(|| {
-            store.gate.begin(if wait { lock_wait() } else { Duration::ZERO })?;
-            let lock = store.with(|o| {
-                if wait { o.inner.commit_lock() } else { o.inner.try_commit_lock() }
-                    .map_err(map_err)
-            });
+            store.gate.begin(wait)?;
+            let lock = store.with(|o| o.inner.commit_lock_within(wait).map_err(map_err));
             if lock.is_err() {
                 store.gate.end();
             }

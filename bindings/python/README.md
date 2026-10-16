@@ -1,5 +1,16 @@
 # graph-r
 
+[![CI](https://github.com/lituus-io/graph-r/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/ci.yml)
+[![Security](https://github.com/lituus-io/graph-r/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/security.yml)
+[![Fuzz](https://github.com/lituus-io/graph-r/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/fuzz.yml)
+[![Benchmark](https://github.com/lituus-io/graph-r/actions/workflows/benchmark.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/benchmark.yml)
+[![Release](https://github.com/lituus-io/graph-r/actions/workflows/release.yaml/badge.svg)](https://github.com/lituus-io/graph-r/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/uu-graph-r?label=crates.io)](https://crates.io/crates/uu-graph-r)
+[![docs.rs](https://img.shields.io/docsrs/uu-graph-r?label=docs.rs)](https://docs.rs/uu-graph-r)
+[![PyPI](https://img.shields.io/pypi/v/uu-graph-r?label=PyPI)](https://pypi.org/project/uu-graph-r/)
+[![Python](https://img.shields.io/pypi/pyversions/uu-graph-r)](https://pypi.org/project/uu-graph-r/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](https://github.com/lituus-io/graph-r/blob/main/LICENSE)
+
 `pip install uu-graph-r` → `import graph_r` (Python ≥ 3.12, one `abi3` wheel
 per platform).
 
@@ -56,15 +67,21 @@ store.sync("https://docs.example.com/", depth=2)   # unchanged: zero bodies
   now, so the directory can be deleted (Windows refuses while a file is
   mapped). A store written
   by another format version raises `FormatVersionError` (a `GraphRError`)
-  with `found` and `supported`.
+  with `found` and `supported`, and is left untouched: a 0.4 or 0.5 store
+  raises `found=2, supported=3` — drain it with the release that wrote it,
+  then rebuild.
 - **Thread-safe.** Every method detaches from the interpreter; driving the
   store through `asyncio.to_thread` is the intended pattern.
 - **Many writers.** Any number of processes may hold a writable `Store` on
   one path; `open_or_create` is safe when they race to create it. Each write
   holds the commit lock only for its append; `with store.transaction() as
   tx:` holds it across a block, so a read-modify-write is serializable and
-  the block commits as one append. A writer that cannot get the lock in ten
-  seconds raises `LockedError` (a `GraphRError`).
+  the block commits as one append. A writer that cannot get the lock within
+  `lock_wait` seconds (`Store.open(path, lock_wait=0.5)`; ten by default)
+  raises `LockedError` (a `GraphRError`); `transaction(wait=...)` takes
+  `True`, `False` or a number of seconds.
+- **Atomic.** A write or a block is one checksummed log record: a crash
+  mid-write loses that write whole, never part of it, and nothing before it.
 - **Durable.** An mmapped, checksummed store with write-ahead logging,
   crash-safe compaction, and many-writer / many-reader access — implemented
   in Rust, shipped as one `abi3` wheel per platform

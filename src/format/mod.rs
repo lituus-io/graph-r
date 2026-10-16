@@ -6,8 +6,9 @@
 //! - [`base`] — `graph.base`, the immutable mmapped snapshot: checksummed
 //!   128-byte header, section directory, 64-byte-aligned sections, and a
 //!   whole-file xxh3 trailer, written via tmp + fsync + rename.
-//! - [`wal`] — `graph.wal`, the append-only op log: checksummed frames whose
-//!   replay stops at the first torn frame.
+//! - [`wal`] — `graph.wal`, the append-only log: one checksummed record per
+//!   transaction, read in place; replay stops at the first torn record, and a
+//!   record whose checksum holds but whose contents do not is corrupt.
 //!
 //! Every decoder returns [`crate::Error::Format`] on malformed input (and
 //! [`crate::Error::Version`] on a well-formed header of another version) and caps

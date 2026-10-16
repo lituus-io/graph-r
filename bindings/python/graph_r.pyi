@@ -4,7 +4,7 @@
 # Type stubs for the graph_r native extension module.
 
 from types import TracebackType
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 
 __version__: str
 
@@ -26,7 +26,10 @@ class GraphRError(Exception):
 class FormatVersionError(GraphRError):
     """The store on disk was written in a format version this build does not
     read (an older store to rebuild, or a newer one). Raised by ``open``,
-    ``open_or_create`` and ``open_read_only`` (and ``reload_if_stale``)."""
+    ``open_or_create`` and ``open_read_only`` (and ``reload_if_stale``),
+    before anything is written: the store is left exactly as it was. A store
+    from 0.4 or 0.5 raises it with ``found=2, supported=3``; drain it with
+    the release that wrote it, then rebuild."""
 
     found: int
     """The version the file declares."""
@@ -34,10 +37,10 @@ class FormatVersionError(GraphRError):
     """The one version this build reads and writes."""
 
 class LockedError(GraphRError):
-    """Another writer held the store's commit lock past the wait (ten
-    seconds; none for ``transaction(wait=False)``). Nothing was written:
-    retry later. A subclass of ``GraphRError``, so existing handlers keep
-    catching it."""
+    """Another writer held the store's commit lock past the wait (the
+    store's ``lock_wait``, ten seconds unless set at open; a
+    ``transaction(wait=...)``'s own). Nothing was written: retry later. A
+    subclass of ``GraphRError``, so existing handlers keep catching it."""
 
 class Anchor:
     """A sub-document anchor on a hit: fetch the URL and resolve the heading
@@ -99,23 +102,27 @@ class Store:
 
     Any number of writable handles, in any number of processes, may be open
     on one path. Every write is a transaction: the commit lock is held only
-    for its append, and a writer that cannot get it within ten seconds raises
-    ``LockedError``. ``transaction()`` holds it across a block.
+    for its append (one record, one write, one fsync), and a writer that
+    cannot get it within ``lock_wait`` seconds (ten unless set at open)
+    raises ``LockedError``. ``transaction()`` holds it across a block. A
+    crash mid-write loses that write whole and nothing before it.
     """
 
     @staticmethod
-    def create(path: str) -> "Store":
-        """Create a fresh store in ``path`` (errors if one already exists)."""
+    def create(path: str, lock_wait: Optional[float] = None) -> "Store":
+        """Create a fresh store in ``path`` (errors if one already exists).
+        ``lock_wait``: seconds a write waits for another writer before
+        ``LockedError`` (default ten; ``ValueError`` unless finite and >= 0)."""
     @staticmethod
-    def open(path: str) -> "Store":
+    def open(path: str, lock_wait: Optional[float] = None) -> "Store":
         """Open an existing store read-write (errors if missing;
         ``FormatVersionError`` if another format version wrote it). Takes no
-        lock: writable handles coexist."""
+        lock: writable handles coexist. ``lock_wait`` as for ``create``."""
     @staticmethod
-    def open_or_create(path: str) -> "Store":
+    def open_or_create(path: str, lock_wait: Optional[float] = None) -> "Store":
         """Open the store at ``path``, creating it first if absent. Safe when
         many processes race to create it: one creates, the others wait for it
-        and open the result."""
+        (up to ``lock_wait``) and open the result."""
     @staticmethod
     def open_read_only(path: str) -> "Store":
         """Open read-only; coexists with a live writer in another process."""
@@ -265,11 +272,12 @@ class Store:
         """Every live (committed, non-tombstoned) document url starting with
         ``prefix``, sorted. Exhaustive, not ranked; one pass over the
         documents plus a sort of the matches."""
-    def transaction(self, wait: bool = True) -> "Transaction":
+    def transaction(self, wait: Union[bool, float] = True) -> "Transaction":
         """``with store.transaction() as tx:`` — a serializable block.
 
-        The commit lock is taken at entry (waiting up to ten seconds, else
-        ``LockedError``; at once with ``wait=False``), so ``tx``'s reads see
+        The commit lock is taken at entry, waiting for another writer up to
+        ``wait``: ``True`` (the store's ``lock_wait``), ``False`` (not at all)
+        or a number of seconds; past it, ``LockedError``. So ``tx``'s reads see
         every writer's commits and no other writer can commit until the block
         ends. ``tx`` has the store's read and write methods; the writes are
         staged and committed together — one append, one fsync — at exit, or

@@ -34,10 +34,14 @@ else warn "python3 not found"; fi
 
 step "fuzz (${FUZZ_SECS}s per target)"
 if have fuzz; then
-  for t in fuzz_base_parse fuzz_wal_replay fuzz_op_decode fuzz_postings_decode fuzz_wal_committed_len fuzz_open_image; do
-    (cd fuzz && cargo fuzz run "$t" -- -max_total_time="$FUZZ_SECS" 2>&1 | tail -1)
+  for t in fuzz_base_parse fuzz_wal_replay fuzz_op_decode fuzz_record_decode fuzz_postings_decode \
+    fuzz_wal_committed_len fuzz_open_image fuzz_two_writers fuzz_crash_cut; do
+    extra=""; [ "$t" = fuzz_record_decode ] && extra="-malloc_limit_mb=64"
+    (cd fuzz && cargo fuzz run "$t" -- -max_total_time="$FUZZ_SECS" $extra 2>&1 | tail -1)
   done
 else warn "cargo-fuzz not installed"; fi
+
+step "cross-version (scripts/xver)"; cargo run -q --locked --manifest-path scripts/xver/Cargo.toml | tail -1
 
 step "supply chain"
 if have deny; then cargo deny check; else warn "cargo-deny not installed"; fi

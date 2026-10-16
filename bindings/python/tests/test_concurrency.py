@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 
@@ -126,6 +127,68 @@ def test_waiting_and_not_waiting_for_another_writer(tmp_path):
     with b.transaction(wait=False) as tx:
         tx.add("https://x.dev/b", content_hash=1)
     assert b.urls() == ["https://x.dev/b"]
+
+
+def test_lock_wait_bounds_how_long_a_write_waits(tmp_path):
+    path = str(tmp_path / "kb")
+    a = graph_r.Store.create(path)
+    b = graph_r.Store.open(path, lock_wait=0.05)
+    with a.transaction():
+        # A plain write and a transaction's default both wait b's 50 ms, not
+        # the ten-second default.
+        start = time.monotonic()
+        with pytest.raises(graph_r.LockedError):
+            b.add("https://x.dev/b", content_hash=1)
+        with pytest.raises(graph_r.LockedError):
+            with b.transaction():
+                pass
+        assert time.monotonic() - start < 5
+    b.add("https://x.dev/b", content_hash=1)
+    assert b.urls() == ["https://x.dev/b"]
+
+
+def test_transaction_wait_takes_seconds(tmp_path):
+    path = str(tmp_path / "kb")
+    a = graph_r.Store.create(path)
+    b = graph_r.Store.open_or_create(path)  # a ten-second lock_wait
+    with a.transaction():
+        start = time.monotonic()
+        for wait in (0, 0.0, 0.05, False):
+            with pytest.raises(graph_r.LockedError):
+                with b.transaction(wait=wait):
+                    pass
+        assert time.monotonic() - start < 5, "a wait in seconds was not honoured"
+    with b.transaction(wait=0.5) as tx:
+        tx.add("https://x.dev/b", content_hash=1)
+    with b.transaction(wait=True) as tx:
+        tx.add("https://x.dev/c", content_hash=1)
+    assert b.urls() == ["https://x.dev/b", "https://x.dev/c"]
+
+
+@pytest.mark.parametrize("ok", [0, 2, 0.25, 1e-05, 1.5e2, 0.0000001])
+def test_a_wait_in_any_decimal_form_opens(tmp_path, ok):
+    path = str(tmp_path / "kb")
+    graph_r.Store.create(path, lock_wait=ok)
+    store = graph_r.Store.open(path, lock_wait=ok)
+    with store.transaction(wait=ok) as tx:
+        tx.add("https://x.dev/a", content_hash=1)
+    assert store.urls() == ["https://x.dev/a"]
+
+
+@pytest.mark.parametrize("bad", [-1, -0.5, float("nan"), float("inf"), 1e30, True])
+def test_a_wait_must_be_a_finite_number_of_seconds(tmp_path, bad):
+    path = str(tmp_path / "kb")
+    store = graph_r.Store.create(path)
+    for opener in (graph_r.Store.open, graph_r.Store.open_or_create):
+        with pytest.raises(ValueError):
+            opener(path, lock_wait=bad)
+    with pytest.raises(ValueError):
+        graph_r.Store.create(str(tmp_path / "other"), lock_wait=bad)
+    if bad is not True:  # transaction(wait=True) means the store's own wait
+        with pytest.raises(ValueError):
+            store.transaction(wait=bad)
+    with pytest.raises(ValueError):
+        store.transaction(wait="soon")
 
 
 def test_plain_writes_and_a_block_on_one_store(tmp_path):

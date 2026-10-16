@@ -1,0 +1,21 @@
+# Author: spicyzhug@gmail.com
+# Copyright: lituus-io, all rights reserved
+#
+# The cross-version harness: the released 0.5.1 opens stores this checkout
+# writes. Its own project, detached from the crate and its workspace, so the
+# crate never depends on it; CI runs it as a job of its own.
+
+[package]
+name = "graph-r-xver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The release under test, exactly as published.
+old = { package = "uu-graph-r", version = "=0.5.1" }
+# This checkout, which writes the stores.
+new = { package = "uu-graph-r", path = "../.." }
+
+[workspace]
+members = ["."]

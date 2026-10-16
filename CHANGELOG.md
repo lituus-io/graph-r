@@ -4,6 +4,90 @@ All notable changes to graph-r are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.0
+
+**One record per transaction.** The log is now one checksummed record per
+transaction, so a transaction is atomic on disk, in memory and across
+processes. Opening a 0.4 or 0.5 store is a typed refusal (see *Format* below):
+drain, then rebuild.
+
+- A commit (or a `transact` block) is sealed into one record — length, tag,
+  first sequence, op count and an xxh3 over the rest — and appended with one
+  write and one fsync. A crash mid-append leaves a torn record: replay
+  ignores it and the next committer cuts it off, so that transaction is
+  absent whole and every earlier one present. (0.5 logged one frame per op,
+  so a crash could keep a prefix of a transaction.)
+- Whole records only, everywhere: a commit, a catch-up from another
+  process's appends, an image reload and a replay each publish whole records
+  with one move of the overlay frontier, so no snapshot ever holds part of a
+  transaction. A catch-up that finds another writer mid-append leaves that
+  record for its next look; `committed_len` and `committed_frames_len` keep
+  their signatures and now count whole records, so a mirror ships whole
+  transactions.
+- A record whose checksum holds but whose contents break a rule (an unknown
+  op, a lying count, overlapping string lengths, unsorted edges or keys,
+  bad UTF-8, non-zero reserved bytes, a sequence regression) is
+  `Error::Corrupt` naming its byte offset, and is never cut: 0.5 cut a
+  malformed frame as a torn tail, silently dropping every commit after it.
+- **Zero-copy log.** The log is read once at open (never mapped: it is cut
+  in place) and served as is: the bytes a commit sealed, or a catch-up read,
+  become the overlay without decoding into owned ops. Ops are read through
+  borrowed views (`OpView`, `UpsertView`, `SegsView`, `EdgesView`,
+  `TouchView`, `AttrsView`); strings are `&str` over bytes validated once
+  when the record was accepted. Staging encodes straight into the record
+  (`RecordBuf`), named attributes included.
+- Measured on one machine against 0.5.1: opening a log of 1k / 10k / 100k
+  ops is 2.3x / 3.3x / 3.45x faster (100k: 22.2 ms to 6.44 ms); the first
+  overlay read of a snapshot 3.4x (492 us to 147 us); a 100-upsert commit
+  28% less CPU. Counted: opening 10k ops allocates 23 times (0.5.1: 20 031),
+  folding them 13 (20 013), and a steady-state commit allocates nothing of
+  its own after staging (21; on Windows the standard library's UTF-16 copy
+  of each path it hands the OS adds 2, for the two stats that notice another
+  process's compaction). The wheel's extension is no larger than 0.5.1's
+  (4 949 712 bytes on macOS arm64; same C-API imports).
+- **Commit fixes** (all from 0.5.1): room in the overlay is reserved before
+  the append, so a durable commit can no longer go unaccounted and reuse
+  its sequence numbers, which left the store unopenable (`wal sequence
+  regression`); a failed append keeps the writer's staged ops (a failed
+  transaction drops only its own) and forces a full re-read of the log; an
+  inline compaction that cannot run leaves `compaction_due()` set instead of
+  failing a commit that is already durable.
+- A transaction larger than `wal::MAX_RECORD` (256 MiB, about a million
+  upserts) is refused at commit with `Error::Format`, before anything is
+  written, its ops still staged; `Writer::discard` drops them.
+  `set_edges` and `set_edges_with_flags` stay infallible.
+- `Store::commit_lock_within(wait)`: a commit lock with a wait of the
+  caller's choosing.
+- **Format.** Log format 3 and base format 3 (the base layout is unchanged:
+  only its version field and header checksum differ from 0.5's). A 0.4/0.5
+  store opened by 0.6, and a 0.6 store opened by 0.4/0.5, are refused with
+  `Error::Version { found, supported }` — `{2, 3}` and `{3, 2}` — before any
+  repair, files untouched. The base is bumped too because every release
+  reads it first: a 0.5 writer that found a 0.6 store's log empty would
+  otherwise have rewritten it as its own. There is no in-place upgrade and
+  no mixing of 0.5 and 0.6 writers on one store: drain, then rebuild. A
+  store from the 0.5 line is also the only kind 0.5.x's sequence-reuse
+  defect can have damaged; 0.6.0 supersedes it.
+- **Removed API** (the frame format): `wal::Op`, `OwnedSeg`, `OwnedEdge`,
+  `encode_frame`, `replay_frames`, `MAX_FRAME`, `FRAME_OVERHEAD` and
+  `Replay::ops`; `wal::replay` returns a `Replay` that borrows its image and
+  walks `records()`. `writer::MAX_LABEL` and `MAX_SEGS` are re-exported from
+  `wal`, unchanged; `MAX_ATTR_BYTES` stays 1 048 246.
+- The overlay's maps hash a key digest with one finalizer round under a
+  per-map secret, instead of SipHash.
+- Python: `Store.open`, `open_or_create` and `create` take `lock_wait=None`
+  (seconds); `transaction(wait=...)` takes `True`, `False` or seconds. A 0.4
+  or 0.5 store raises `FormatVersionError(found=2, supported=3)`.
+- Tests: a reader in one process never sees part of another process's
+  transaction (fails on 0.5.1); a crash cut anywhere in a real record loses
+  that transaction whole; the model proptest cuts a log of multi-op
+  transactions at any byte and requires exactly the first k; refusals leave
+  every file byte-identical; counted allocations; new fuzz targets
+  `fuzz_record_decode` and `fuzz_crash_cut`; `scripts/xver`, run in CI, has
+  the released 0.5.1 open 0.6 stores (an empty log included) and requires
+  `Version { found: 3, supported: 2 }` with the files unchanged.
+- Builds with uu-link-r 0.4.3 and uu-objstore-r 0.2.5.
+
 ## 0.5.1
 
 **Fair commit lock.** In 0.5.0 a writer waiting for the commit lock polled it

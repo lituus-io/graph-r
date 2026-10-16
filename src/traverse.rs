@@ -56,12 +56,9 @@ pub struct Neighbors<'s> {
 pub(crate) enum NeighborsInner<'s> {
     /// CSR run in the base file.
     Base { snap: &'s crate::snapshot::Snapshot<'s>, edges: &'s [u8], idx: usize, end: usize },
-    /// Whole-set replacement living in the overlay.
-    Overlay {
-        snap: &'s crate::snapshot::Snapshot<'s>,
-        edges: &'s [crate::format::wal::OwnedEdge],
-        idx: usize,
-    },
+    /// Whole-set replacement living in the overlay: the op's fixed-width
+    /// entries, read in place.
+    Overlay { snap: &'s crate::snapshot::Snapshot<'s>, edges: &'s [u8], idx: usize },
     /// The node has no edges.
     Empty,
 }
@@ -93,7 +90,10 @@ impl LendingIterator for Neighbors<'_> {
                 })
             }
             NeighborsInner::Overlay { snap, edges, idx } => {
-                let (dst_key, etype, flags, weight) = *edges.get(*idx)?;
+                if *idx >= crate::format::wal::edge_count(edges) {
+                    return None;
+                }
+                let (dst_key, etype, flags, weight) = crate::format::wal::edge_at(edges, *idx);
                 *idx += 1;
                 let dst = snap.base_node_id(dst_key);
                 let dst_url = dst.and_then(|id| snap.node_identity(id).1);

@@ -640,3 +640,98 @@ fn attributes_that_cannot_fit_one_log_frame_are_refused_not_lost_on_reopen() {
     let snap = store.snapshot();
     assert_eq!(snap.attr(UrlKey::of(url), 2).map(str::len), Some(graph_r::writer::MAX_ATTR_LEN));
 }
+
+// ---- 0.6: a transaction is one record --------------------------------------
+
+/// Every file in `dir` with its bytes: what "unchanged on disk" compares.
+fn files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A 0.6 store holding two committed documents, its handle dropped.
+fn store_with_two(dir: &std::path::Path) {
+    let store = Store::create(dir, Config::default()).unwrap();
+    put(&store, "https://x.dev/a");
+    put(&store, "https://x.dev/b");
+}
+
+/// Every way of opening `dir` must fail with `want` and leave every file
+/// byte-identical: a log this build cannot read is refused, never repaired.
+fn refused_untouched(dir: &std::path::Path, want: fn(&Error) -> bool) {
+    let before = files(dir);
+    let opens: [graph_r::Result<Store>; 4] = [
+        Store::open(dir),
+        Store::open_cfg(dir, Config::default()),
+        Store::open_or_create(dir, Config::default()),
+        Store::open_read_only(dir),
+    ];
+    for (i, opened) in opens.into_iter().enumerate() {
+        match opened {
+            Err(e) if want(&e) => {}
+            other => panic!("opener {i}: refused with the wrong outcome: {other:?}"),
+        }
+    }
+    assert_eq!(files(dir), before, "a refused log was rewritten");
+}
+
+/// 0.5.1's repair rewrote any log it could not take for current, so a log
+/// beside a base of this format had to be refused before repair, whatever
+/// it holds: a log of the previous format...
+#[test]
+fn a_current_base_with_a_version_2_log_is_refused_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    store_with_two(dir.path());
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/store_v042")
+        .join(graph_r::store::WAL_FILE);
+    std::fs::copy(fixture, dir.path().join(graph_r::store::WAL_FILE)).unwrap();
+    refused_untouched(dir.path(), |e| matches!(e, Error::Version { found: 2, supported: 3 }));
+}
+
+/// ...a log of a later generation than its base (under the lock, damage;
+/// without it, a compaction in flight)...
+#[test]
+fn a_current_base_with_a_foreign_generation_log_is_refused_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    store_with_two(dir.path());
+    let path = dir.path().join(graph_r::store::WAL_FILE);
+    let mut raw = std::fs::read(&path).unwrap();
+    let header = graph_r::format::wal::encode_header(99, 0);
+    raw[..graph_r::format::wal::HEADER_LEN].copy_from_slice(&header);
+    std::fs::write(&path, &raw).unwrap();
+    refused_untouched(dir.path(), |e| matches!(e, Error::Corrupt { .. } | Error::Busy { .. }));
+}
+
+/// ...or a record whose checksum holds but whose contents do not, which is
+/// how a tampered or mis-written commit looks. 0.5.1 cut such a frame as a
+/// torn tail, silently dropping every commit after it.
+#[test]
+fn a_corrupt_record_is_refused_untouched_never_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    store_with_two(dir.path());
+    let path = dir.path().join(graph_r::store::WAL_FILE);
+    let mut raw = std::fs::read(&path).unwrap();
+    let first = graph_r::format::wal::HEADER_LEN;
+    let len = u32::from_le_bytes(raw[first..first + 4].try_into().unwrap()) as usize;
+    let rec = &mut raw[first..first + len];
+    rec[32 + 4] = 7; // an op kind this format does not have
+    let mut h = graph_r::hash::Hasher::new();
+    h.update(&rec[..24]);
+    h.update(&rec[32..]);
+    let sum = h.digest64();
+    rec[24..32].copy_from_slice(&sum.to_le_bytes());
+    std::fs::write(&path, &raw).unwrap();
+    // The first record starts right after the 64-byte header.
+    refused_untouched(
+        dir.path(),
+        |e| matches!(e, Error::Corrupt { message } if message.contains("record at byte 64")),
+    );
+}

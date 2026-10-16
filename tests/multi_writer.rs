@@ -7,6 +7,10 @@
 //! and a role in the environment; [`child`] is a no-op unless that role is
 //! set, so a normal `cargo test` run passes it trivially. Processes start
 //! together on a "go" file, so their opens and commits genuinely race.
+//!
+//! No child outlives its test: a spawned child is [`Reaped`] (killed and
+//! waited for) when the parent drops it on any path, a failed assertion
+//! included, and every child that loops gives up past [`CHILD_DEADLINE`].
 
 #![cfg(feature = "store")]
 use graph_r::prelude::*;
@@ -16,6 +20,10 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const ROLE: &str = "GRAPH_R_MW_ROLE";
+/// The longest a child keeps looping, whatever its parent does.
+const CHILD_DEADLINE: Duration = Duration::from_secs(120);
+/// Ops in the transaction the "crash" child dies writing.
+const CRASH_OPS: usize = 5;
 const ARGS: &str = "GRAPH_R_MW_ARGS";
 
 fn url_of(writer: usize, n: usize) -> String {
@@ -35,17 +43,46 @@ fn doc(url: &str) -> DocRecord<'_> {
     }
 }
 
-fn spawn(role: &str, args: &[String]) -> Child {
-    Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child", "--nocapture", "--test-threads=1"])
-        .env(ROLE, role)
-        .env(ARGS, args.join("\n"))
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap()
+/// A child process that is killed and waited for when dropped still
+/// running: a parent that panics (an assertion, a failed sibling) never
+/// leaves writers committing to a temporary store behind it.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
 }
 
-fn wait_all(children: Vec<Child>) {
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn spawn(role: &str, args: &[String]) -> Reaped {
+    Reaped(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child", "--nocapture", "--test-threads=1"])
+            .env(ROLE, role)
+            .env(ARGS, args.join("\n"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn wait_all(children: Vec<Reaped>) {
     for mut c in children {
         let status = c.wait().unwrap();
         assert!(status.success(), "a child process failed: {status}");
@@ -75,6 +112,12 @@ fn wait_for(go: &Path) {
         assert!(start.elapsed() < Duration::from_secs(60), "never released");
         std::thread::sleep(Duration::from_micros(200));
     }
+}
+
+/// Every op's sequence number in a log image, in log order.
+fn seqs(raw: &[u8]) -> Vec<u64> {
+    let replayed = graph_r::format::wal::replay(raw).unwrap();
+    replayed.records().flat_map(|r| r.first_seq()..=r.last_seq()).collect()
 }
 
 fn live_urls(store: &Store) -> Vec<String> {
@@ -146,8 +189,10 @@ fn child() {
             let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
             let store = Store::open(&dir).unwrap();
             ready_then_go(&dir.join("go"), id);
+            let deadline = Instant::now() + CHILD_DEADLINE;
             let mut k = 0;
             while !dir.join("stop").exists() {
+                assert!(Instant::now() < deadline, "never told to stop");
                 let url = url_of(id, k % 64);
                 store.transact(|tx| tx.upsert_node(&doc(&url))).unwrap();
                 k += 1;
@@ -174,6 +219,39 @@ fn child() {
             }
             std::fs::write(dir.join("polite"), format!("{ok} {locked}")).unwrap();
         }
+        // M transactions of K fresh documents each.
+        "ktx" => {
+            let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
+            let (m, k): (usize, usize) = (args[2].parse().unwrap(), args[3].parse().unwrap());
+            let cfg = Config { compact_after_ops: usize::MAX, ..Config::default() };
+            let store = Store::open_cfg(&dir, cfg).unwrap();
+            ready_then_go(&dir.join("go"), id);
+            for t in 0..m {
+                let urls: Vec<String> = (0..k).map(|i| url_of(id, t * k + i)).collect();
+                store.transact(|tx| urls.iter().try_for_each(|u| tx.upsert_node(&doc(u)))).unwrap();
+            }
+        }
+        // Die mid-append: write a strict prefix of the record this
+        // transaction would have been, then exit without unwinding.
+        "crash" => {
+            let dir = PathBuf::from(&args[0]);
+            let cut: usize = args[1].parse().unwrap();
+            let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
+            let next = seqs(&raw).last().map_or(1, |s| s + 1);
+            let mut rec = graph_r::format::wal::RecordBuf::new();
+            for i in 0..CRASH_OPS {
+                rec.push_upsert(&doc(&url_of(9, i)), 0).unwrap();
+            }
+            rec.seal(next).unwrap();
+            let rec = rec.into_vec();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join(graph_r::store::WAL_FILE))
+                .unwrap();
+            std::io::Write::write_all(&mut f, &rec[..cut.min(rec.len() - 1)]).unwrap();
+            f.sync_all().unwrap();
+            std::process::exit(0);
+        }
         other => panic!("unknown role {other}"),
     }
 }
@@ -190,7 +268,7 @@ fn writers_committing_back_to_back_cannot_starve_another() {
     let dir = root.path().join("s");
     drop(Store::create(&dir, Config::default()).unwrap());
     let d = dir.display().to_string();
-    let hot: Vec<Child> = (0..2).map(|id| spawn("hot", &[d.clone(), id.to_string()])).collect();
+    let hot: Vec<Reaped> = (0..2).map(|id| spawn("hot", &[d.clone(), id.to_string()])).collect();
     let polite = spawn("polite", &[d.clone(), "2".into(), COMMITS.to_string()]);
     go_when_ready(&dir.join("go"), 3);
     wait_all(vec![polite]);
@@ -217,7 +295,7 @@ fn concurrent_first_creation_loses_nothing() {
     for round in 0..ROUNDS {
         let dir = root.path().join(format!("s{round}"));
         let go = root.path().join(format!("go{round}"));
-        let children: Vec<Child> = (0..N)
+        let children: Vec<Reaped> = (0..N)
             .map(|id| {
                 spawn(
                     "create",
@@ -237,7 +315,7 @@ fn concurrent_first_creation_loses_nothing() {
     }
 }
 
-/// N processes × M commits, released together: exactly N·M frames with
+/// N processes × M commits, released together: exactly N·M ops with
 /// strictly increasing sequence numbers 1..=N·M, every document present, and
 /// every handle converged to the same set.
 fn n_by_m(n: usize, m: usize, compact_every: usize) {
@@ -250,7 +328,7 @@ fn n_by_m(n: usize, m: usize, compact_every: usize) {
             .chain([compact_every.to_string()])
             .collect::<Vec<_>>()
     };
-    let children: Vec<Child> = (0..n).map(|id| spawn("commits", &args(id))).collect();
+    let children: Vec<Reaped> = (0..n).map(|id| spawn("commits", &args(id))).collect();
     go_when_ready(&dir.join("go"), n);
     wait_all(children);
     let mut want: Vec<String> = (0..n).flat_map(|i| (0..m).map(move |k| url_of(i, k))).collect();
@@ -263,9 +341,7 @@ fn n_by_m(n: usize, m: usize, compact_every: usize) {
     }
     if compact_every == 0 {
         let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
-        let seqs: Vec<u64> =
-            graph_r::format::wal::replay(&raw).unwrap().ops.iter().map(|o| o.0).collect();
-        assert_eq!(seqs, (1..=(n * m) as u64).collect::<Vec<_>>(), "N·M frames, in sequence");
+        assert_eq!(seqs(&raw), (1..=(n * m) as u64).collect::<Vec<_>>(), "N·M ops, in sequence");
     }
 }
 
@@ -302,9 +378,7 @@ fn two_handles_in_one_process_both_write() {
     assert_eq!(live_urls(&a).len(), 200);
     assert_eq!(live_urls(&a), live_urls(&b));
     let raw = std::fs::read(dir.path().join(graph_r::store::WAL_FILE)).unwrap();
-    let seqs: Vec<u64> =
-        graph_r::format::wal::replay(&raw).unwrap().ops.iter().map(|o| o.0).collect();
-    assert_eq!(seqs, (1..=200).collect::<Vec<_>>());
+    assert_eq!(seqs(&raw), (1..=200).collect::<Vec<_>>());
 }
 
 /// Readers never wait on a writer: while another process holds the commit
@@ -350,4 +424,87 @@ fn readers_finish_while_a_writer_waits_for_another_process() {
     wait_all(vec![holder]);
     assert!(committed.load(Ordering::SeqCst));
     assert_eq!(store.len(), 2);
+}
+
+/// N processes commit K-op transactions while a reader in this process
+/// catches up on one thread and takes snapshots on another: no snapshot ever
+/// holds part of a transaction, so the live count is always a multiple of
+/// K. (0.5.1 fails this: a catch-up published another process's ops one at
+/// a time, and could read part of an append in progress.)
+#[test]
+fn a_reader_never_sees_part_of_another_process_transaction() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const N: usize = 3;
+    const M: usize = 40;
+    const K: usize = 7;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("s");
+    drop(Store::create(&dir, Config::default()).unwrap());
+    let reader = Store::open_read_only(&dir).unwrap();
+    let d = dir.display().to_string();
+    let children: Vec<Reaped> = (0..N)
+        .map(|id| spawn("ktx", &[d.clone(), id.to_string(), M.to_string(), K.to_string()]))
+        .collect();
+    let done = AtomicBool::new(false);
+    let (polls, seen) = (AtomicU64::new(0), AtomicU64::new(0));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                reader.reload_if_stale().unwrap();
+            }
+            reader.reload_if_stale().unwrap();
+        });
+        s.spawn(|| loop {
+            let finished = done.load(Ordering::Acquire);
+            let len = reader.snapshot().len();
+            assert_eq!(len % K, 0, "a snapshot holds {len} documents: part of a transaction");
+            polls.fetch_add(1, Ordering::Relaxed);
+            seen.fetch_max(len as u64, Ordering::Relaxed);
+            if finished {
+                break;
+            }
+        });
+        go_when_ready(&dir.join("go"), N);
+        wait_all(children);
+        done.store(true, Ordering::Release);
+    });
+    assert!(seen.load(Ordering::Relaxed) > 0, "the reader saw commits land");
+    assert!(polls.load(Ordering::Relaxed) > 0);
+    assert_eq!(reader.len(), N * M * K);
+}
+
+/// A writer killed mid-append leaves a strict prefix of its transaction's
+/// record. Whatever the cut, the next committer removes it: that
+/// transaction is absent whole, every earlier one present, and the log
+/// holds only whole records.
+#[test]
+fn a_transaction_cut_by_a_crash_is_absent_whole() {
+    let root = tempfile::tempdir().unwrap();
+    for cut in [1, 31, 32, 100, 250, usize::MAX] {
+        let dir = root.path().join(format!("s{cut}"));
+        let store = Store::create(&dir, Config::default()).unwrap();
+        for t in 0..3 {
+            store
+                .transact(|tx| (0..4).try_for_each(|i| tx.upsert_node(&doc(&url_of(t, i)))))
+                .unwrap();
+        }
+        drop(store);
+        wait_all(vec![spawn("crash", &[dir.display().to_string(), cut.to_string()])]);
+        let store = Store::open(&dir).unwrap();
+        store.transact(|tx| tx.upsert_node(&doc(&url_of(7, 0)))).unwrap();
+        let mut want: Vec<String> =
+            (0..3).flat_map(|t| (0..4).map(move |i| url_of(t, i))).collect();
+        want.push(url_of(7, 0));
+        want.sort();
+        assert_eq!(live_urls(&store), want, "cut at {cut}: not the earlier transactions alone");
+        let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
+        assert_eq!(
+            graph_r::format::wal::committed_len(&raw),
+            raw.len(),
+            "cut at {cut}: torn bytes left"
+        );
+        assert_eq!(seqs(&raw), (1..=13).collect::<Vec<_>>(), "cut at {cut}");
+        drop(store);
+        assert_eq!(live_urls(&Store::open_read_only(&dir).unwrap()), want);
+    }
 }

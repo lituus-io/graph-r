@@ -24,12 +24,13 @@
 //! - **Catch-up under the lock.** Holding the lock, a committer first
 //!   compares the files' stamp (two `stat`s) with what its handle last saw.
 //!   A new base (another handle compacted) is installed into a free
-//!   generation slot; a grown log has just its appended frames read and
-//!   published; the sequence counter and log offset advance to the file's.
-//!   Only then are the new frames encoded and appended, so sequence numbers
-//!   stay strictly increasing across every writer. A torn tail left by a
-//!   writer that crashed mid-append is truncated here, by the next committer
-//!   (and opportunistically at open when the lock happens to be free).
+//!   generation slot; a grown log has just its appended records read and
+//!   published, whole records only; the sequence counter and log offset
+//!   advance to the file's. Only then is the new record sealed and
+//!   appended, so sequence numbers stay strictly increasing across every
+//!   writer. A torn record left by a writer that crashed mid-append is
+//!   truncated here, by the next committer (and opportunistically at open
+//!   when the lock happens to be free).
 //! - **Serializable transactions.** [`Store::transact`] holds the lock from
 //!   before its caught-up read view is taken until its single append lands,
 //!   so a read-modify-write is serializable across processes. One
@@ -49,17 +50,18 @@
 //!   reading the old generation untouched until they drop. Other handles
 //!   install the new base at their next catch-up.
 //!
-//! A transaction is atomic with respect to other writers and to a failed
-//! append (the log is cut back to where it was). The log format has no batch
-//! marker, so a power loss in the middle of a multi-op append can still leave
-//! a prefix of that transaction's frames — the same guarantee a multi-op
-//! [`Writer::commit`] has always had.
+//! A transaction is atomic everywhere: it is one checksummed log record, so
+//! a crash or power loss mid-append leaves a torn record that replay ignores
+//! and the next committer cuts off — the transaction is absent whole, and
+//! every earlier one present. In memory, a commit, a catch-up and a replay
+//! each publish whole records with one frontier move, so no snapshot (and
+//! no other process reading the log) ever sees part of a transaction.
 
 use crate::compact;
 use crate::error::{Error, Result};
 use crate::format::{base, wal};
 use crate::mmap::MappedFile;
-use crate::overlay::Arena;
+use crate::overlay::{publish_records, LogArena};
 use crate::snapshot::Snapshot;
 use crate::ttl::TtlConfig;
 use crate::writer::{Txn, WriteState, Writer};
@@ -112,12 +114,12 @@ impl Default for Config {
     }
 }
 
-/// One loaded generation: the mmapped base and its overlay arena.
+/// One loaded generation: the mmapped base and its overlay of log records.
 #[derive(Debug)]
 pub(crate) struct GenInner {
     map: MappedFile,
     pub(crate) dir: base::BaseDir,
-    pub(crate) arena: Arena,
+    pub(crate) log: LogArena,
 }
 
 impl GenInner {
@@ -126,7 +128,7 @@ impl GenInner {
     }
 
     pub(crate) fn from_parts(map: MappedFile, dir: base::BaseDir) -> Self {
-        Self { map, dir, arena: Arena::new() }
+        Self { map, dir, log: LogArena::new() }
     }
 }
 
@@ -141,6 +143,10 @@ pub(crate) struct GenSlot {
 #[derive(Debug)]
 pub struct Store {
     pub(crate) dir: PathBuf,
+    /// `graph.base` and `graph.wal` inside `dir`, joined once: a commit's
+    /// catch-up and append then build no path.
+    pub(crate) base_file: PathBuf,
+    pub(crate) wal_file: PathBuf,
     pub(crate) cfg: Config,
     read_only: bool,
     pub(crate) current: AtomicUsize,
@@ -308,8 +314,27 @@ pub(crate) mod probe {
         pub(crate) static TURNSTILE: Cell<u64> = const { Cell::new(0) };
         /// Log fsyncs by commits.
         pub(crate) static FSYNCS: Cell<u64> = const { Cell::new(0) };
+        /// Log writes by commits.
+        pub(crate) static WRITES: Cell<u64> = const { Cell::new(0) };
         /// Log bytes read by tail catch-ups.
         pub(crate) static TAIL_BYTES: Cell<u64> = const { Cell::new(0) };
+        /// Make every overlay reservation fail, as a full arena would.
+        pub(crate) static FULL: Cell<u64> = const { Cell::new(0) };
+        /// Fail the next appends after their bytes are written and synced.
+        pub(crate) static FAIL_APPEND: Cell<u64> = const { Cell::new(0) };
+        /// … and leave those bytes in the log (the cut-back fails too), as
+        /// a failing disk can.
+        pub(crate) static STUCK: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn full() -> bool {
+        FULL.with(Cell::get) != 0
+    }
+    pub(crate) fn stuck() -> bool {
+        STUCK.with(Cell::get) != 0
+    }
+    /// Consume one injected append failure, if any is armed.
+    pub(crate) fn fail_append() -> bool {
+        FAIL_APPEND.with(|x| x.get().checked_sub(1).map(|n| x.set(n)).is_some())
     }
     pub(crate) fn bump(c: &'static LocalKey<Cell<u64>>, n: u64) {
         c.with(|x| x.set(x.get() + n));
@@ -375,8 +400,13 @@ impl Stamp {
     /// Two `stat` calls; `None` when either file cannot be examined (the
     /// caller then falls back to a full load, which reports the real error).
     pub(crate) fn read(dir: &Path) -> Option<Self> {
-        let base = FileId::of(&fs::metadata(base_path(dir)).ok()?);
-        let wal = match fs::metadata(wal_path(dir)) {
+        Self::of(&base_path(dir), &wal_path(dir))
+    }
+
+    /// [`Stamp::read`] on paths already joined.
+    fn of(base: &Path, wal: &Path) -> Option<Self> {
+        let base = FileId::of(&fs::metadata(base).ok()?);
+        let wal = match fs::metadata(wal) {
             Ok(md) => Some((Ident::of(&md), md.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return None,
@@ -526,7 +556,7 @@ impl Store {
     /// and has no directory ([`Store::dir`] is empty); keep it current with
     /// [`Store::reload_image`].
     pub fn open_image(base: bytes::Bytes, wal: &[u8]) -> Result<Self> {
-        let built = build_generation(MappedFile::from_bytes(base), wal)?;
+        let built = build_generation(MappedFile::from_bytes(base), wal.to_vec())?;
         if built.log == LogState::Newer {
             return Err(newer_image());
         }
@@ -543,11 +573,12 @@ impl Store {
         }
         let _one_at_a_time = self.write.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match base {
-            Some(b) => {
-                self.install_or_apply(MappedFile::from_bytes(b), wal)?.ok_or_else(newer_image)
-            }
-            None => match self.apply_wal_bytes(wal)? {
-                Some(changed) => Ok(changed),
+            Some(b) => self
+                .install_or_apply(MappedFile::from_bytes(b), wal.to_vec())?
+                .map(|a| a.changed)
+                .ok_or_else(newer_image),
+            None => match self.apply_log(wal)? {
+                Some((changed, _)) => Ok(changed),
                 None => {
                     Err(Error::format("log image belongs to another generation; pass its base"))
                 }
@@ -576,6 +607,8 @@ impl Store {
             base_gen: generation,
         };
         let store = Self {
+            base_file: base_path(&dir),
+            wal_file: wal_path(&dir),
             dir,
             cfg,
             read_only,
@@ -713,7 +746,10 @@ impl Store {
         self.commit_lock_within(Duration::ZERO)
     }
 
-    fn commit_lock_within(&self, wait: Duration) -> Result<CommitLock> {
+    /// [`Store::commit_lock`] waiting up to `wait` instead of
+    /// [`Config::lock_wait`] (zero: never waits, as
+    /// [`Store::try_commit_lock`]).
+    pub fn commit_lock_within(&self, wait: Duration) -> Result<CommitLock> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -819,8 +855,8 @@ impl Store {
         let cur = self.current.load(Ordering::Acquire);
         let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
         let g = guard.as_ref().ok_or_else(|| Error::corrupt("current slot empty"))?;
-        let next_seq = g.dir.header.wal_applied_seq.max(g.arena.last_seq()) + 1;
-        state.adopt(next_seq, g.arena.len(), state.seen.base_gen);
+        let next_seq = g.dir.header.wal_applied_seq.max(g.log.last_seq()) + 1;
+        state.adopt(next_seq, g.log.len(), state.seen.base_gen);
         if caught == Caught::Full {
             let over = state.ops_since_compact >= self.cfg.compact_after_ops
                 || state.wal_bytes >= self.cfg.compact_after_wal_bytes;
@@ -829,16 +865,18 @@ impl Store {
         Ok(changed)
     }
 
-    /// Cut a torn tail back to the last intact frame, or give a missing,
+    /// Cut a torn tail back to the last whole record, or give a missing,
     /// empty or older log a header for the served generation. Under the
-    /// commit lock only.
+    /// commit lock only. A log of another version, with a bad header or with
+    /// a corrupt record never gets here: reading it failed, and nothing was
+    /// written.
     fn repair(&self, state: &mut WriteState) -> Result<()> {
         let seen = &mut state.seen;
-        let file = wal_path(&self.dir);
+        let file = &self.wal_file;
         if !seen.log_current {
-            atomic_write(&file, &wal::encode_header(seen.base_gen, now_ms()))?;
+            atomic_write(file, &wal::encode_header(seen.base_gen, now_ms()))?;
             *seen = Seen {
-                stamp: Stamp::read(&self.dir),
+                stamp: Stamp::of(&self.base_file, file),
                 wal_pos: wal::HEADER_LEN as u64,
                 log_current: true,
                 base_gen: seen.base_gen,
@@ -848,7 +886,7 @@ impl Store {
         }
         if let Some((ident, len)) = seen.stamp.and_then(|s| s.wal) {
             if len > seen.wal_pos {
-                let f = fs::OpenOptions::new().write(true).open(&file)?;
+                let f = fs::OpenOptions::new().write(true).open(file)?;
                 f.set_len(seen.wal_pos)?;
                 f.sync_all()?;
                 if let Some(s) = seen.stamp.as_mut() {
@@ -864,7 +902,7 @@ impl Store {
     /// is damage; without it, a compaction caught mid-way (re-read, then
     /// `Busy`).
     fn catch_up(&self, seen: &mut Seen, locked: bool) -> Result<(bool, Caught)> {
-        let now = Stamp::read(&self.dir);
+        let now = Stamp::of(&self.base_file, &self.wal_file);
         if let (Some(n), Some(l)) = (now, seen.stamp) {
             if n == l {
                 return Ok((false, Caught::Nothing));
@@ -888,13 +926,15 @@ impl Store {
         Ok((changed, Caught::Full))
     }
 
-    /// Same base file: read the log from `pos` (a frame boundary already
-    /// consumed) and publish the new frames. Returns whether anything became
-    /// visible and the new consumed offset.
+    /// Same base file: read the log from `pos` (a record boundary already
+    /// consumed) and publish the whole records found there; a partial one
+    /// (another writer mid-append) is left for the next look. Returns
+    /// whether anything became visible and the new consumed offset, always
+    /// a record boundary.
     fn reload_wal_tail(&self, pos: u64) -> Result<(bool, u64)> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut tail = Vec::new();
-        match fs::File::open(wal_path(&self.dir)) {
+        match fs::File::open(&self.wal_file) {
             Ok(mut f) => {
                 f.seek(SeekFrom::Start(pos))?;
                 f.read_to_end(&mut tail)?;
@@ -904,38 +944,43 @@ impl Store {
         }
         #[cfg(test)]
         probe::bump(&probe::TAIL_BYTES, tail.len() as u64);
-        let (ops, used) = wal::replay_frames(&tail)?;
-        Ok((self.publish_new(ops)?, pos + used as u64))
+        let scanned = wal::scan(&tail, 0, None);
+        if let Some(e) = scanned.corrupt {
+            return Err(e);
+        }
+        tail.truncate(scanned.end);
+        Ok((self.publish_new(tail, 0)?, pos + scanned.end as u64))
     }
 
-    /// Publish `ops` (in sequence order) that the served generation has not
-    /// seen: sequence above both the base's folded ops and the overlay's last.
-    fn publish_new(&self, ops: Vec<(u64, wal::Op)>) -> Result<bool> {
+    /// Publish the ops of `seg[from..]` (whole records, validated) that the
+    /// served generation has not seen — sequence above both the base's
+    /// folded ops and the overlay's last — moving `seg` in as one segment.
+    fn publish_new(&self, seg: Vec<u8>, from: usize) -> Result<bool> {
         let cur = self.current.load(Ordering::Acquire);
         let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
         let Some(g) = guard.as_ref() else { return Ok(false) };
-        let seen = g.dir.header.wal_applied_seq.max(g.arena.last_seq());
-        let mut changed = false;
-        for (seq, op) in ops.into_iter().filter(|&(s, _)| s > seen) {
-            if !g.arena.publish(seq, op) {
-                return Err(Error::busy("overlay arena full"));
-            }
-            changed = true;
-        }
-        Ok(changed)
+        publish_above(&g.log, g.dir.header.wal_applied_seq.max(g.log.last_seq()), seg, from)
     }
 
-    /// Publish the frames of a log image that the current generation has not
-    /// seen. `None` when the image belongs to another generation.
-    fn apply_wal_bytes(&self, raw: &[u8]) -> Result<Option<bool>> {
+    /// Publish the records of a log image that the current generation has
+    /// not seen, copying only those (the image is borrowed). `None` when the
+    /// image belongs to another generation; otherwise whether anything
+    /// became visible and the image's committed length.
+    fn apply_log(&self, raw: &[u8]) -> Result<Option<(bool, usize)>> {
         if raw.is_empty() {
-            return Ok(Some(false));
+            return Ok(Some((false, wal::HEADER_LEN)));
         }
-        let replayed = wal::replay(raw)?;
-        if replayed.base_generation != self.generation() {
+        if wal::parse_header(raw)? != self.generation() {
             return Ok(None);
         }
-        self.publish_new(replayed.ops).map(Some)
+        let replayed = wal::replay(raw)?;
+        let served = self.served_seq()?;
+        let start = replayed.records().find(|r| r.last_seq() > served).map(|r| r.offset());
+        let changed = match start {
+            Some(at) => self.publish_new(raw[at..replayed.good_len].to_vec(), 0)?,
+            None => false,
+        };
+        Ok(Some((changed, replayed.good_len)))
     }
 
     /// Map the base and read the log, retrying across a compaction caught
@@ -944,17 +989,15 @@ impl Store {
     /// whether the log belongs to the base and the base's generation.
     fn reload_full(&self, locked: bool) -> Result<(bool, u64, bool, u64)> {
         for _ in 0..RACE_RETRIES {
-            let map = MappedFile::open(&base_path(&self.dir))?;
+            let map = MappedFile::open(&self.base_file)?;
             let base_gen = base::Header::parse(map.bytes())?.generation;
-            let raw = match fs::read(wal_path(&self.dir)) {
+            let raw = match fs::read(&self.wal_file) {
                 Ok(raw) => raw,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => return Err(e.into()),
             };
-            if let Some(changed) = self.install_or_apply(map, &raw)? {
-                let current = wal::parse_header(&raw).ok() == Some(base_gen);
-                let pos = if current { wal::committed_len(&raw) } else { wal::HEADER_LEN };
-                return Ok((changed, pos as u64, current, base_gen));
+            if let Some(a) = self.install_or_apply(map, raw)? {
+                return Ok((a.changed, a.pos as u64, a.current, base_gen));
             }
             if locked {
                 return Err(Error::corrupt("wal is newer than base"));
@@ -963,45 +1006,50 @@ impl Store {
         Err(Error::busy("compaction in progress; retry"))
     }
 
-    /// Same generation as served: publish new frames. Otherwise rebuild the
-    /// generation from `map` + `raw` and install it into a free ring slot.
-    /// `None` when the log is newer than `map` (a compaction between the
-    /// reads): the caller re-reads.
-    fn install_or_apply(&self, map: MappedFile, raw: &[u8]) -> Result<Option<bool>> {
+    /// Same generation as served: publish new records. Otherwise rebuild
+    /// the generation from `map` + `raw` and install it into a free ring
+    /// slot. `None` when the log is newer than `map` (a compaction between
+    /// the reads): the caller re-reads. A log that is unreadable — another
+    /// version, a bad header, a corrupt record — is an error here, before
+    /// anything is decided about repairing it.
+    fn install_or_apply(&self, map: MappedFile, raw: Vec<u8>) -> Result<Option<Applied>> {
         let cur_gen = self.generation();
         let new_gen = base::Header::parse(map.bytes())?.generation;
         if new_gen == cur_gen {
             // Generations are never reused, so the same number is the same
             // base: only the log can have grown.
-            return match self.apply_wal_bytes(raw)? {
-                Some(changed) => Ok(Some(changed)),
+            return Ok(match self.apply_log(&raw)? {
+                Some((changed, pos)) => Some(Applied { changed, pos, current: !raw.is_empty() }),
                 // Another generation's log: newer means a compaction landed
                 // between the reads (re-read); older is already folded in.
-                None if wal::replay(raw)?.base_generation > new_gen => Ok(None),
-                None => Ok(Some(false)),
-            };
+                None if wal::parse_header(&raw)? > new_gen => None,
+                None => Some(Applied { changed: false, pos: wal::HEADER_LEN, current: false }),
+            });
         }
         let built = build_generation(map, raw)?;
+        let pos = built.good_len;
+        let current = matches!(built.log, LogState::Current { .. });
         if built.log == LogState::Newer {
             return Ok(None);
         }
         let folded = built.inner.dir.header.wal_applied_seq;
         match self.install(built.inner, new_gen) {
-            Ok(()) => Ok(Some(true)),
+            None => Ok(Some(Applied { changed: true, pos, current })),
             // Every other slot is pinned by a snapshot. If the served
             // generation already holds every op the new base folded (this
             // handle's own compaction, typically), keep serving it and
             // publish the new base's log on top: the same state, one
             // generation behind on disk. Otherwise there is no way to serve
             // it yet.
-            Err(busy) => {
+            Some(mut inner) => {
                 if folded > self.served_seq()? {
-                    return Err(busy);
+                    return Err(Error::busy("all generation slots pinned by snapshots"));
                 }
-                match built.log {
-                    LogState::Current { .. } => self.publish_new(wal::replay(raw)?.ops).map(Some),
-                    _ => Ok(Some(false)), // nothing past what the base folded
-                }
+                let changed = match inner.log.take_first_segment() {
+                    Some(seg) => self.publish_new(seg, wal::HEADER_LEN)?,
+                    None => false,
+                };
+                Ok(Some(Applied { changed, pos, current }))
             }
         }
     }
@@ -1010,12 +1058,15 @@ impl Store {
     fn served_seq(&self) -> Result<u64> {
         let cur = self.current.load(Ordering::Acquire);
         let guard = self.gens[cur].inner.try_read().map_err(|_| Error::busy("slot busy"))?;
-        Ok(guard.as_ref().map_or(0, |g| g.dir.header.wal_applied_seq.max(g.arena.last_seq())))
+        Ok(guard.as_ref().map_or(0, |g| g.dir.header.wal_applied_seq.max(g.log.last_seq())))
     }
 
     /// Install a loaded generation into a free ring slot and serve it. The
     /// one install path: catch-ups and compaction both come through here.
-    pub(crate) fn install(&self, inner: GenInner, generation: u64) -> Result<()> {
+    /// `Some` (the generation, handed back) when every other slot is pinned
+    /// by a snapshot.
+    #[must_use]
+    pub(crate) fn install(&self, inner: GenInner, generation: u64) -> Option<GenInner> {
         let cur = self.current.load(Ordering::Acquire);
         for (i, slot) in self.gens.iter().enumerate() {
             if i == cur {
@@ -1026,11 +1077,41 @@ impl Store {
                 drop(w);
                 slot.seq.store(generation, Ordering::Release);
                 self.current.store(i, Ordering::Release);
-                return Ok(());
+                return None;
             }
         }
-        Err(Error::busy("all generation slots pinned by snapshots"))
+        Some(inner)
     }
+}
+
+/// Publish the ops of `seg[from..]` (whole records, validated) with
+/// sequence numbers above `served` into `log`, moving `seg` in as one
+/// segment. Whether anything became visible.
+fn publish_above(log: &LogArena, served: u64, seg: Vec<u8>, from: usize) -> Result<bool> {
+    let new: usize = wal::Records::trusted(&seg, from, seg.len())
+        .map(|r| match r.last_seq().checked_sub(served) {
+            Some(n) if n > 0 => n.min(u64::from(r.op_count())) as usize,
+            _ => 0,
+        })
+        .sum();
+    if new == 0 {
+        return Ok(false);
+    }
+    if !log.reserve(new, seg.len()) {
+        return Err(Error::busy("overlay arena full"));
+    }
+    publish_records(log, seg, from, served);
+    Ok(true)
+}
+
+/// What a full re-read made of the log.
+struct Applied {
+    /// Anything new became visible.
+    changed: bool,
+    /// The log offset consumed (a record boundary).
+    pos: usize,
+    /// The log's header names the base's generation.
+    current: bool,
 }
 
 /// Take `dir`'s commit lock if it is free this instant (no waiting).
@@ -1070,59 +1151,45 @@ enum LogState {
     Newer,
 }
 
-/// Validate `map` as a base and replay `raw` against it. Pure: shared by the
-/// file-backed and in-memory (image) paths.
-fn build_generation(map: MappedFile, raw: &[u8]) -> Result<Built> {
+/// Validate `map` as a base and replay `raw` against it, moving the log's
+/// committed records into the new generation's overlay as one segment. Pure:
+/// shared by the file-backed and in-memory (image) paths. A log of another
+/// version, with a bad header or holding a corrupt record is an error, so
+/// nothing downstream ever repairs (rewrites) it.
+fn build_generation(map: MappedFile, mut raw: Vec<u8>) -> Result<Built> {
     let bdir = base::BaseDir::parse(map.bytes())?;
     let header = bdir.header;
-    let inner = GenInner { map, dir: bdir, arena: Arena::new() };
-    if raw.is_empty() {
-        return Ok(Built {
-            inner,
-            next_seq: header.wal_applied_seq + 1,
-            replayed: 0,
-            good_len: 0,
-            log: LogState::Empty,
-        });
-    }
-    let replayed = wal::replay(raw)?;
-    if replayed.base_generation > header.generation {
-        return Ok(Built {
-            inner,
-            next_seq: header.wal_applied_seq + 1,
-            replayed: 0,
-            good_len: 0,
-            log: LogState::Newer,
-        });
-    }
-    if replayed.base_generation < header.generation {
-        return Ok(Built {
-            inner,
-            next_seq: header.wal_applied_seq + 1,
-            replayed: 0,
-            good_len: wal::HEADER_LEN,
-            log: LogState::Stale,
-        });
-    }
-    let torn = replayed.good_len < raw.len();
-    let next_seq = replayed
-        .ops
-        .last()
-        .map_or(header.wal_applied_seq + 1, |&(s, _)| s.max(header.wal_applied_seq) + 1);
-    let mut count = 0;
-    for (seq, op) in replayed.ops.into_iter().filter(|&(s, _)| s > header.wal_applied_seq) {
-        if !inner.arena.publish(seq, op) {
-            return Err(Error::busy("overlay arena full during replay"));
-        }
-        count += 1;
-    }
-    Ok(Built {
+    let inner = GenInner { map, dir: bdir, log: LogArena::new() };
+    let folded = Built {
         inner,
-        next_seq,
-        replayed: count,
-        good_len: replayed.good_len,
-        log: LogState::Current { torn },
-    })
+        next_seq: header.wal_applied_seq + 1,
+        replayed: 0,
+        good_len: 0,
+        log: LogState::Empty,
+    };
+    if raw.is_empty() {
+        return Ok(folded);
+    }
+    let generation = wal::parse_header(&raw)?;
+    if generation > header.generation {
+        return Ok(Built { log: LogState::Newer, ..folded });
+    }
+    if generation < header.generation {
+        return Ok(Built { good_len: wal::HEADER_LEN, log: LogState::Stale, ..folded });
+    }
+    let scanned = wal::scan(&raw, wal::HEADER_LEN, None);
+    if let Some(e) = scanned.corrupt {
+        return Err(e);
+    }
+    let good_len = scanned.end;
+    let torn = good_len < raw.len();
+    let applied = header.wal_applied_seq;
+    let next_seq = scanned.last_seq.map_or(applied, |l| l.max(applied)) + 1;
+    raw.truncate(good_len);
+    publish_above(&folded.inner.log, applied, raw, wal::HEADER_LEN)
+        .map_err(|_| Error::busy("overlay arena full during replay"))?;
+    let replayed = folded.inner.log.len();
+    Ok(Built { next_seq, replayed, good_len, log: LogState::Current { torn }, ..folded })
 }
 
 /// Load `graph.base` + replay `graph.wal` for `dir`. Pure reading: repair is
@@ -1138,7 +1205,7 @@ fn load_generation(dir: &Path, locked: bool) -> Result<Built> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        let built = build_generation(map, &raw)?;
+        let built = build_generation(map, raw)?;
         if built.log != LogState::Newer {
             return Ok(built);
         }
@@ -1167,6 +1234,11 @@ mod tests {
             etag: None,
             pinned: false,
         }
+    }
+
+    /// Every op's sequence number in a log image, in log order.
+    fn seqs(raw: &[u8]) -> Vec<u64> {
+        wal::replay(raw).unwrap().records().flat_map(|r| r.first_seq()..=r.last_seq()).collect()
     }
 
     fn write(store: &Store, url: &str, hash: u64) {
@@ -1309,7 +1381,7 @@ mod tests {
         write(&a, "https://x.dev/c", 3);
         assert_eq!(urls(&a), ["https://x.dev/a", "https://x.dev/b", "https://x.dev/c"]);
         let raw = fs::read(wal_path(dir.path())).unwrap();
-        let seqs: Vec<u64> = wal::replay(&raw).unwrap().ops.iter().map(|o| o.0).collect();
+        let seqs = seqs(&raw);
         assert_eq!(seqs, [1, 2, 3], "one sequence across both writers");
         assert!(b.reload_if_stale().unwrap(), "a writable handle reloads too");
         assert_eq!(urls(&b), urls(&a));
@@ -1419,6 +1491,7 @@ mod tests {
         probe::take(&probe::LOCKS);
         probe::take(&probe::FSYNCS);
         probe::take(&probe::TURNSTILE);
+        probe::take(&probe::WRITES);
         store
             .transact(|tx| {
                 for i in 0..100 {
@@ -1429,7 +1502,10 @@ mod tests {
             .unwrap();
         assert_eq!(probe::take(&probe::LOCKS), 1, "one lock per transaction");
         assert_eq!(probe::take(&probe::TURNSTILE), 1, "one wait-queue probe per transaction");
+        assert_eq!(probe::take(&probe::WRITES), 1, "one write per transaction");
         assert_eq!(probe::take(&probe::FSYNCS), 1, "one fsync per transaction");
+        let raw = fs::read(wal_path(dir.path())).unwrap();
+        assert_eq!(wal::replay(&raw).unwrap().records().count(), 1, "one record per transaction");
         assert_eq!(other.len(), 0);
         assert!(other.reload_if_stale().unwrap());
         assert_eq!(other.len(), 100);
@@ -1498,5 +1574,168 @@ mod tests {
         drop((a, b));
         let fresh = Store::open_read_only(dir.path()).unwrap();
         assert_eq!(urls(&fresh), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    // ---- a commit that cannot complete ------------------------------------
+
+    fn wal_len(dir: &Path) -> u64 {
+        fs::metadata(wal_path(dir)).unwrap().len()
+    }
+
+    /// The overlay is checked for room before anything is written: a full
+    /// one refuses with `Busy`, the log untouched and the ops still staged.
+    /// (Room checked after a durable append is how 0.5.1 could write a
+    /// commit it never accounted for, and reuse its sequence numbers.)
+    #[test]
+    fn a_full_overlay_refuses_before_writing_and_keeps_the_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let before = wal_len(dir.path());
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FULL.with(|f| f.set(1));
+        let r = w.commit();
+        probe::FULL.with(|f| f.set(0));
+        assert!(matches!(r, Err(Error::Busy { .. })), "{r:?}");
+        assert_eq!(wal_len(dir.path()), before, "a refused commit wrote to the log");
+        w.commit().expect("the staged op commits once there is room");
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    /// A failed append is cut back off the log and keeps the writer's ops
+    /// staged: a retry commits them (0.5.1 dropped them).
+    #[test]
+    fn a_failed_append_keeps_the_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let before = wal_len(dir.path());
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        assert!(matches!(w.commit(), Err(Error::Io { .. })));
+        assert_eq!(wal_len(dir.path()), before, "the failed append was cut back");
+        w.commit().expect("the kept op commits on retry");
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/a", "https://x.dev/b"]);
+    }
+
+    /// The worst case: the append fails after its bytes reached the log and
+    /// they cannot be cut back off. The next commit re-reads the log rather
+    /// than trust the handle's bookkeeping, so no sequence number is ever
+    /// written twice and the store reopens. (A durable append the handle did
+    /// not account for is how 0.5.1 reused sequences and bricked a store.)
+    #[test]
+    fn a_failed_append_that_stays_in_the_log_never_reuses_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        write(&store, "https://x.dev/a", 1);
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        probe::STUCK.with(|f| f.set(1));
+        let failed = w.commit();
+        probe::STUCK.with(|f| f.set(0));
+        assert!(matches!(failed, Err(Error::Io { .. })));
+        w.commit().expect("the kept op commits on retry");
+        w.upsert_node(&doc("https://x.dev/c", 3)).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        drop(store);
+        let raw = fs::read(wal_path(dir.path())).unwrap();
+        wal::replay(&raw).expect("no sequence regression");
+        let seqs = seqs(&raw);
+        assert!(seqs.windows(2).all(|p| p[0] < p[1]), "sequences {seqs:?}");
+        let reopened = Store::open(dir.path()).expect("the store reopens");
+        assert_eq!(urls(&reopened), ["https://x.dev/a", "https://x.dev/b", "https://x.dev/c"]);
+    }
+
+    /// A transaction is all or nothing for its caller too: when its append
+    /// fails, its ops are dropped (a retry runs the closure again), so they
+    /// never ride along with the next transaction.
+    #[test]
+    fn a_failed_transaction_leaves_nothing_of_its_own_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        probe::FAIL_APPEND.with(|f| f.set(1));
+        let r = store.transact(|tx| tx.upsert_node(&doc("https://x.dev/a", 1)));
+        assert!(matches!(r, Err(Error::Io { .. })), "{r:?}");
+        store.transact(|tx| tx.upsert_node(&doc("https://x.dev/b", 2))).unwrap();
+        assert_eq!(urls(&store), ["https://x.dev/b"]);
+    }
+
+    /// A commit is durable and visible before any inline compaction runs, so
+    /// a compaction that cannot complete (here: every ring slot pinned) must
+    /// not fail it. It leaves the compaction due instead.
+    #[test]
+    fn an_inline_compaction_that_cannot_install_leaves_the_commit_ok_and_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { compact_after_ops: 1, ..Config::default() };
+        let store = Store::create(dir.path(), cfg).unwrap();
+        let mut pins = vec![store.snapshot()];
+        for (i, url) in ["https://x.dev/a", "https://x.dev/b", "https://x.dev/c"].iter().enumerate()
+        {
+            write(&store, url, i as u64);
+            pins.push(store.snapshot());
+        }
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/d", 4)).unwrap();
+        w.commit().expect("the commit itself succeeded");
+        drop(w);
+        assert!(store.compaction_due(), "the compaction is left due");
+        assert_eq!(store.len(), 4, "and the commit is visible");
+        drop(pins);
+        store.compact().unwrap();
+        assert!(!store.compaction_due());
+        assert_eq!(store.len(), 4);
+    }
+
+    /// An aborted transaction drops only its own ops: what a dropped writer
+    /// left staged on the handle before it is kept, and commits next.
+    #[test]
+    fn an_abort_truncates_to_its_mark_and_keeps_earlier_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/kept", 1)).unwrap();
+        drop(w);
+        let r: Result<()> = store.transact(|tx| {
+            tx.upsert_node(&doc("https://x.dev/aborted", 2))?;
+            tx.remove(UrlKey::of("https://x.dev/kept"))?;
+            Err(Error::format("abort"))
+        });
+        assert!(r.is_err());
+        store.writer().unwrap().commit().unwrap();
+        assert_eq!(urls(&store), ["https://x.dev/kept"]);
+    }
+
+    /// A transaction larger than one record is refused at commit with a
+    /// typed `Format`, before anything is written, its ops still staged (the
+    /// same refusal again); `discard` drops them and the handle commits on.
+    #[test]
+    fn a_transaction_over_the_record_cap_is_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let before = wal_len(dir.path());
+        let big = "v".repeat(wal::MAX_ATTR_LEN);
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/a", 1)).unwrap();
+        let mut k = 0u64;
+        while (k as usize) * wal::MAX_ATTR_LEN <= wal::MAX_RECORD {
+            w.set_attrs(UrlKey(k), &[(0, &big)]).unwrap();
+            k += 1;
+        }
+        let first = w.commit().unwrap_err();
+        assert!(matches!(first, Error::Format { .. }), "{first}");
+        assert_eq!(wal_len(dir.path()), before, "nothing was written");
+        let again = w.commit().unwrap_err();
+        assert_eq!(again.to_string(), first.to_string(), "the same ops are still staged");
+        w.discard();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/b"]);
     }
 }

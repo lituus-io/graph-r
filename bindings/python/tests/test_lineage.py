@@ -424,11 +424,26 @@ def copy_v1(tmp_path):
 
 
 @pytest.mark.parametrize("opener", ["open", "open_or_create", "open_read_only"])
+def test_a_0_5_store_raises_format_version_error_and_is_left_alone(tmp_path, opener):
+    # Written by the 0.4/0.5 format, which this release cannot read: a typed
+    # refusal naming both versions, and not a byte of the store rewritten.
+    dst = tmp_path / "v2"
+    dst.mkdir()
+    for f in ("graph.base", "graph.wal"):
+        shutil.copyfile(FIXTURES / "store_v042" / f, dst / f)
+    before = {f: (dst / f).read_bytes() for f in os.listdir(dst)}
+    with pytest.raises(graph_r.FormatVersionError) as info:
+        getattr(graph_r.Store, opener)(str(dst))
+    assert (info.value.found, info.value.supported) == (2, 3)
+    assert {f: (dst / f).read_bytes() for f in os.listdir(dst)} == before
+
+
+@pytest.mark.parametrize("opener", ["open", "open_or_create", "open_read_only"])
 def test_a_format_v1_store_raises_format_version_error(tmp_path, opener):
     path = copy_v1(tmp_path)
     with pytest.raises(graph_r.FormatVersionError) as info:
         getattr(graph_r.Store, opener)(path)
-    assert (info.value.found, info.value.supported) == (1, 2)
+    assert (info.value.found, info.value.supported) == (1, 3)
     assert isinstance(info.value, graph_r.GraphRError), "existing handlers keep catching it"
     assert "unsupported version 1" in str(info.value)
     # Damage is not a version mismatch.

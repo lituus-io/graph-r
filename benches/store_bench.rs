@@ -2,7 +2,9 @@
 // Copyright: lituus-io, all rights reserved
 //
 //! Criterion benches for the store's hot paths, including the load-bearing
-//! claim: reader latency stays flat while a writer commits and compacts.
+//! claim: reader latency stays flat while a writer commits and compacts. The
+//! log benches (`open/replay`, `read/overlay_first_lookup`) use only API every
+//! release since 0.5 has, so the same file measures an older build.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use graph_r::prelude::*;
@@ -226,5 +228,74 @@ fn bench_read_under_write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_reads, bench_writes, bench_read_under_write);
+/// A store whose log holds `ops` upserts in transactions of 100, never
+/// compacted: what an open replays and a first overlay read folds.
+fn build_log(dir: &std::path::Path, ops: usize) {
+    let cfg = Config {
+        durability: Durability::Never,
+        compact_after_ops: usize::MAX,
+        compact_after_wal_bytes: u64::MAX,
+        ..Config::default()
+    };
+    let store = Store::create(dir, cfg).unwrap();
+    for start in (0..ops).step_by(100) {
+        let urls: Vec<String> = (start..(start + 100).min(ops)).map(url_of).collect();
+        store
+            .transact(|tx| {
+                urls.iter().try_for_each(|url| {
+                    tx.upsert_node(&DocRecord {
+                        url,
+                        url_key: UrlKey::of(url),
+                        content_hash: 1,
+                        fetched_at_ms: 1000,
+                        title: Some("Benchmark Page Title"),
+                        snippet: Some("a snippet of distilled content for ranking and rendering"),
+                        etag: Some("\"tag\""),
+                        pinned: false,
+                    })
+                })
+            })
+            .unwrap();
+    }
+}
+
+/// Opening a store replays its log: read once, validated, served in place.
+fn bench_open(c: &mut Criterion) {
+    let mut group = c.benchmark_group("open");
+    for &n in &[1_000usize, 10_000, 100_000] {
+        let dir = tempfile::tempdir().unwrap();
+        build_log(dir.path(), n);
+        group.throughput(criterion::Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("replay", n), &n, |b, _| {
+            b.iter(|| black_box(Store::open_read_only(dir.path()).unwrap()));
+        });
+    }
+    group.finish();
+}
+
+/// The first overlay read of a snapshot folds every op in the log.
+fn bench_overlay_first_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read");
+    let n = 4096usize;
+    let dir = tempfile::tempdir().unwrap();
+    build_log(dir.path(), n);
+    let store = Store::open_read_only(dir.path()).unwrap();
+    let key = UrlKey::of(&url_of(n / 2));
+    group.bench_with_input(BenchmarkId::new("overlay_first_lookup", n), &n, |b, _| {
+        b.iter(|| {
+            let snap = store.snapshot();
+            black_box(snap.node(black_box(key)).map(|n| n.content_hash))
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_reads,
+    bench_writes,
+    bench_read_under_write,
+    bench_open,
+    bench_overlay_first_lookup
+);
 criterion_main!(benches);
