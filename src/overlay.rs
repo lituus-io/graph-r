@@ -264,6 +264,10 @@ pub(crate) struct OverlayView {
 impl OverlayView {
     pub(crate) fn build(log: &LogArena, upto: usize) -> Self {
         const PINNED: u16 = crate::format::base::nflags::PINNED;
+        if upto == 0 {
+            // Nothing to fold, nothing ever inserted: no secret to draw.
+            return Self { map: KeyMap::with_hasher(KeyState(0)) };
+        }
         let mut map: KeyMap<OverlayNode> = KeyMap::default();
         for (_, r) in log.committed(upto) {
             let Some(op) = log.view(r) else { continue };
