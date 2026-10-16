@@ -219,6 +219,65 @@ fn wal_sequence_regression_is_corruption() {
     assert!(matches!(wal::replay(&image), Err(Error::Corrupt { .. })));
 }
 
+/// Seal `rec` (one record) with a valid checksum after tampering, so the
+/// record reads as written that way.
+fn reseal(rec: &mut [u8]) {
+    let mut h = graph_r::hash::Hasher::new();
+    h.update(&rec[..24]);
+    h.update(&rec[wal::RECORD_HEADER_LEN..]);
+    let sum = h.digest64();
+    rec[24..32].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// One tampering of a sealed record.
+type Lie = fn(&mut Vec<u8>);
+
+/// A record whose header lies about its contents — more or fewer ops than
+/// it holds, or string lengths that overlap the next field — is a typed
+/// `Corrupt` naming its offset: never trusted, never read past, never cut.
+#[test]
+fn a_lying_record_is_corrupt() {
+    let mut b = wal::RecordBuf::new();
+    for url in ["https://x.dev/a", "https://x.dev/b"] {
+        b.push_upsert(
+            &DocRecord {
+                url,
+                url_key: UrlKey::of(url),
+                content_hash: 1,
+                fetched_at_ms: 1,
+                title: Some("T"),
+                snippet: None,
+                etag: None,
+                pinned: false,
+            },
+            0,
+        )
+        .unwrap();
+    }
+    b.seal(1).unwrap();
+    let good = b.into_vec();
+    let lies: [(&str, Lie); 4] = [
+        ("op_count high", |r| r[16] = 3),
+        ("op_count huge", |r| r[16..20].copy_from_slice(&u32::MAX.to_le_bytes())),
+        ("url overlaps the title", |r| r[32 + 36] += 1),
+        ("title runs past the op", |r| r[32 + 38] = 0xff),
+    ];
+    for (lie, tamper) in lies {
+        let mut rec = good.clone();
+        tamper(&mut rec);
+        reseal(&mut rec);
+        let mut image = wal::encode_header(1, 0);
+        image.extend_from_slice(&rec);
+        match wal::replay(&image) {
+            Err(Error::Corrupt { message }) => {
+                assert!(message.contains("byte 64"), "{lie}: {message}");
+            }
+            other => panic!("{lie}: {other:?}"),
+        }
+        assert_eq!(wal::committed_len(&image), wal::HEADER_LEN, "{lie}: shipped as committed");
+    }
+}
+
 // ---- resource exhaustion --------------------------------------------------
 
 /// A hostile postings run must not be trusted to size an allocation. The

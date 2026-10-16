@@ -16,6 +16,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const ROLE: &str = "GRAPH_R_MW_ROLE";
+/// Ops in the transaction the "crash" child dies writing.
+const CRASH_OPS: usize = 5;
 const ARGS: &str = "GRAPH_R_MW_ARGS";
 
 fn url_of(writer: usize, n: usize) -> String {
@@ -179,6 +181,39 @@ fn child() {
                 std::thread::sleep(Duration::from_millis(20));
             }
             std::fs::write(dir.join("polite"), format!("{ok} {locked}")).unwrap();
+        }
+        // M transactions of K fresh documents each.
+        "ktx" => {
+            let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
+            let (m, k): (usize, usize) = (args[2].parse().unwrap(), args[3].parse().unwrap());
+            let cfg = Config { compact_after_ops: usize::MAX, ..Config::default() };
+            let store = Store::open_cfg(&dir, cfg).unwrap();
+            ready_then_go(&dir.join("go"), id);
+            for t in 0..m {
+                let urls: Vec<String> = (0..k).map(|i| url_of(id, t * k + i)).collect();
+                store.transact(|tx| urls.iter().try_for_each(|u| tx.upsert_node(&doc(u)))).unwrap();
+            }
+        }
+        // Die mid-append: write a strict prefix of the record this
+        // transaction would have been, then exit without unwinding.
+        "crash" => {
+            let dir = PathBuf::from(&args[0]);
+            let cut: usize = args[1].parse().unwrap();
+            let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
+            let next = seqs(&raw).last().map_or(1, |s| s + 1);
+            let mut rec = graph_r::format::wal::RecordBuf::new();
+            for i in 0..CRASH_OPS {
+                rec.push_upsert(&doc(&url_of(9, i)), 0).unwrap();
+            }
+            rec.seal(next).unwrap();
+            let rec = rec.into_vec();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join(graph_r::store::WAL_FILE))
+                .unwrap();
+            std::io::Write::write_all(&mut f, &rec[..cut.min(rec.len() - 1)]).unwrap();
+            f.sync_all().unwrap();
+            std::process::exit(0);
         }
         other => panic!("unknown role {other}"),
     }
@@ -352,4 +387,87 @@ fn readers_finish_while_a_writer_waits_for_another_process() {
     wait_all(vec![holder]);
     assert!(committed.load(Ordering::SeqCst));
     assert_eq!(store.len(), 2);
+}
+
+/// N processes commit K-op transactions while a reader in this process
+/// catches up on one thread and takes snapshots on another: no snapshot ever
+/// holds part of a transaction, so the live count is always a multiple of
+/// K. (0.5.1 fails this: a catch-up published another process's ops one at
+/// a time, and could read part of an append in progress.)
+#[test]
+fn a_reader_never_sees_part_of_another_process_transaction() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const N: usize = 3;
+    const M: usize = 40;
+    const K: usize = 7;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("s");
+    drop(Store::create(&dir, Config::default()).unwrap());
+    let reader = Store::open_read_only(&dir).unwrap();
+    let d = dir.display().to_string();
+    let children: Vec<Child> = (0..N)
+        .map(|id| spawn("ktx", &[d.clone(), id.to_string(), M.to_string(), K.to_string()]))
+        .collect();
+    let done = AtomicBool::new(false);
+    let (polls, seen) = (AtomicU64::new(0), AtomicU64::new(0));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                reader.reload_if_stale().unwrap();
+            }
+            reader.reload_if_stale().unwrap();
+        });
+        s.spawn(|| loop {
+            let finished = done.load(Ordering::Acquire);
+            let len = reader.snapshot().len();
+            assert_eq!(len % K, 0, "a snapshot holds {len} documents: part of a transaction");
+            polls.fetch_add(1, Ordering::Relaxed);
+            seen.fetch_max(len as u64, Ordering::Relaxed);
+            if finished {
+                break;
+            }
+        });
+        go_when_ready(&dir.join("go"), N);
+        wait_all(children);
+        done.store(true, Ordering::Release);
+    });
+    assert!(seen.load(Ordering::Relaxed) > 0, "the reader saw commits land");
+    assert!(polls.load(Ordering::Relaxed) > 0);
+    assert_eq!(reader.len(), N * M * K);
+}
+
+/// A writer killed mid-append leaves a strict prefix of its transaction's
+/// record. Whatever the cut, the next committer removes it: that
+/// transaction is absent whole, every earlier one present, and the log
+/// holds only whole records.
+#[test]
+fn a_transaction_cut_by_a_crash_is_absent_whole() {
+    let root = tempfile::tempdir().unwrap();
+    for cut in [1, 31, 32, 100, 250, usize::MAX] {
+        let dir = root.path().join(format!("s{cut}"));
+        let store = Store::create(&dir, Config::default()).unwrap();
+        for t in 0..3 {
+            store
+                .transact(|tx| (0..4).try_for_each(|i| tx.upsert_node(&doc(&url_of(t, i)))))
+                .unwrap();
+        }
+        drop(store);
+        wait_all(vec![spawn("crash", &[dir.display().to_string(), cut.to_string()])]);
+        let store = Store::open(&dir).unwrap();
+        store.transact(|tx| tx.upsert_node(&doc(&url_of(7, 0)))).unwrap();
+        let mut want: Vec<String> =
+            (0..3).flat_map(|t| (0..4).map(move |i| url_of(t, i))).collect();
+        want.push(url_of(7, 0));
+        want.sort();
+        assert_eq!(live_urls(&store), want, "cut at {cut}: not the earlier transactions alone");
+        let raw = std::fs::read(dir.join(graph_r::store::WAL_FILE)).unwrap();
+        assert_eq!(
+            graph_r::format::wal::committed_len(&raw),
+            raw.len(),
+            "cut at {cut}: torn bytes left"
+        );
+        assert_eq!(seqs(&raw), (1..=13).collect::<Vec<_>>(), "cut at {cut}");
+        drop(store);
+        assert_eq!(live_urls(&Store::open_read_only(&dir).unwrap()), want);
+    }
 }

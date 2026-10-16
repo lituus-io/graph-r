@@ -1497,6 +1497,7 @@ mod tests {
         probe::take(&probe::LOCKS);
         probe::take(&probe::FSYNCS);
         probe::take(&probe::TURNSTILE);
+        probe::take(&probe::WRITES);
         store
             .transact(|tx| {
                 for i in 0..100 {
@@ -1507,7 +1508,10 @@ mod tests {
             .unwrap();
         assert_eq!(probe::take(&probe::LOCKS), 1, "one lock per transaction");
         assert_eq!(probe::take(&probe::TURNSTILE), 1, "one wait-queue probe per transaction");
+        assert_eq!(probe::take(&probe::WRITES), 1, "one write per transaction");
         assert_eq!(probe::take(&probe::FSYNCS), 1, "one fsync per transaction");
+        let raw = fs::read(wal_path(dir.path())).unwrap();
+        assert_eq!(wal::replay(&raw).unwrap().records().count(), 1, "one record per transaction");
         assert_eq!(other.len(), 0);
         assert!(other.reload_if_stale().unwrap());
         assert_eq!(other.len(), 100);
@@ -1692,5 +1696,52 @@ mod tests {
         store.compact().unwrap();
         assert!(!store.compaction_due());
         assert_eq!(store.len(), 4);
+    }
+
+    /// An aborted transaction drops only its own ops: what a dropped writer
+    /// left staged on the handle before it is kept, and commits next.
+    #[test]
+    fn an_abort_truncates_to_its_mark_and_keeps_earlier_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/kept", 1)).unwrap();
+        drop(w);
+        let r: Result<()> = store.transact(|tx| {
+            tx.upsert_node(&doc("https://x.dev/aborted", 2))?;
+            tx.remove(UrlKey::of("https://x.dev/kept"))?;
+            Err(Error::format("abort"))
+        });
+        assert!(r.is_err());
+        store.writer().unwrap().commit().unwrap();
+        assert_eq!(urls(&store), ["https://x.dev/kept"]);
+    }
+
+    /// A transaction larger than one record is refused at commit with a
+    /// typed `Format`, before anything is written, its ops still staged (the
+    /// same refusal again); `discard` drops them and the handle commits on.
+    #[test]
+    fn a_transaction_over_the_record_cap_is_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), Config::default()).unwrap();
+        let before = wal_len(dir.path());
+        let big = "v".repeat(wal::MAX_ATTR_LEN);
+        let mut w = store.writer().unwrap();
+        w.upsert_node(&doc("https://x.dev/a", 1)).unwrap();
+        let mut k = 0u64;
+        while (k as usize) * wal::MAX_ATTR_LEN <= wal::MAX_RECORD {
+            w.set_attrs(UrlKey(k), &[(0, &big)]).unwrap();
+            k += 1;
+        }
+        let first = w.commit().unwrap_err();
+        assert!(matches!(first, Error::Format { .. }), "{first}");
+        assert_eq!(wal_len(dir.path()), before, "nothing was written");
+        let again = w.commit().unwrap_err();
+        assert_eq!(again.to_string(), first.to_string(), "the same ops are still staged");
+        w.discard();
+        w.upsert_node(&doc("https://x.dev/b", 2)).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        assert_eq!(urls(&store), ["https://x.dev/b"]);
     }
 }

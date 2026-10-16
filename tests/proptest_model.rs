@@ -3,7 +3,8 @@
 //
 //! Property tests: the store agrees with a trivial reference model under
 //! arbitrary op sequences, compaction is byte-reproducible, and a WAL torn at
-//! any byte recovers exactly the committed prefix.
+//! any byte recovers exactly the transactions committed before the tear —
+//! each one whole.
 
 #![cfg(feature = "store")] // the store is what these exercise
 use graph_r::prelude::*;
@@ -38,7 +39,7 @@ fn op_strategy() -> impl Strategy<Value = MOp> {
 }
 
 /// Reference model: key → (content_hash, pinned, changes).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Model {
     live: BTreeMap<u8, (u64, bool, u16)>,
 }
@@ -70,6 +71,39 @@ impl Model {
             }
             MOp::Compact => {}
         }
+    }
+}
+
+/// Ops that mean the same inside one transaction as across several.
+fn txn_op_strategy() -> impl Strategy<Value = MOp> {
+    prop_oneof![
+        (0u8..12, any::<u64>(), any::<bool>()).prop_map(|(n, hash, pinned)| MOp::Upsert {
+            n,
+            hash,
+            pinned
+        }),
+        (0u8..12).prop_map(|n| MOp::Remove { n }),
+    ]
+}
+
+/// Stage one transaction op.
+fn stage(tx: &mut Txn<'_>, op: &MOp) -> graph_r::Result<()> {
+    match *op {
+        MOp::Upsert { n, hash, pinned } => {
+            let url = url_of(n);
+            tx.upsert_node(&DocRecord {
+                url: &url,
+                url_key: UrlKey::of(&url),
+                content_hash: hash,
+                fetched_at_ms: 1000 + u64::from(n),
+                title: Some("T"),
+                snippet: None,
+                etag: None,
+                pinned,
+            })
+        }
+        MOp::Remove { n } => tx.remove(UrlKey::of(&url_of(n))),
+        _ => unreachable!("only upserts and removals are staged in a transaction"),
     }
 }
 
@@ -177,31 +211,38 @@ proptest! {
         prop_assert_eq!(render(&ops), render(&ops));
     }
 
+    /// Transactions of several upserts and removals, the log cut at any
+    /// byte: the reopened store is exactly the model after the first `k`
+    /// whole transactions, where `k` is the number of whole records the cut
+    /// kept — never a part of the next.
     #[test]
     fn wal_torn_at_any_byte_recovers_a_committed_prefix(
-        ops in proptest::collection::vec(op_strategy(), 1..12),
+        txns in proptest::collection::vec(proptest::collection::vec(txn_op_strategy(), 1..5), 1..10),
         cut_frac in 0.0f64..1.0
     ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(dir.path(), Config::default()).unwrap();
-        for op in &ops {
-            // Skip compaction ops here: we want a WAL with content.
-            if !matches!(op, MOp::Compact) {
-                apply_store(&store, op);
+        let mut models = vec![Model::default()];
+        for txn in &txns {
+            store.transact(|tx| txn.iter().try_for_each(|op| stage(tx, op))).unwrap();
+            let mut next = models.last().unwrap().clone();
+            for op in txn {
+                next.apply(op);
             }
+            models.push(next);
         }
         drop(store);
         let wal = dir.path().join("graph.wal");
         let bytes = std::fs::read(&wal).unwrap();
-        if bytes.len() > 64 {
-            let cut = 64 + ((bytes.len() - 64) as f64 * cut_frac) as usize;
-            std::fs::write(&wal, &bytes[..cut]).unwrap();
-        }
-        // Open must never panic and must produce a consistent store; every
-        // node it reports must be internally coherent.
+        let cut = 64 + ((bytes.len() - 64) as f64 * cut_frac) as usize;
+        std::fs::write(&wal, &bytes[..cut]).unwrap();
+        let kept = graph_r::format::wal::replay(&bytes[..cut]).unwrap().records().count();
+        prop_assert!(kept < models.len());
+        // Read-only first (nothing repaired), then writable (the tear cut).
+        check_agreement(&Store::open_read_only(dir.path()).unwrap(), &models[kept]);
         let store = Store::open(dir.path()).unwrap();
+        check_agreement(&store, &models[kept]);
         let snap = store.snapshot();
-        // Decode every live node.
-        assert!(snap.due(u64::MAX, usize::MAX).len() <= snap.len());
+        prop_assert!(snap.due(u64::MAX, usize::MAX).len() <= snap.len());
     }
 }
