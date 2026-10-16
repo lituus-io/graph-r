@@ -1,5 +1,16 @@
 # graph-r
 
+[![CI](https://github.com/lituus-io/graph-r/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/ci.yml)
+[![Security](https://github.com/lituus-io/graph-r/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/security.yml)
+[![Fuzz](https://github.com/lituus-io/graph-r/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/fuzz.yml)
+[![Benchmark](https://github.com/lituus-io/graph-r/actions/workflows/benchmark.yml/badge.svg?branch=main)](https://github.com/lituus-io/graph-r/actions/workflows/benchmark.yml)
+[![Release](https://github.com/lituus-io/graph-r/actions/workflows/release.yaml/badge.svg)](https://github.com/lituus-io/graph-r/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/uu-graph-r?label=crates.io)](https://crates.io/crates/uu-graph-r)
+[![docs.rs](https://img.shields.io/docsrs/uu-graph-r?label=docs.rs)](https://docs.rs/uu-graph-r)
+[![PyPI](https://img.shields.io/pypi/v/uu-graph-r?label=PyPI)](https://pypi.org/project/uu-graph-r/)
+[![Python](https://img.shields.io/pypi/pyversions/uu-graph-r)](https://pypi.org/project/uu-graph-r/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+
 An embedded, persistent knowledge graph that acts as the durable backend for
 [link-r](../link-r): link-r **acquires and ranks** (crawl, extract, hybrid
 search over a possibly in-memory index); graph-r **remembers and serves**
@@ -10,6 +21,13 @@ can be absorbed and then discarded while every lookup keeps resolving.
 The point: answer "where is the resource that explains X?" **locally**, with a
 URL and a heading anchor, inside a token budget — instead of re-crawling,
 re-searching, or shipping page bodies to a model on every question.
+
+## Install
+
+| | |
+|---|---|
+| Rust | `cargo add uu-graph-r` |
+| Python ≥3.12 (abi3 wheels: Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64) | `pip install uu-graph-r` → `import graph_r` |
 
 ## Division of responsibilities
 
