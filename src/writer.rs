@@ -287,23 +287,23 @@ impl<'s> Writer<'s> {
         if attrs.len() > MAX_ATTRS {
             return Err(Error::format("too many attributes"));
         }
-        let mut owned: Vec<(u8, &str)> = Vec::with_capacity(attrs.len());
+        let mut owned: Vec<(u8, [&str; 3])> = Vec::with_capacity(attrs.len());
         for &(k, v) in attrs.iter().rev() {
             if v.len() > MAX_ATTR_LEN {
                 return Err(Error::format("attribute too long"));
             }
             if !owned.iter().any(|(o, _)| *o == k) {
-                owned.push((k, v));
+                owned.push((k, [v, "", ""]));
             }
         }
         // Bound the whole op, so it always fits one record entry.
-        if owned.iter().map(|(_, v)| v.len()).sum::<usize>() > MAX_ATTR_BYTES {
+        if owned.iter().map(|(_, v)| v[0].len()).sum::<usize>() > MAX_ATTR_BYTES {
             return Err(Error::format(format!(
                 "attributes exceed {MAX_ATTR_BYTES} bytes in total"
             )));
         }
         owned.sort_unstable_by_key(|(k, _)| *k);
-        self.state.staged.push_attrs(key, &owned)
+        self.state.staged.push_attr_parts(key, &owned)
     }
 
     /// [`Writer::set_attrs`] with string names: a whole-set replacement of
@@ -343,10 +343,9 @@ impl<'s> Writer<'s> {
         }
         // Each record is `name NUL value`, written straight into the log
         // record: no value is assembled anywhere first.
-        self.state.staged.push_attr_parts(
-            key,
-            named.iter().enumerate().map(|(k, &(n, v))| (k as u8, [n, "\0", v])),
-        )
+        let parts: Vec<(u8, [&str; 3])> =
+            named.iter().enumerate().map(|(k, &(n, v))| (k as u8, [n, "\0", v])).collect();
+        self.state.staged.push_attr_parts(key, &parts)
     }
 
     /// Record a revalidation outcome. Freshness policy (interval growth/cut,
@@ -560,7 +559,7 @@ impl<'s> Writer<'s> {
         state.next_seq += u64::from(count);
         state.ops_since_compact += count as usize;
         let record = std::mem::take(&mut state.staged).into_vec();
-        crate::overlay::publish_records(&inner.log, record, 0);
+        crate::overlay::publish_records(&inner.log, record, 0, first_seq - 1);
         drop(guard);
         let last = self.state.next_seq - 1;
         if self.state.ops_since_compact >= self.store.cfg.compact_after_ops

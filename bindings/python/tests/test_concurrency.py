@@ -165,7 +165,17 @@ def test_transaction_wait_takes_seconds(tmp_path):
     assert b.urls() == ["https://x.dev/b", "https://x.dev/c"]
 
 
-@pytest.mark.parametrize("bad", [-1, -0.5, float("nan"), float("inf")])
+@pytest.mark.parametrize("ok", [0, 2, 0.25, 1e-05, 1.5e2, 0.0000001])
+def test_a_wait_in_any_decimal_form_opens(tmp_path, ok):
+    path = str(tmp_path / "kb")
+    graph_r.Store.create(path, lock_wait=ok)
+    store = graph_r.Store.open(path, lock_wait=ok)
+    with store.transaction(wait=ok) as tx:
+        tx.add("https://x.dev/a", content_hash=1)
+    assert store.urls() == ["https://x.dev/a"]
+
+
+@pytest.mark.parametrize("bad", [-1, -0.5, float("nan"), float("inf"), 1e30, True])
 def test_a_wait_must_be_a_finite_number_of_seconds(tmp_path, bad):
     path = str(tmp_path / "kb")
     store = graph_r.Store.create(path)
@@ -174,8 +184,9 @@ def test_a_wait_must_be_a_finite_number_of_seconds(tmp_path, bad):
             opener(path, lock_wait=bad)
     with pytest.raises(ValueError):
         graph_r.Store.create(str(tmp_path / "other"), lock_wait=bad)
-    with pytest.raises(ValueError):
-        store.transaction(wait=bad)
+    if bad is not True:  # transaction(wait=True) means the store's own wait
+        with pytest.raises(ValueError):
+            store.transaction(wait=bad)
     with pytest.raises(ValueError):
         store.transaction(wait="soon")
 

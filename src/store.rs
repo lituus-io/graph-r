@@ -1100,16 +1100,7 @@ fn publish_above(log: &LogArena, served: u64, seg: Vec<u8>, from: usize) -> Resu
     if !log.reserve(new, seg.len()) {
         return Err(Error::busy("overlay arena full"));
     }
-    if new == wal::Records::trusted(&seg, from, seg.len()).map(|r| r.op_count() as usize).sum() {
-        publish_records(log, seg, from);
-    } else {
-        log.publish(seg, move |s| {
-            wal::Records::trusted(s, from, s.len())
-                .flat_map(|r| r.ops())
-                .filter(move |&(seq, _, _)| seq > served)
-                .map(|(seq, off, _)| (seq, off))
-        });
-    }
+    publish_records(log, seg, from, served);
     Ok(true)
 }
 

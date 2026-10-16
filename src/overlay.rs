@@ -180,6 +180,7 @@ impl LogArena {
 
     /// Take back the first segment of an arena that was never served (a
     /// generation that could not be installed), to publish it elsewhere.
+    #[inline]
     pub(crate) fn take_first_segment(&mut self) -> Option<Vec<u8>> {
         self.segs[0].get_mut()?.get_mut(0)?.take()
     }
@@ -237,6 +238,7 @@ impl std::hash::Hasher for KeyHasher {
 pub(crate) struct KeyState(u64);
 
 impl Default for KeyState {
+    #[inline]
     fn default() -> Self {
         use std::hash::BuildHasher as _;
         Self(std::collections::hash_map::RandomState::new().hash_one(0x5EED_u64))
@@ -312,12 +314,14 @@ impl OverlayView {
     }
 }
 
-/// Publish `rec` (one sealed record, or a run of whole records starting at
-/// `from`) into `log`, every op of it.
-pub(crate) fn publish_records(log: &LogArena, rec: Vec<u8>, from: usize) {
-    log.publish(rec, move |seg| {
-        wal::Records::trusted(seg, from, seg.len())
+/// Publish the ops of `seg[from..]` (whole, validated records: one sealed
+/// commit, or a run read from the log) with sequence numbers above `above`
+/// into `log`, moving `seg` in as one segment. The one publish path.
+pub(crate) fn publish_records(log: &LogArena, seg: Vec<u8>, from: usize, above: u64) {
+    log.publish(seg, move |s| {
+        wal::Records::trusted(s, from, s.len())
             .flat_map(|r| r.ops())
+            .filter(move |&(seq, _, _)| seq > above)
             .map(|(seq, off, _)| (seq, off))
     });
 }
@@ -341,7 +345,7 @@ mod tests {
     fn publish(a: &LogArena, rec: Vec<u8>) {
         let ops = wal::Records::trusted(&rec, 0, rec.len()).map(|r| r.op_count() as usize).sum();
         assert!(a.reserve(ops, rec.len()));
-        publish_records(a, rec, 0);
+        publish_records(a, rec, 0, 0);
     }
 
     #[test]

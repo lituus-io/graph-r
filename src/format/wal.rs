@@ -401,23 +401,21 @@ impl RecordBuf {
     /// ascending, at most [`MAX_ATTRS`], each value at most
     /// [`MAX_ATTR_LEN`], the op at most [`MAX_OP`].
     pub fn push_attrs(&mut self, key: UrlKey, attrs: &[(u8, &str)]) -> Result<()> {
-        self.push_attr_parts(key, attrs.iter().map(|&(k, v)| (k, [v, "", ""])))
+        let parts: Vec<(u8, [&str; 3])> = attrs.iter().map(|&(k, v)| (k, [v, "", ""])).collect();
+        self.push_attr_parts(key, &parts)
     }
 
     /// [`RecordBuf::push_attrs`] with each value the concatenation of three
     /// parts, written straight into the record (a named attribute is
     /// `name`, NUL, `value`): no value is assembled anywhere else first.
-    pub(crate) fn push_attr_parts<'v, I>(&mut self, key: UrlKey, attrs: I) -> Result<()>
-    where
-        I: ExactSizeIterator<Item = (u8, [&'v str; 3])> + Clone,
-    {
+    pub(crate) fn push_attr_parts(&mut self, key: UrlKey, attrs: &[(u8, [&str; 3])]) -> Result<()> {
         let n = attrs.len();
         if n > MAX_ATTRS {
             return Err(Error::format(format!("more than {MAX_ATTRS} attributes")));
         }
         let mut total = 0usize;
         let mut prev: Option<u8> = None;
-        for (k, parts) in attrs.clone() {
+        for &(k, parts) in attrs {
             if prev.is_some_and(|p| p >= k) {
                 return Err(Error::format("attribute keys must be strictly ascending"));
             }
@@ -433,7 +431,7 @@ impl RecordBuf {
         }
         let at = self.begin(OP_ATTRS, 0, key, 8 + n * ATTR_ENTRY + total);
         self.buf.extend_from_slice(&[n as u8, 0, 0, 0, 0, 0, 0, 0]);
-        for (k, parts) in attrs.clone() {
+        for &(k, parts) in attrs {
             self.buf.extend_from_slice(&[k, 0, 0, 0]);
             put_u32(&mut self.buf, parts.iter().map(|p| p.len() as u32).sum());
         }
@@ -489,6 +487,7 @@ struct OpWalk<'a> {
 impl<'a> Iterator for OpWalk<'a> {
     type Item = (usize, &'a [u8]);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let rest = self.bytes.get(self.pos..)?;
         if rest.len() < OP_HEADER_LEN {
@@ -571,18 +570,21 @@ pub struct Record<'a> {
 impl<'a> Record<'a> {
     /// Sequence number of its first op; op `i` has `first_seq() + i`.
     #[must_use]
+    #[inline]
     pub fn first_seq(&self) -> u64 {
         get_u64(self.rec, 8)
     }
 
     /// Ops it carries (at least one).
     #[must_use]
+    #[inline]
     pub fn op_count(&self) -> u32 {
         get_u32(self.rec, 16)
     }
 
     /// Sequence number of its last op.
     #[must_use]
+    #[inline]
     pub fn last_seq(&self) -> u64 {
         self.first_seq() + u64::from(self.op_count()) - 1
     }
@@ -642,6 +644,7 @@ impl<'a> Records<'a> {
 impl<'a> Iterator for Records<'a> {
     type Item = Record<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Record<'a>> {
         if self.end - self.pos.min(self.end) < MIN_RECORD {
             return None;
@@ -770,6 +773,7 @@ pub enum OpView<'a> {
 impl<'a> OpView<'a> {
     /// The view of one op validated earlier (or encoded here): no checks
     /// beyond the kind. `None` only for bytes that were never an op.
+    #[inline]
     pub(crate) fn trusted(op: &'a [u8]) -> Option<Self> {
         if op.len() < OP_HEADER_LEN {
             return None;
@@ -789,6 +793,7 @@ impl<'a> OpView<'a> {
 
     /// The key this op targets.
     #[must_use]
+    #[inline]
     pub fn key(&self) -> UrlKey {
         match self {
             Self::Upsert(v) => v.key(),
@@ -803,10 +808,12 @@ impl<'a> OpView<'a> {
 
 /// UTF-8 at `op[at..at + len]`, validated when the op was accepted (so the
 /// fallback is never taken).
+#[inline]
 fn text(op: &[u8], at: usize, len: usize) -> &str {
     std::str::from_utf8(&op[at..at + len]).unwrap_or("")
 }
 
+#[inline]
 fn utf8(bytes: &[u8], what: &str) -> Result<()> {
     std::str::from_utf8(bytes)
         .map(|_| ())
@@ -842,10 +849,12 @@ pub fn validate_op(bytes: &[u8]) -> Result<OpView<'_>> {
     OpView::trusted(bytes).ok_or_else(|| Error::format("unknown op kind"))
 }
 
+#[inline]
 fn zeros(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
 }
 
+#[inline]
 fn check_upsert(op: &[u8]) -> Result<()> {
     let n = op.len();
     if n < UPSERT_FIXED {
@@ -875,6 +884,7 @@ fn check_upsert(op: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn check_segs(op: &[u8]) -> Result<()> {
     let n = op.len();
     if n < SEGS_FIXED || !zeros(&op[17..24]) || usize::from(op[16]) > MAX_SEGS {
@@ -900,6 +910,7 @@ fn check_segs(op: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn check_edges(op: &[u8]) -> Result<()> {
     let n = op.len();
     if n < EDGES_FIXED || !zeros(&op[18..24]) {
@@ -920,6 +931,7 @@ fn check_edges(op: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn check_touch(op: &[u8]) -> Result<()> {
     let n = op.len();
     if n < TOUCH_FIXED {
@@ -939,6 +951,7 @@ fn check_touch(op: &[u8]) -> Result<()> {
     utf8(&op[TOUCH_FIXED..], "touch etag")
 }
 
+#[inline]
 fn check_attrs(op: &[u8]) -> Result<()> {
     let n = op.len();
     if n < ATTRS_FIXED || !zeros(&op[17..24]) || usize::from(op[16]) > MAX_ATTRS {
@@ -1000,6 +1013,7 @@ impl<'a> UpsertView<'a> {
     fn len_at(&self, i: usize) -> usize {
         usize::from(get_u16(self.op, 36 + 2 * i))
     }
+    #[inline]
     fn field(&self, i: usize, bit: u8) -> Option<&'a str> {
         if i > 0 && self.op[34] & bit == 0 {
             return None;
@@ -1129,12 +1143,14 @@ impl<'a> EdgesView<'a> {
 }
 
 /// Edge `i` of an [`EdgesView`]'s entries.
+#[inline]
 pub(crate) fn edge_at(entries: &[u8], i: usize) -> Edge {
     let e = i * EDGE_ENTRY;
     (UrlKey(get_u64(entries, e)), entries[e + 8], entries[e + 9], get_u16(entries, e + 10))
 }
 
 /// Edges in an [`EdgesView`]'s entries.
+#[inline]
 pub(crate) fn edge_count(entries: &[u8]) -> usize {
     entries.len() / EDGE_ENTRY
 }
@@ -1188,6 +1204,7 @@ impl<'a> TouchView<'a> {
     }
     /// The entity tag after the check.
     #[must_use]
+    #[inline]
     pub fn etag(&self) -> Option<&'a str> {
         (self.op[49] & T_ETAG != 0)
             .then(|| text(self.op, TOUCH_FIXED, usize::from(get_u16(self.op, 50))))

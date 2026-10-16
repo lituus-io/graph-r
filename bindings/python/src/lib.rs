@@ -80,20 +80,60 @@ fn closed() -> PyErr {
     GraphRError::new_err("store is closed")
 }
 
-/// How long a write waits for another writer: `seconds`, else the store's
-/// own default (ten seconds). Negative, NaN or infinite is a `ValueError`.
-fn lock_wait(seconds: Option<f64>) -> PyResult<Duration> {
-    match seconds {
-        None => Ok(Config::default().lock_wait),
-        Some(s) if s.is_finite() && s >= 0.0 => Duration::try_from_secs_f64(s)
-            .map_err(|_| PyValueError::new_err("lock_wait is out of range")),
-        Some(_) => Err(PyValueError::new_err("lock_wait must be a finite number of seconds >= 0")),
+/// A wait in seconds from a Python number (an `int`, a `float`, or any
+/// number whose `str()` is a decimal): finite and `>= 0`, else
+/// `ValueError`. Read as the decimal text Python prints (for a float, the
+/// shortest that round-trips) and rounded to whole microseconds with integer
+/// arithmetic, which links neither float conversion nor float parsing into
+/// the wheel.
+fn seconds(v: &Bound<'_, PyAny>) -> PyResult<Duration> {
+    let bad = || PyValueError::new_err("a wait must be a finite number of seconds >= 0");
+    if v.is_instance_of::<pyo3::types::PyString>() {
+        return Err(bad());
     }
+    let text = v.str()?;
+    micros(text.to_str()?.trim()).map(Duration::from_micros).ok_or_else(bad)
+}
+
+/// `text` (`digits[.digits][e[+-]digits]`) in whole microseconds, rounded
+/// half up; `None` for anything else (a sign, `inf`, `nan`) or past `u64`.
+#[inline]
+fn micros(text: &str) -> Option<u64> {
+    let (mantissa, exp) = match text.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && frac.is_empty() || whole.len() + frac.len() > 36 {
+        return None;
+    }
+    let mut digits: u128 = 0;
+    for c in whole.bytes().chain(frac.bytes()) {
+        digits = digits * 10 + u128::from(c.checked_sub(b'0').filter(|d| *d < 10)?);
+    }
+    let scale = exp.checked_sub(i32::try_from(frac.len()).ok()?)?.checked_add(6)?;
+    let us = if scale >= 0 {
+        digits.checked_mul(10u128.checked_pow(scale.unsigned_abs())?)?
+    } else if scale < -38 {
+        0
+    } else {
+        let div = 10u128.pow(scale.unsigned_abs());
+        (digits + div / 2) / div
+    };
+    u64::try_from(us).ok()
+}
+
+/// How long a write waits for another writer: `lock_wait` seconds, else
+/// the store's own default (ten seconds).
+#[inline]
+fn lock_wait(v: Option<&Bound<'_, PyAny>>) -> PyResult<Duration> {
+    v.map_or(Ok(Config::default().lock_wait), seconds)
 }
 
 /// The configuration a writable handle opens with.
-fn writable(seconds: Option<f64>) -> PyResult<Config> {
-    Ok(Config { lock_wait: lock_wait(seconds)?, ..Config::default() })
+#[inline]
+fn writable(v: Option<&Bound<'_, PyAny>>) -> PyResult<Config> {
+    Ok(Config { lock_wait: lock_wait(v)?, ..Config::default() })
 }
 
 /// Edges per node a `set_edges` call may carry (the store's own cap).
@@ -707,7 +747,11 @@ impl PyStore {
     /// another writer before `LockedError`.
     #[staticmethod]
     #[pyo3(signature = (path, lock_wait=None))]
-    fn create(py: Python<'_>, path: String, lock_wait: Option<f64>) -> PyResult<Self> {
+    fn create(
+        py: Python<'_>,
+        path: String,
+        lock_wait: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let cfg = writable(lock_wait)?;
         let inner = py.detach(|| Store::create(&path, cfg));
         wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
@@ -719,7 +763,7 @@ impl PyStore {
     /// may be open on one path. `lock_wait` as for `create`.
     #[staticmethod]
     #[pyo3(signature = (path, lock_wait=None))]
-    fn open(py: Python<'_>, path: String, lock_wait: Option<f64>) -> PyResult<Self> {
+    fn open(py: Python<'_>, path: String, lock_wait: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         let cfg = writable(lock_wait)?;
         let inner = py.detach(|| Store::open_cfg(&path, cfg));
         wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
@@ -731,7 +775,11 @@ impl PyStore {
     /// result.
     #[staticmethod]
     #[pyo3(signature = (path, lock_wait=None))]
-    fn open_or_create(py: Python<'_>, path: String, lock_wait: Option<f64>) -> PyResult<Self> {
+    fn open_or_create(
+        py: Python<'_>,
+        path: String,
+        lock_wait: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let cfg = writable(lock_wait)?;
         let inner = py.detach(|| Store::open_or_create(&path, cfg));
         wrap(inner.map_err(|e| map_open_err(py, e))?, cfg.lock_wait)
@@ -1043,9 +1091,7 @@ impl PyStore {
             Some(w) => match w.extract::<bool>() {
                 Ok(true) => slf.borrow().lock_wait,
                 Ok(false) => Duration::ZERO,
-                Err(_) => lock_wait(Some(w.extract::<f64>().map_err(|_| {
-                    PyValueError::new_err("wait must be True, False or a number of seconds")
-                })?))?,
+                Err(_) => seconds(&w)?,
             },
         };
         Ok(PyTransaction {
