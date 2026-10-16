@@ -7,6 +7,10 @@
 //! and a role in the environment; [`child`] is a no-op unless that role is
 //! set, so a normal `cargo test` run passes it trivially. Processes start
 //! together on a "go" file, so their opens and commits genuinely race.
+//!
+//! No child outlives its test: a spawned child is [`Reaped`] (killed and
+//! waited for) when the parent drops it on any path, a failed assertion
+//! included, and every child that loops gives up past [`CHILD_DEADLINE`].
 
 #![cfg(feature = "store")]
 use graph_r::prelude::*;
@@ -16,6 +20,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const ROLE: &str = "GRAPH_R_MW_ROLE";
+/// The longest a child keeps looping, whatever its parent does.
+const CHILD_DEADLINE: Duration = Duration::from_secs(120);
 /// Ops in the transaction the "crash" child dies writing.
 const CRASH_OPS: usize = 5;
 const ARGS: &str = "GRAPH_R_MW_ARGS";
@@ -37,17 +43,46 @@ fn doc(url: &str) -> DocRecord<'_> {
     }
 }
 
-fn spawn(role: &str, args: &[String]) -> Child {
-    Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child", "--nocapture", "--test-threads=1"])
-        .env(ROLE, role)
-        .env(ARGS, args.join("\n"))
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap()
+/// A child process that is killed and waited for when dropped still
+/// running: a parent that panics (an assertion, a failed sibling) never
+/// leaves writers committing to a temporary store behind it.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
 }
 
-fn wait_all(children: Vec<Child>) {
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn spawn(role: &str, args: &[String]) -> Reaped {
+    Reaped(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child", "--nocapture", "--test-threads=1"])
+            .env(ROLE, role)
+            .env(ARGS, args.join("\n"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn wait_all(children: Vec<Reaped>) {
     for mut c in children {
         let status = c.wait().unwrap();
         assert!(status.success(), "a child process failed: {status}");
@@ -154,8 +189,10 @@ fn child() {
             let (dir, id): (PathBuf, usize) = (PathBuf::from(&args[0]), args[1].parse().unwrap());
             let store = Store::open(&dir).unwrap();
             ready_then_go(&dir.join("go"), id);
+            let deadline = Instant::now() + CHILD_DEADLINE;
             let mut k = 0;
             while !dir.join("stop").exists() {
+                assert!(Instant::now() < deadline, "never told to stop");
                 let url = url_of(id, k % 64);
                 store.transact(|tx| tx.upsert_node(&doc(&url))).unwrap();
                 k += 1;
@@ -231,7 +268,7 @@ fn writers_committing_back_to_back_cannot_starve_another() {
     let dir = root.path().join("s");
     drop(Store::create(&dir, Config::default()).unwrap());
     let d = dir.display().to_string();
-    let hot: Vec<Child> = (0..2).map(|id| spawn("hot", &[d.clone(), id.to_string()])).collect();
+    let hot: Vec<Reaped> = (0..2).map(|id| spawn("hot", &[d.clone(), id.to_string()])).collect();
     let polite = spawn("polite", &[d.clone(), "2".into(), COMMITS.to_string()]);
     go_when_ready(&dir.join("go"), 3);
     wait_all(vec![polite]);
@@ -258,7 +295,7 @@ fn concurrent_first_creation_loses_nothing() {
     for round in 0..ROUNDS {
         let dir = root.path().join(format!("s{round}"));
         let go = root.path().join(format!("go{round}"));
-        let children: Vec<Child> = (0..N)
+        let children: Vec<Reaped> = (0..N)
             .map(|id| {
                 spawn(
                     "create",
@@ -291,7 +328,7 @@ fn n_by_m(n: usize, m: usize, compact_every: usize) {
             .chain([compact_every.to_string()])
             .collect::<Vec<_>>()
     };
-    let children: Vec<Child> = (0..n).map(|id| spawn("commits", &args(id))).collect();
+    let children: Vec<Reaped> = (0..n).map(|id| spawn("commits", &args(id))).collect();
     go_when_ready(&dir.join("go"), n);
     wait_all(children);
     let mut want: Vec<String> = (0..n).flat_map(|i| (0..m).map(move |k| url_of(i, k))).collect();
@@ -405,7 +442,7 @@ fn a_reader_never_sees_part_of_another_process_transaction() {
     drop(Store::create(&dir, Config::default()).unwrap());
     let reader = Store::open_read_only(&dir).unwrap();
     let d = dir.display().to_string();
-    let children: Vec<Child> = (0..N)
+    let children: Vec<Reaped> = (0..N)
         .map(|id| spawn("ktx", &[d.clone(), id.to_string(), M.to_string(), K.to_string()]))
         .collect();
     let done = AtomicBool::new(false);
