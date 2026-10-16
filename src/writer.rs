@@ -21,14 +21,12 @@ use std::io::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::MutexGuard;
 
-/// Maximum label length persisted (bytes of UTF-8).
-pub const MAX_LABEL: usize = 2048;
-/// Maximum segments per document.
-pub const MAX_SEGS: usize = 128;
 /// Maximum outbound edges per node (wide joins and conditions included).
 pub use crate::format::wal::MAX_EDGES;
 /// Maximum attributes per node, and the longest attribute value.
 pub use crate::format::wal::{MAX_ATTRS, MAX_ATTR_LEN};
+/// Maximum label length persisted (bytes of UTF-8), and segments per document.
+pub use crate::format::wal::{MAX_LABEL, MAX_SEGS};
 /// Most value bytes one node's attribute set may hold in total: what fits a
 /// single log frame (the op's fixed fields and per-value headers included).
 pub const MAX_ATTR_BYTES: usize = crate::format::wal::MAX_FRAME - (1 + 8 + 1) - MAX_ATTRS * (1 + 4);
