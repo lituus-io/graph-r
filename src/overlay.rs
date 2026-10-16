@@ -210,16 +210,59 @@ pub(crate) struct OverlayNode {
     pub(crate) severed: bool,
 }
 
+/// Hashes a [`crate::UrlKey`] (already an xxh3 digest) with one finalizer
+/// round over the key and a per-map secret, instead of `SipHash`: the fold's
+/// cost is these inserts. The secret comes from the process's random hash
+/// state, so URLs chosen to collide (a crawled page picks its links) cannot
+/// aim at buckets they cannot see.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        crate::hash::fmix64(self.0)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 ^= v;
+    }
+}
+
+/// Builds [`KeyHasher`]s seeded with one map's secret.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyState(u64);
+
+impl Default for KeyState {
+    fn default() -> Self {
+        use std::hash::BuildHasher as _;
+        Self(std::collections::hash_map::RandomState::new().hash_one(0x5EED_u64))
+    }
+}
+
+impl std::hash::BuildHasher for KeyState {
+    type Hasher = KeyHasher;
+    fn build_hasher(&self) -> KeyHasher {
+        KeyHasher(self.0)
+    }
+}
+
+/// A map keyed by a key's digest.
+pub(crate) type KeyMap<V> = HashMap<u64, V, KeyState>;
+
 /// Merged overlay view for a snapshot: key → folded state, in op order.
 #[derive(Debug, Default)]
 pub(crate) struct OverlayView {
-    pub(crate) map: HashMap<u64, OverlayNode>,
+    pub(crate) map: KeyMap<OverlayNode>,
 }
 
 impl OverlayView {
     pub(crate) fn build(log: &LogArena, upto: usize) -> Self {
         const PINNED: u16 = crate::format::base::nflags::PINNED;
-        let mut map: HashMap<u64, OverlayNode> = HashMap::new();
+        let mut map: KeyMap<OverlayNode> = KeyMap::default();
         for (_, r) in log.committed(upto) {
             let Some(op) = log.view(r) else { continue };
             let entry = map.entry(op.key().0).or_default();

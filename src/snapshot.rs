@@ -22,7 +22,7 @@
 use crate::format::base::{self, nflags, NodeRec, SegRec};
 use crate::format::wal::{self, AttrsView, EdgesView, OpView, SegsView, TouchView, UpsertView};
 use crate::key::{NodeId, SegKey, UrlKey};
-use crate::overlay::{OpRef, OverlayNode, OverlayView};
+use crate::overlay::{KeyMap, OpRef, OverlayNode, OverlayView};
 use crate::store::{GenInner, Store};
 use crate::traverse::{Neighbors, NeighborsInner};
 use crate::ttl::TtlConfig;
@@ -36,7 +36,7 @@ pub struct Snapshot<'s> {
     frontier: usize,
     view: OnceCell<OverlayView>,
     /// Overlay edges reversed (destination → sources), built on first use.
-    inbound: OnceCell<std::collections::HashMap<u64, Vec<wal::Edge>>>,
+    inbound: OnceCell<KeyMap<Vec<wal::Edge>>>,
     hub_threshold: OnceCell<u32>,
     live: OnceCell<usize>,
 }
@@ -542,8 +542,7 @@ impl<'s> Snapshot<'s> {
             }
         }
         let inbound = self.inbound.get_or_init(|| {
-            let mut m: std::collections::HashMap<u64, Vec<wal::Edge>> =
-                std::collections::HashMap::new();
+            let mut m: KeyMap<Vec<wal::Edge>> = KeyMap::default();
             for (&src, p) in overlay {
                 if p.removed {
                     continue;
