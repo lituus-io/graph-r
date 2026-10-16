@@ -746,7 +746,10 @@ impl Store {
         self.commit_lock_within(Duration::ZERO)
     }
 
-    fn commit_lock_within(&self, wait: Duration) -> Result<CommitLock> {
+    /// [`Store::commit_lock`] waiting up to `wait` instead of
+    /// [`Config::lock_wait`] (zero: never waits, as
+    /// [`Store::try_commit_lock`]).
+    pub fn commit_lock_within(&self, wait: Duration) -> Result<CommitLock> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
