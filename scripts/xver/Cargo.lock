@@ -42,7 +42,7 @@ name = "graph-r-xver"
 version = "0.0.0"
 dependencies = [
  "uu-graph-r 0.5.1",
- "uu-graph-r 0.6.0",
+ "uu-graph-r 0.6.1",
 ]
 
 [[package]]
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "uu-graph-r"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "compact_str",
